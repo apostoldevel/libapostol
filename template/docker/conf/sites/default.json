@@ -1,0 +1,4 @@
+{
+  "hosts": ["example.com", "localhost:8080"],
+  "root": "/opt/$APP_NAME/www"
+}

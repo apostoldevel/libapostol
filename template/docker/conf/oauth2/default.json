@@ -1,0 +1,19 @@
+{
+  "web": {
+    "issuers": ["accounts.example.com"],
+    "scopes": ["example"],
+    "client_id": "web-example.com",
+    "client_secret": "$CLIENT_SECRET_WEB",
+    "algorithm": "HS256",
+    "auth_uri": "/oauth2/authorize",
+    "token_uri": "/oauth2/token",
+    "redirect_uris": [
+      "https://example.com/oauth2/code",
+      "http://localhost:8080/oauth2/code"
+    ],
+    "javascript_origins": [
+      "https://example.com",
+      "http://localhost:8080"
+    ]
+  }
+}

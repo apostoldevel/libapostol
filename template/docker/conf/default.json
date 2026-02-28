@@ -1,0 +1,53 @@
+{
+  "prefix": "/etc/$APP_NAME/",
+  "locale": "en_US.UTF-8",
+  "log": {
+    "level": "notice",
+    "file": "/var/log/$APP_NAME/error.log",
+    "access": "/var/log/$APP_NAME/access.log",
+    "postgres": "/var/log/$APP_NAME/postgres.log"
+  },
+  "daemon": {
+    "enabled": false,
+    "pid": "/run/$APP_NAME.pid"
+  },
+  "process": {
+    "master": true,
+    "helper": false,
+    "user": "",
+    "group": ""
+  },
+  "workers": 0,
+  "server": {
+    "listen": "0.0.0.0",
+    "port": 8080,
+    "backlog": 128,
+    "timeout": 30000,
+    "root": "www"
+  },
+  "module": {
+    "heartbeat": {
+      "enable": true
+    },
+    "WebService": {
+      "enable": true
+    }
+  },
+  "postgres": {
+    "connect": true,
+    "notice": false,
+    "timeout": 10,
+    "worker": {
+      "host": "pgbouncer",
+      "port": "6432",
+      "dbname": "mydb",
+      "user": "myuser",
+      "password": "changeme",
+      "sslmode": "disable"
+    },
+    "pool": {
+      "min": 5,
+      "max": 10
+    }
+  }
+}

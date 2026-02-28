@@ -1,0 +1,75 @@
+#pragma once
+
+#include <filesystem>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace apostol
+{
+
+/// Single OAuth2 application entry (one section inside a provider JSON file).
+struct OAuthApp
+{
+    std::string provider;           // filename without extension ("default", "google")
+    std::string name;               // section name ("web", "service", "android", "ios")
+    std::string client_id;          // unique identifier
+    std::string client_secret;      // secret for JWT signing / OAuth2
+    std::string algorithm;          // "HS256", "HS384", "HS512"
+    std::vector<std::string> issuers;            // JWT iss claim values
+    std::vector<std::string> javascript_origins; // CORS origins
+    std::vector<std::string> redirect_uris;      // allowed redirect URIs
+    std::vector<std::string> scopes;             // allowed OAuth2 scopes
+    std::string auth_uri;           // authorization endpoint
+    std::string token_uri;          // token exchange endpoint
+    std::string cert_uri;           // JWKS public key endpoint
+};
+
+// ─── OAuthProviders ──────────────────────────────────────────────────────────
+//
+// Centralized cache of OAuth2 provider configurations loaded from conf/oauth2/*.json.
+//
+// Replaces three separate filesystem scans:
+//   - Application::load_oauth2_credentials()  (BotSession)
+//   - verify_jwt() per-request scan            (JWT verification)
+//   - ApostolModule::load_allowed_origins()    (CORS)
+//
+// Loaded once at startup, reloaded on SIGHUP via clear() + load().
+//
+class OAuthProviders
+{
+public:
+    /// Load all *.json files from @p oauth2_dir.
+    /// Each file may contain multiple application sections.
+    /// Non-existent directory or malformed files are silently skipped.
+    void load(const std::filesystem::path& oauth2_dir);
+
+    /// Clear all loaded applications (call before reload).
+    void clear();
+
+    /// All loaded applications.
+    const std::vector<OAuthApp>& apps() const noexcept { return apps_; }
+
+    /// Find an application by its client_id (used for JWT verification).
+    /// Returns nullptr if not found.
+    const OAuthApp* find_by_client_id(std::string_view client_id) const;
+
+    /// Find app by provider name + app name (e.g. "google", "web").
+    const OAuthApp* find(std::string_view provider, std::string_view app_name) const;
+
+    /// Find app of the "default" provider by app name (e.g. "web", "service").
+    const OAuthApp* find_default(std::string_view app_name) const;
+
+    /// Find credentials {client_id, client_secret} for a named application
+    /// (e.g. "service", "web"). Returns {"",""} if not found.
+    std::pair<std::string, std::string> credentials(std::string_view app_name) const;
+
+    /// Collect all unique javascript_origins across all applications.
+    std::vector<std::string> allowed_origins() const;
+
+private:
+    std::vector<OAuthApp> apps_;
+};
+
+} // namespace apostol

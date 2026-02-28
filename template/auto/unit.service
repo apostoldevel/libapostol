@@ -1,0 +1,18 @@
+[Unit]
+Description=$APP_DESCRIPTION
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/run/$APP_NAME.pid
+ExecStartPre=/usr/bin/rm -f /run/$APP_NAME.pid
+ExecStartPre=/usr/sbin/$APP_NAME -t
+ExecStart=/usr/sbin/$APP_NAME
+ExecReload=/bin/kill -s HUP $MAINPID
+KillSignal=SIGQUIT
+TimeoutStopSec=5
+KillMode=mixed
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,83 @@
+#!/bin/bash
+
+set -euo pipefail
+
+PROJECT_NAME="${PROJECT_NAME:-$APP_NAME}"
+
+set -o allexport
+source /opt/$PROJECT_NAME/.env
+set +o allexport
+
+PGHOST="${PGHOST:-postgres}"
+PGPORT="${PGPORT:-5432}"
+PGUSER="${PGUSER:-daemon}"
+PGDATABASE="${PGDATABASE:-mydb}"
+
+PG_PARAMS=(-d "$PGDATABASE" -U "$PGUSER")
+
+if [ -n "$PGHOST" ]; then
+  PG_PARAMS+=(-h "$PGHOST")
+fi
+
+if [ -n "$PGPORT" ]; then
+  PG_PARAMS+=(-p "$PGPORT")
+fi
+
+if [[ -d /var/log/$PROJECT_NAME ]]; then
+  find /var/log/"$PROJECT_NAME" -name '*.log' -delete
+fi
+
+display_message() {
+  echo "$@"
+}
+
+display_error() {
+  >&2 echo "$@"
+}
+
+display_configuration() {
+  display_message "--------------------------------------------------------------------"
+  display_message "PROJECT_NAME    : $PROJECT_NAME"
+  display_message "WORKER_PROCESSES: $WORKER_PROCESSES"
+  display_message "PGHOST          : $PGHOST"
+  display_message "PGPORT          : $PGPORT"
+  display_message "PGDATABASE      : $PGDATABASE"
+  display_message "PGUSER          : $PGUSER"
+  display_message "--------------------------------------------------------------------"
+}
+
+init_app() {
+  mkdir -p /etc/"$PROJECT_NAME"/conf
+  push_directory /opt/"$PROJECT_NAME"
+  cp -p conf/default.json /etc/"$PROJECT_NAME"/conf/"$PROJECT_NAME".json
+  pop_directory
+}
+
+pop_directory() {
+  popd >/dev/null
+}
+
+push_directory() {
+  local DIRECTORY="$1"
+  pushd "$DIRECTORY" >/dev/null
+}
+
+display_configuration
+
+if [[ ! -f /etc/$PROJECT_NAME/conf/$PROJECT_NAME.json ]]; then
+  init_app
+fi
+
+display_message "Waiting for the database to be ready..."
+
+retries=10
+until pg_isready --timeout=1 "${PG_PARAMS[@]}" >/dev/null 2>&1; do
+  sleep 1
+  ((retries=retries-1))
+  if [ $retries -eq 0 ]; then
+    display_error "Can't connect to database $PGDATABASE on $PGHOST:$PGPORT as user $PGUSER."
+    exit 1
+  fi
+done
+
+/usr/sbin/"$PROJECT_NAME" -w "$WORKER_PROCESSES"
