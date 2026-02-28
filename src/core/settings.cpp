@@ -12,7 +12,7 @@ namespace apostol
 
 AppSettings::AppSettings()
 {
-    conf_file    = resolve(std::string(APP_CONF_PREFIX) + APP_CONF_FILE);
+    conf_file    = resolve(std::string(APP_PREFIX) + APP_CONF_FILE);
     pid_file     = resolve(APP_PID_FILE);
     lock_file    = resolve(APP_LOCK_FILE);
     error_log    = resolve(APP_ERROR_LOG_FILE);
@@ -48,7 +48,7 @@ void AppSettings::populate(const Config& cfg)
     if (new_prefix != prefix)
     {
         prefix = new_prefix;
-        conf_file    = resolve(std::string(APP_CONF_PREFIX) + APP_CONF_FILE);
+        conf_file    = resolve(std::string(APP_PREFIX) + APP_CONF_FILE);
         pid_file     = resolve(APP_PID_FILE);
         lock_file    = resolve(APP_LOCK_FILE);
         error_log    = resolve(APP_ERROR_LOG_FILE);

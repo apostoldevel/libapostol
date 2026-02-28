@@ -315,7 +315,7 @@ void Application::parse_args(int argc, char* argv[])
             if (!settings_.prefix.empty() && settings_.prefix.back() != '/')
                 settings_.prefix += '/';
             // Re-resolve all default paths with new prefix
-            settings_.conf_file    = settings_.resolve(std::string(APP_CONF_PREFIX) + APP_CONF_FILE);
+            settings_.conf_file    = settings_.resolve(std::string(APP_PREFIX) + APP_CONF_FILE);
             settings_.pid_file     = settings_.resolve(APP_PID_FILE);
             settings_.lock_file    = settings_.resolve(APP_LOCK_FILE);
             settings_.error_log    = settings_.resolve(APP_ERROR_LOG_FILE);
