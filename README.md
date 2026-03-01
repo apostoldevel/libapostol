@@ -27,7 +27,7 @@ Create a new project from the libapostol template:
 bash <(curl -sL https://raw.githubusercontent.com/apostoldevel/libapostol/master/install.sh)
 ```
 
-Build and run:
+Build and run (assumes the default project name `myapp` — adjust if you chose a different name):
 
 ```bash
 cd myapp
@@ -36,7 +36,7 @@ cmake --build cmake-build-debug --parallel $(nproc)
 
 # For local development: change "prefix" in conf/default.json to "."
 mkdir -p logs
-./cmake-build-debug/myapp -c conf/default.json
+./cmake-build-debug/myapp -p . -c conf/default.json
 
 curl http://localhost:4977/api/v1/ping   # → {"ok":true,"message":"OK"}
 curl http://localhost:4977/docs          # → Swagger UI

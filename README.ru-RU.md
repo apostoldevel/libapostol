@@ -27,7 +27,7 @@ HTTP-сервер и сокеты PostgreSQL работают в **едином 
 bash <(curl -sL https://raw.githubusercontent.com/apostoldevel/libapostol/master/install.sh)
 ```
 
-Сборка и запуск:
+Сборка и запуск (примеры используют имя проекта `myapp` по умолчанию — если выбрали другое, подставьте его в командах):
 
 ```bash
 cd myapp
@@ -36,7 +36,7 @@ cmake --build cmake-build-debug --parallel $(nproc)
 
 # Для локальной разработки: измените "prefix" в conf/default.json на "."
 mkdir -p logs
-./cmake-build-debug/myapp -c conf/default.json
+./cmake-build-debug/myapp -p . -c conf/default.json
 
 curl http://localhost:4977/api/v1/ping   # → {"ok":true,"message":"OK"}
 curl http://localhost:4977/docs          # → Swagger UI
