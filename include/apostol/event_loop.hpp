@@ -104,7 +104,7 @@ private:
     sigset_t signal_mask_{};
     TimerId next_timer_id_{1};
 
-    static constexpr int MAX_EVENTS = 64;
+    static constexpr int MAX_EVENTS = 512;
 };
 
 } // namespace apostol
