@@ -277,6 +277,7 @@ private:
     std::string locale_;
     std::string conf_param_;  // global config directives (-g)
     std::string cmdline_;     // original command line (for process title)
+    int         cli_workers_{-1}; // -1 = not set via CLI; ≥0 = explicit -w value
     int         os_argc_{0};
     char**      os_argv_{nullptr};
     char*       os_argv_last_{nullptr};  // end of contiguous argv+environ memory

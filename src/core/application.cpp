@@ -154,6 +154,10 @@ int Application::run(int argc, char* argv[])
     // Re-registers in every child process too (see worker_run/helper_run/single_run).
     install_crash_handler(settings_.error_log.string());
 
+    // CLI -w overrides config workers (mirrors v1 DefaultCommands: skip config if CLI set)
+    if (cli_workers_ >= 0)
+        settings_.workers = cli_workers_;
+
     // CLI -l overrides config locale; then apply to process (mirrors v1 DefaultLocale.SetLocale)
     if (!locale_.empty())
         settings_.locale = locale_;
@@ -337,9 +341,9 @@ void Application::parse_args(int argc, char* argv[])
         }
         else if ((arg == "-w" || arg == "--workers") && i + 1 < argc)
         {
-            settings_.workers = std::atoi(argv[++i]);
-            if (settings_.workers < 0)
-                settings_.workers = 0; // 0 = auto (effective_workers() → nproc)
+            cli_workers_ = std::atoi(argv[++i]);
+            if (cli_workers_ < 0)
+                cli_workers_ = 0; // 0 = auto (effective_workers() → nproc)
         }
         else if (arg == "-v" || arg == "--version")
         {
@@ -950,7 +954,7 @@ pid_t Application::fork_child(ProcessRole role, std::string child_name,
 
 void Application::spawn_workers()
 {
-    int count = settings_.workers > 0 ? settings_.workers : 1;
+    int count = settings_.effective_workers();
     for (int i = 0; i < count; ++i)
         fork_child(ProcessRole::worker, fmt::format("worker#{}", i + 1));
 }
