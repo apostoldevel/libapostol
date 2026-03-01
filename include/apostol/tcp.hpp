@@ -57,6 +57,10 @@ public:
     /// @param backlog  listen() backlog (default = APP_DEFAULT_LISTEN_BACKLOG from CMake).
     explicit TcpListener(uint16_t port = 0, int backlog = APP_DEFAULT_LISTEN_BACKLOG);
 
+    /// Wrap an existing bound+listening fd without taking ownership.
+    /// The fd will NOT be closed by the destructor — caller (master) manages lifetime.
+    static TcpListener borrow_fd(int fd);
+
     ~TcpListener();
 
     TcpListener(const TcpListener&)            = delete;
@@ -73,8 +77,11 @@ public:
     std::optional<TcpConnection> accept();
 
 private:
-    int fd_      {-1};
-    int backlog_ {APP_DEFAULT_LISTEN_BACKLOG};
+    explicit TcpListener(int fd, bool owns) noexcept;
+
+    int  fd_       {-1};
+    int  backlog_  {APP_DEFAULT_LISTEN_BACKLOG};
+    bool owns_fd_  {true};  // false for borrowed fd (worker inherits from master)
 };
 
 } // namespace apostol

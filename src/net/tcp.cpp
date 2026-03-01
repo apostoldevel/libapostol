@@ -83,6 +83,17 @@ ssize_t TcpConnection::write(const void* buf, std::size_t len) noexcept
 
 // ─── TcpListener ─────────────────────────────────────────────────────────────
 
+TcpListener::TcpListener(int fd, bool owns) noexcept
+    : fd_(fd), backlog_(0), owns_fd_(owns)
+{}
+
+TcpListener TcpListener::borrow_fd(int fd)
+{
+    if (fd < 0)
+        throw std::invalid_argument("TcpListener::borrow_fd: invalid fd");
+    return TcpListener(fd, false);
+}
+
 TcpListener::TcpListener(uint16_t port, int backlog)
     : backlog_(backlog)
 {
@@ -120,11 +131,12 @@ TcpListener::TcpListener(uint16_t port, int backlog)
 
 TcpListener::~TcpListener()
 {
-    if (fd_ >= 0)
+    if (fd_ >= 0 && owns_fd_)
         ::close(fd_);
 }
 
-TcpListener::TcpListener(TcpListener&& o) noexcept : fd_(o.fd_)
+TcpListener::TcpListener(TcpListener&& o) noexcept
+    : fd_(o.fd_), backlog_(o.backlog_), owns_fd_(o.owns_fd_)
 {
     o.fd_ = -1;
 }
@@ -132,9 +144,11 @@ TcpListener::TcpListener(TcpListener&& o) noexcept : fd_(o.fd_)
 TcpListener& TcpListener::operator=(TcpListener&& o) noexcept
 {
     if (this != &o) {
-        if (fd_ >= 0) ::close(fd_);
-        fd_   = o.fd_;
-        o.fd_ = -1;
+        if (fd_ >= 0 && owns_fd_) ::close(fd_);
+        fd_       = o.fd_;
+        backlog_  = o.backlog_;
+        owns_fd_  = o.owns_fd_;
+        o.fd_     = -1;
     }
     return *this;
 }

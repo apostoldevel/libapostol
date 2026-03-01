@@ -26,6 +26,8 @@
 namespace apostol
 {
 
+class TcpListener;  // forward declaration for master_listener_
+
 // ─── Application ─────────────────────────────────────────────────────────────
 //
 // Base class for Apostol applications. Manages the master/worker process model.
@@ -298,6 +300,9 @@ private:
     WsHandler                ws_handler_;
     EventLoop*               worker_loop_{nullptr};
     std::unique_ptr<Logger>  stream_logger_;
+
+    std::unique_ptr<TcpListener> master_listener_;  // listening socket (master only)
+    int listen_fd_{-1};                              // fd inherited by workers via fork
 
     std::vector<ChildInfo>            children_;
     std::vector<CustomProcessEntry>   custom_processes_;

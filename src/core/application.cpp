@@ -255,6 +255,17 @@ void Application::start_process()
     {
         write_pid_file();
         on_start();
+
+        // Create listening socket BEFORE fork (nginx model).
+        // Workers inherit fd and only call accept().
+        if (settings_.server_port != 0) {
+            master_listener_ = std::make_unique<TcpListener>(
+                settings_.server_port, settings_.server_backlog);
+            listen_fd_ = master_listener_->fd();
+            http_port_ = master_listener_->local_port();
+            logger_->notice("master: bound listening socket on port {}", http_port_);
+        }
+
         if (cfg_helper()) spawn_helper();
         // Spawn custom processes first, then workers
         for (auto& cp : custom_processes_)
@@ -276,6 +287,10 @@ void Application::start_process()
         }
         spawn_workers();
         master_run();
+
+        master_listener_.reset();
+        listen_fd_ = -1;
+
         remove_pid_file();
     }
     else if (role_ == ProcessRole::helper)
@@ -641,7 +656,14 @@ void Application::master_run()
                               kill_timeout_secs_, children_.size());
                 for (auto& child : children_)
                     ::kill(child.pid, SIGKILL);
-                // SIGCHLD will reap them and stop the loop.
+                // Proactively reap: zombies won't generate new SIGCHLD.
+                reap_children();
+                if (children_.empty())
+                {
+                    loop.stop();
+                    return;
+                }
+                // If still not empty, SIGCHLD handler will catch the rest.
             },
             /*repeat=*/false);
     };
@@ -679,6 +701,10 @@ void Application::master_run()
         for (auto& child : children_)
             ::kill(child.pid, SIGUSR1);
     });
+
+    // Reap any children that died during the spawn→eventloop window
+    // (their SIGCHLD was lost before signalfd was set up).
+    reap_children();
 
     loop.run();
 
@@ -726,6 +752,9 @@ void Application::single_run()
         exit_code_ = 1;
         return;
     }
+
+    // Drop privileges after initialization (sockets bound, DB connected)
+    set_user(cfg_user(), cfg_group());
 
     // Set process title AFTER modules are registered
     auto names = module_manager_.module_names();
@@ -781,6 +810,9 @@ void Application::worker_run()
         return;
     }
 
+    // Drop privileges after initialization (sockets bound, DB connected)
+    set_user(cfg_user(), cfg_group());
+
     // Set process title AFTER modules are registered
     auto names = module_manager_.module_names();
     set_process_title(names.empty()
@@ -829,6 +861,9 @@ void Application::helper_run()
         exit_code_ = 1;
         return;
     }
+
+    // Drop privileges after initialization (DB connected)
+    set_user(cfg_user(), cfg_group());
 
     // Set process title AFTER modules are registered
     auto names = module_manager_.module_names();
@@ -897,6 +932,9 @@ void Application::custom_process_run(CustomProcess& proc)
         exit_code_ = 1;
         return;
     }
+
+    // 7. Drop privileges after initialization (sockets bound, DB connected)
+    set_user(cfg_user(), cfg_group());
 
     // Set process title AFTER on_start (modules may be registered)
     auto names = module_manager_.module_names();
@@ -1009,6 +1047,10 @@ void Application::fast_shutdown()
 {
     logger_->notice("fast shutdown requested");
     shutting_down_ = true;
+
+    // Proactively reap any zombie children first (they won't generate new SIGCHLD).
+    reap_children();
+
     for (auto& child : children_)
     {
         child.shutting_down = true;
@@ -1023,6 +1065,10 @@ void Application::graceful_shutdown()
     logger_->notice("graceful shutdown requested");
     shutting_down_ = true;
     graceful_ = true;
+
+    // Proactively reap any zombie children first (they won't generate new SIGCHLD).
+    reap_children();
+
     for (auto& child : children_)
     {
         child.shutting_down = true;
@@ -1182,6 +1228,15 @@ void Application::set_user(std::string_view user, std::string_view group)
         return;
     }
 
+    // Initialize supplementary groups (required before setuid for proper group access).
+    // By this point setgid() has already been called with the correct gid.
+    if (::initgroups(pw->pw_name, ::getgid()) == -1)
+    {
+        std::fprintf(stderr, "initgroups('%s', %u): %s\n",
+            pw->pw_name, ::getgid(), std::strerror(errno));
+        return;
+    }
+
     if (::setuid(pw->pw_uid) == -1)
         std::fprintf(stderr, "setuid(%u): %s\n", pw->pw_uid, std::strerror(errno));
 }
@@ -1318,7 +1373,14 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
 {
     worker_loop_ = &loop;
 
-    auto listener = std::make_shared<TcpListener>(port, settings_.server_backlog);
+    std::shared_ptr<TcpListener> listener;
+    if (listen_fd_ >= 0) {
+        // Worker: borrow fd inherited from master (no bind, no close on exit)
+        listener = std::make_shared<TcpListener>(TcpListener::borrow_fd(listen_fd_));
+    } else {
+        // Single-process mode: create own listener
+        listener = std::make_shared<TcpListener>(port, settings_.server_backlog);
+    }
     http_port_ = listener->local_port();
 
     logger_->notice("HTTP server listening on port {}", http_port_);
