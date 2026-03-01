@@ -19,6 +19,74 @@ HTTP-сервер и сокеты PostgreSQL работают в **едином 
 
 ---
 
+## Быстрый старт
+
+Создайте новый проект из шаблона libapostol:
+
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/apostoldevel/libapostol/master/install.sh)
+```
+
+Сборка и запуск:
+
+```bash
+cd myapp
+./configure --debug
+cmake --build cmake-build-debug --parallel $(nproc)
+
+# Для локальной разработки: измените "prefix" в conf/default.json на "."
+mkdir -p logs
+./cmake-build-debug/myapp -c conf/default.json
+
+curl http://localhost:4977/api/v1/ping   # → {"ok":true,"message":"OK"}
+curl http://localhost:4977/docs          # → Swagger UI
+```
+
+Подробное руководство: **[Getting Started](https://github.com/apostoldevel/libapostol/wiki/Getting-Started)** в wiki.
+
+---
+
+## REST API со встроенным Swagger UI
+
+Наследуйте `RoutedModule`, определите маршруты — интерактивная документация API
+генерируется автоматически. Без внешних инструментов, кодогенерации и ручного YAML.
+
+```cpp
+void MyService::init_routes()
+{
+    routes_.add_route("GET", "/api/v1/ping",
+        [](const HttpRequest&, HttpResponse& resp, const PathParams&) {
+            resp.set_status(HttpStatus::ok)
+                .set_body(R"({"ok":true,"message":"OK"})",
+                          "application/json; charset=utf-8");
+        })
+        .summary("Ping healthcheck")
+        .tag("General")
+        .response(200, "OK");
+
+    routes_.add_route("GET", "/api/v1/users/{id}",
+        [](const HttpRequest&, HttpResponse& resp, const PathParams& params) {
+            auto id = params["id"];
+            // ...
+        })
+        .summary("Get user by ID")
+        .tag("Users")
+        .param("id", "path", "string", true, "User identifier")
+        .response(200, "User found")
+        .response(404, "Not found");
+}
+```
+
+Каждый маршрут, зарегистрированный через `RouteBuilder`, автоматически доступен как:
+
+- **`/docs`** — интерактивный [Swagger UI](https://swagger.io/tools/swagger-ui/) (загружается из CDN, без статических файлов)
+- **`/docs/api.json`** — спецификация OpenAPI 3.0 (JSON)
+- **`/docs/api.yaml`** — спецификация OpenAPI 3.0 (YAML)
+
+См. [Creating Modules](https://github.com/apostoldevel/libapostol/wiki/Creating-Modules) — полный справочник `RouteBuilder` API.
+
+---
+
 ## Возможности
 
 | Категория  | Компоненты                                                                                     |
@@ -27,8 +95,9 @@ HTTP-сервер и сокеты PostgreSQL работают в **едином 
 | Сеть       | TCP (TLS через OpenSSL), HTTP/1.1 (llhttp, keep-alive, chunked), WebSocket (RFC 6455), UDP     |
 | Клиенты    | FetchClient (CurlClient/HttpClient), SmtpClient, TcpClient, UdpClient, HttpProxy               |
 | PostgreSQL | Async pool (libpq+epoll), LISTEN/NOTIFY, deferred dispatch (`exec_sql`), PG utils               |
-| Безопасность | JWT-верификация (HS/RS/ES/PS через jwt-cpp), OAuth2-провайдеры, BotSession                    |
-| Утилиты    | Base64 (RFC 4648), File utils (SHA256, MIME), HTTP utils, SiteConfig                            |
+| REST API   | RoutedModule + RouteBuilder fluent API, параметры в путях, wildcard-маршруты, генерация спецификации OpenAPI 3.0, встроенный Swagger UI |
+| Безопасность | JWT-верификация (HS/RS/ES/PS через jwt-cpp), OAuth2-провайдеры, BotSession, CORS               |
+| Утилиты    | Base64 (RFC 4648), File utils (SHA256, MIME), HTTP utils, RouteManager, SiteConfig              |
 
 ## Технологический стек
 
@@ -52,6 +121,99 @@ HTTP-сервер и сокеты PostgreSQL работают в **едином 
 
 Все три флага можно выставить в `OFF` для минимальной сборки без опциональных
 зависимостей.
+
+---
+
+## Шаблонные проекты
+
+libapostol — это конструктор модулей. Выбираете нужные модули и собираете из них
+приложение. Два референсных проекта демонстрируют этот подход:
+
+### Apostol
+
+**[apostol](https://github.com/apostoldevel/apostol)** — HTTP-шлюз к PostgreSQL.
+
+| Модуль | Тип | Описание |
+|--------|-----|----------|
+| [PGHTTP](https://github.com/apostoldevel/module-PGHTTP) | Worker | HTTP → диспетчеризация PL/pgSQL-функций |
+| [WebServer](https://github.com/apostoldevel/module-WebServer) | Worker | Раздача статических файлов + Swagger UI |
+| [PGFetch](https://github.com/apostoldevel/module-PGFetch) | Helper | LISTEN/NOTIFY → исходящие HTTP-запросы |
+
+### Apostol CRM
+
+[Apostol](https://github.com/apostoldevel/apostol) + [db-platform](https://github.com/apostoldevel/db-platform) — **Apostol CRM**[^crm] — полноценная backend-платформа: авторизация, REST API, файловый сервер, WebSocket, фоновые процессы.
+
+---
+
+## Модули
+
+Все модули самодостаточны и переиспользуемы между проектами:
+
+### Workers (обработчики HTTP/WebSocket-запросов)
+
+| Модуль | Описание | Требования |
+|--------|----------|------------|
+| [PGHTTP](https://github.com/apostoldevel/module-PGHTTP) | HTTP → диспетчеризация PL/pgSQL-функций | WITH_POSTGRESQL |
+| [WebServer](https://github.com/apostoldevel/module-WebServer) | Раздача статических файлов + Swagger UI | — |
+| [AuthServer](https://github.com/apostoldevel/module-AuthServer) | Сервер авторизации OAuth 2.0 + JWT | WITH_POSTGRESQL + WITH_SSL |
+| [AppServer](https://github.com/apostoldevel/module-AppServer) | REST API с авторизацией → PostgreSQL | WITH_POSTGRESQL + WITH_SSL |
+| [FileServer](https://github.com/apostoldevel/module-FileServer) | Файловый сервер с JWT-авторизацией | WITH_POSTGRESQL + WITH_SSL |
+| [WebSocketAPI](https://github.com/apostoldevel/module-WebSocketAPI) | JSON-RPC + pub/sub через WebSocket | WITH_POSTGRESQL + WITH_SSL |
+| [StreamServer](https://github.com/apostoldevel/process-StreamServer) | Обработка UDP-датаграмм через PG | WITH_POSTGRESQL |
+
+### Helpers (фоновые модули в helper-процессе)
+
+| Модуль | Описание | Требования |
+|--------|----------|------------|
+| [PGFetch](https://github.com/apostoldevel/module-PGFetch) | LISTEN/NOTIFY → исходящие HTTP-запросы | WITH_POSTGRESQL |
+| [PGFile](https://github.com/apostoldevel/module-PGFile) | LISTEN/NOTIFY → синхронизация файлов (PG ↔ файловая система) | WITH_POSTGRESQL |
+
+### Процессы (независимые фоновые процессы)
+
+| Процесс | Описание | Требования |
+|---------|----------|------------|
+| [TaskScheduler](https://github.com/apostoldevel/process-TaskScheduler) | Выполнение задач по расписанию из очереди `db.job` | WITH_POSTGRESQL |
+| [ReportServer](https://github.com/apostoldevel/process-ReportServer) | Генерация отчётов по LISTEN/NOTIFY | WITH_POSTGRESQL |
+| [MessageServer](https://github.com/apostoldevel/process-MessageServer) | Рассылка сообщений (SMTP / FCM / HTTP API) | WITH_POSTGRESQL + WITH_SSL |
+| [Replication](https://github.com/apostoldevel/process-Replication) | Синхронизация данных master-slave по HTTP | WITH_POSTGRESQL |
+
+---
+
+## Бенчмарк
+
+**Apostol v2 vs v1 vs Python vs Node.js vs Go vs Nginx** — сравнительное
+тестирование в идентичных Docker-условиях.
+
+### /ping — без базы данных (keep-alive ON, 100 соединений)
+
+| Сервис | RPS | Latency p50 |
+|--------|----:|------------:|
+| Nginx (static return) | 585,000 | 119us |
+| **Apostol v2** | **271,000** | **351us** |
+| Go (net/http) | 115,000 | 0.87ms |
+| Apostol v1 | 67,000 | 1.48ms |
+| Node.js (Fastify) | 54,000 | 1.77ms |
+| Python (FastAPI) | 2,400 | 41ms |
+
+### /db/ping — PostgreSQL round-trip (keep-alive ON, 100 соединений)
+
+| Сервис | RPS | Latency p50 |
+|--------|----:|------------:|
+| **Apostol v2** | **69,000** | **1.42ms** |
+| Go | 58,000 | 1.62ms |
+| Apostol v1 | 33,000 | 3.02ms |
+| Node.js | 26,000 | 3.69ms |
+| Python | 2,300 | 42ms |
+
+**Ключевые результаты:**
+- Apostol v2 в **4 раза быстрее** v1 и в **2.4 раза быстрее** Go на /ping
+- Apostol v2 **опережает Nginx** при keep-alive OFF на 1000 соединениях (84K vs 74K RPS) благодаря `SO_REUSEPORT`
+- Минимальный разброс p99 latency среди всех сервисов (1.7x при 1000 соединениях)
+
+> Полные результаты, методология и анализ:
+> [REST API Benchmark](https://github.com/apostoldevel/apostol/blob/version2/doc/BENCHMARK.ru-RU.md).
+
+---
 
 ## Использование
 
@@ -95,6 +257,10 @@ src/
 CMakeLists.txt          конфигурация сборки
 ```
 
+## Документация
+
+- **[Wiki](https://github.com/apostoldevel/libapostol/wiki)** — Getting Started, Architecture, Configuration, Creating Modules, Creating Processes
+
 ## Требования
 
 - **C++20** — GCC 12+ или Clang 16+
@@ -106,3 +272,12 @@ CMakeLists.txt          конфигурация сборки
 ## Лицензия
 
 [MIT](https://github.com/apostoldevel/libapostol/blob/master/LICENSE)
+
+---
+
+[^crm]: **Apostol CRM** — абстрактный термин, а не самостоятельный продукт. Он обозначает
+любой проект, в котором совместно используются фреймворк
+[Apostol](https://github.com/apostoldevel/apostol) (C++) и
+[db-platform](https://github.com/apostoldevel/db-platform) через специально разработанные
+модули и процессы. Каждый фреймворк можно использовать независимо; вместе они образуют
+полноценную backend-платформу.
