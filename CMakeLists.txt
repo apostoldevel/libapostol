@@ -14,6 +14,12 @@ option(WITH_CURL       "Build with libcurl"            ON)
 
 include(FetchContent)
 
+# Disable tests/docs/examples for all FetchContent dependencies
+set(JSON_BuildTests     OFF CACHE BOOL "" FORCE)
+set(JSON_Install        OFF CACHE BOOL "" FORCE)
+set(FMT_TEST            OFF CACHE BOOL "" FORCE)
+set(FMT_DOC             OFF CACHE BOOL "" FORCE)
+
 # nlohmann/json
 FetchContent_Declare(
     nlohmann_json

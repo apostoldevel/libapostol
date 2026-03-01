@@ -21,8 +21,8 @@ git clone --depth 1 "$REPO_URL" "$TMPDIR/libapostol" 2>/dev/null
 
 # --- 2. Ask user ----------------------------------------------------------
 
-read -p "Project name [apostol]: " APP_NAME
-APP_NAME=${APP_NAME:-apostol}
+read -p "Project name [myapp]: " APP_NAME
+APP_NAME=${APP_NAME:-myapp}
 
 read -p "Project description [A project based on the Apostol framework.]: " APP_DESCRIPTION
 APP_DESCRIPTION=${APP_DESCRIPTION:-A project based on the Apostol framework.}
@@ -90,7 +90,11 @@ echo "With PostgreSQL:"
 echo "  ./configure --debug --with-postgresql"
 echo "  cmake --build cmake-build-debug --parallel \$(nproc)"
 echo ""
-echo "Run:"
-echo "  ./cmake-build-debug/$APP_NAME"
+echo "Run (after changing \"prefix\" to \".\" in conf/default.json):"
+echo "  mkdir -p logs"
+echo "  ./cmake-build-debug/$APP_NAME -c conf/default.json"
 echo "  curl http://localhost:4977/api/v1/ping"
 echo "  curl http://localhost:4977/docs"
+echo ""
+echo "NOTE: First configure downloads dependencies via CMake FetchContent"
+echo "      and may take 1-2 minutes depending on your network speed."

@@ -15,7 +15,6 @@ WITH_POSTGRESQL=OFF
 WITH_SSL=ON
 WITH_CURL=ON
 APP_NAME=$APP_NAME
-SERVER_TYPE=HTTP
 
 # --- Helpers --------------------------------------------------------------
 
@@ -41,7 +40,6 @@ display_help()
     display_message "  --without-postgresql     Disable PostgreSQL support"
     display_message "  --without-ssl            Disable OpenSSL support (default: on)"
     display_message "  --without-curl           Disable libcurl support (default: on)"
-    display_message "  --server-type=HTTP|TCP   Server type (default: HTTP)"
     display_message "  --app-name=<name>        Application binary / config name (default: $APP_NAME)"
     display_message ""
     display_message "  --help                   Display this help"
@@ -58,7 +56,6 @@ display_configuration()
     display_message "WITH_POSTGRESQL      : $WITH_POSTGRESQL"
     display_message "WITH_SSL             : $WITH_SSL"
     display_message "WITH_CURL            : $WITH_CURL"
-    display_message "SERVER_TYPE          : $SERVER_TYPE"
     display_message "APP_NAME             : $APP_NAME"
     display_message "--------------------------------------------------------------------"
 }
@@ -77,7 +74,6 @@ make_configuration()
         -DWITH_POSTGRESQL="$WITH_POSTGRESQL" \
         -DWITH_SSL="$WITH_SSL" \
         -DWITH_CURL="$WITH_CURL" \
-        -DSERVER_TYPE="$SERVER_TYPE" \
         -DAPP_NAME="$APP_NAME" \
         -B "$BUILD_DIR" .
 
@@ -108,7 +104,6 @@ for OPTION in "$@"; do
         (--without-ssl)        WITH_SSL=OFF ;;
         (--without-curl)       WITH_CURL=OFF ;;
 
-        (--server-type=*)      SERVER_TYPE="${OPTION#*=}" ;;
         (--app-name=*)         APP_NAME="${OPTION#*=}" ;;
         (--build-dir=*)        BUILD_DIR="${OPTION#*=}" ;;
     esac
