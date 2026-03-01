@@ -53,7 +53,10 @@ Application::Application(std::string_view name) : name_(name), logger_(std::make
     logger_->set_level(LogLevel::info);
 }
 
-Application::~Application() = default;
+Application::~Application()
+{
+    delete[] os_environ_;
+}
 
 // ─── set_info ────────────────────────────────────────────────────────────────
 
@@ -103,7 +106,7 @@ std::filesystem::path Application::resolve_path(std::string_view path,
 
 int Application::run(int argc, char* argv[])
 {
-    os_argv_ = argv;
+    init_setproctitle(argc, argv);
 
     // Build cmdline string for use in process titles
     cmdline_.clear();
@@ -685,7 +688,6 @@ void Application::single_run()
     // Re-arm the alternate signal stack: POSIX does not inherit sigaltstack across fork().
     setup_crash_altstack();
 
-    set_process_title(fmt::format("{}: single process", name_));
     logger_->notice("{} single process started (pid={})", name_, ::getpid());
     set_limit_nofile(cfg_limit_nofile());
 
@@ -721,6 +723,12 @@ void Application::single_run()
         return;
     }
 
+    // Set process title AFTER modules are registered
+    auto names = module_manager_.module_names();
+    set_process_title(names.empty()
+        ? fmt::format("{}: single process {}", name_, cmdline_)
+        : fmt::format("{}: single process ({})", name_, names));
+
     loop.run();
 
     module_manager_.on_stop();
@@ -740,7 +748,6 @@ void Application::worker_run()
     // Re-arm the alternate signal stack: POSIX does not inherit sigaltstack across fork().
     setup_crash_altstack();
 
-    set_process_title(fmt::format("{}: worker process", name_));
     logger_->notice("{} worker process started (pid={})", name_, ::getpid());
     set_limit_nofile(cfg_limit_nofile());
 
@@ -770,6 +777,12 @@ void Application::worker_run()
         return;
     }
 
+    // Set process title AFTER modules are registered
+    auto names = module_manager_.module_names();
+    set_process_title(names.empty()
+        ? fmt::format("{}: worker process", name_)
+        : fmt::format("{}: worker process ({})", name_, names));
+
     loop.run();
 
     module_manager_.on_stop();
@@ -786,7 +799,6 @@ void Application::helper_run()
     // Re-arm the alternate signal stack: POSIX does not inherit sigaltstack across fork().
     setup_crash_altstack();
 
-    set_process_title(fmt::format("{}: helper process", name_));
     logger_->notice("{} helper process started (pid={})", name_, ::getpid());
     set_limit_nofile(cfg_limit_nofile());
 
@@ -813,6 +825,12 @@ void Application::helper_run()
         exit_code_ = 1;
         return;
     }
+
+    // Set process title AFTER modules are registered
+    auto names = module_manager_.module_names();
+    set_process_title(names.empty()
+        ? fmt::format("{}: helper process", name_)
+        : fmt::format("{}: helper process ({})", name_, names));
 
     // Module heartbeat — every 1 second (mirrors worker's heartbeat in start_http_server)
     loop.add_timer(std::chrono::seconds(1),
@@ -842,8 +860,7 @@ void Application::custom_process_run(CustomProcess& proc)
     // 2. Crash handler (POSIX does not inherit sigaltstack across fork)
     setup_crash_altstack();
 
-    // 3. Process title + limits
-    set_process_title(fmt::format("{}: {} process", name_, proc.name()));
+    // 3. Limits + log
     logger_->notice("{} process '{}' started (pid={})", name_, proc.name(), ::getpid());
     set_limit_nofile(cfg_limit_nofile());
 
@@ -876,6 +893,12 @@ void Application::custom_process_run(CustomProcess& proc)
         exit_code_ = 1;
         return;
     }
+
+    // Set process title AFTER on_start (modules may be registered)
+    auto names = module_manager_.module_names();
+    set_process_title(names.empty()
+        ? fmt::format("{}: {} process", name_, proc.name())
+        : fmt::format("{}: {} process ({})", name_, proc.name(), names));
 
     // 7. Heartbeat timer (1s)
     loop.add_timer(std::chrono::seconds(1),
@@ -1047,11 +1070,60 @@ void Application::rolling_restart()
 
 // ─── OS-level helpers ─────────────────────────────────────────────────────────
 
+void Application::init_setproctitle(int argc, char* argv[])
+{
+    os_argc_ = argc;
+    os_argv_ = argv;
+
+    // Calculate contiguous argv+environ memory extent
+    os_argv_last_ = os_argv_[0];
+    for (int i = 0; i < os_argc_; ++i) {
+        if (os_argv_last_ == os_argv_[i])
+            os_argv_last_ = os_argv_[i] + std::strlen(os_argv_[i]) + 1;
+    }
+
+    // Copy environ to heap, extend os_argv_last_ through contiguous environ entries
+    std::size_t env_size = 0;
+    for (int i = 0; environ[i]; ++i)
+        env_size += std::strlen(environ[i]) + 1;
+
+    if (env_size > 0) {
+        os_environ_ = new char[env_size];
+        char* dst = os_environ_;
+
+        for (int i = 0; environ[i]; ++i) {
+            std::size_t len = std::strlen(environ[i]) + 1;
+            if (os_argv_last_ == environ[i]) {
+                os_argv_last_ = environ[i] + len;
+            }
+            std::memcpy(dst, environ[i], len);
+            environ[i] = dst;
+            dst += len;
+        }
+        os_argv_last_--;  // point to last usable byte
+    }
+}
+
 void Application::set_process_title(std::string_view title)
 {
-    // prctl(PR_SET_NAME) sets the thread name visible in /proc and ps (max 15 chars)
-    std::string t(title.substr(0, 15));
-    ::prctl(PR_SET_NAME, t.c_str(), 0, 0, 0);
+    // 1. prctl — sets thread name (/proc/pid/comm, max 15 chars)
+    std::string short_name(title.substr(0, 15));
+    ::prctl(PR_SET_NAME, short_name.c_str(), 0, 0, 0);
+
+    // 2. argv[0] rewrite — sets full title (/proc/pid/cmdline, htop/ps)
+    if (!os_argv_ || !os_argv_last_)
+        return;
+
+    os_argv_[1] = nullptr;
+
+    auto max_len = static_cast<std::size_t>(os_argv_last_ - os_argv_[0]);
+    auto copy_len = std::min(title.size(), max_len);
+
+    std::memcpy(os_argv_[0], title.data(), copy_len);
+
+    // Pad remaining space with NUL
+    if (copy_len < max_len)
+        std::memset(os_argv_[0] + copy_len, '\0', max_len - copy_len);
 }
 
 void Application::set_limit_nofile(std::uint32_t limit)

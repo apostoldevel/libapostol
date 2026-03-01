@@ -41,4 +41,18 @@ void ModuleManager::on_stop()
             m->on_stop();
 }
 
+std::string ModuleManager::module_names() const
+{
+    std::string result;
+    for (auto& m : modules_) {
+        if (m->enabled()) {
+            if (!result.empty()) result += ", ";
+            result += '"';
+            result += m->name();
+            result += '"';
+        }
+    }
+    return result;
+}
+
 } // namespace apostol

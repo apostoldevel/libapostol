@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -69,6 +70,9 @@ public:
 
     void on_start();
     void on_stop();
+
+    /// Comma-separated names of enabled modules (for process title).
+    std::string module_names() const;
 
 private:
     std::vector<std::unique_ptr<Module>> modules_;

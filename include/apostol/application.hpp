@@ -199,7 +199,8 @@ private:
     void rolling_restart();
 
     // ── OS-level helpers ──────────────────────────────────────────────────────
-    static void set_process_title(std::string_view title);
+    void init_setproctitle(int argc, char* argv[]);
+    void set_process_title(std::string_view title);
     static void set_limit_nofile(std::uint32_t limit);
     static void set_user(std::string_view user, std::string_view group);
 
@@ -276,7 +277,10 @@ private:
     std::string locale_;
     std::string conf_param_;  // global config directives (-g)
     std::string cmdline_;     // original command line (for process title)
+    int         os_argc_{0};
     char**      os_argv_{nullptr};
+    char*       os_argv_last_{nullptr};  // end of contiguous argv+environ memory
+    char*       os_environ_{nullptr};    // heap copy of environ
     int         exit_code_{0};
 
     std::unique_ptr<Logger>  logger_;
