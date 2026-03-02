@@ -188,30 +188,30 @@ libapostol — это конструктор модулей. Выбираете 
 
 | Сервис | RPS | Latency p50 |
 |--------|----:|------------:|
-| Nginx (static return) | 585,000 | 119us |
-| **Apostol v2** | **271,000** | **351us** |
-| Go (net/http) | 115,000 | 0.87ms |
-| Apostol v1 | 67,000 | 1.48ms |
-| Node.js (Fastify) | 54,000 | 1.77ms |
+| Nginx (static return) | 566,000 | 111us |
+| **Apostol v2** | **507,000** | **170us** |
+| Go (net/http) | 211,000 | 0.45ms |
+| Apostol v1 | 128,000 | 790us |
+| Node.js (Fastify) | 102,000 | 0.95ms |
 | Python (FastAPI) | 2,400 | 41ms |
 
 ### /db/ping — PostgreSQL round-trip (keep-alive ON, 100 соединений)
 
 | Сервис | RPS | Latency p50 |
 |--------|----:|------------:|
-| **Apostol v2** | **69,000** | **1.42ms** |
-| Go | 58,000 | 1.62ms |
-| Apostol v1 | 33,000 | 3.02ms |
-| Node.js | 26,000 | 3.69ms |
+| **Apostol v2** | **112,000** | **0.91ms** |
+| Go | 72,000 | 1.07ms |
+| Apostol v1 | 61,000 | 1.61ms |
+| Node.js | 36,000 | 2.65ms |
 | Python | 2,300 | 42ms |
 
 **Ключевые результаты:**
 - Apostol v2 в **4 раза быстрее** v1 и в **2.4 раза быстрее** Go на /ping
-- Apostol v2 **опережает Nginx** при keep-alive OFF на 1000 соединениях (84K vs 74K RPS) благодаря `SO_REUSEPORT`
-- Минимальный разброс p99 latency среди всех сервисов (1.7x при 1000 соединениях)
+- Apostol v2 достигает **90% пропускной способности Nginx** на /ping с keep-alive (507K vs 566K) и **не уступает Nginx** без keep-alive (84K vs 84K при c100)
+- При 1000 соединениях без keep-alive Apostol v2 **опережает Nginx** (81K vs 75K RPS) благодаря `SO_REUSEPORT`
 
 > Полные результаты, методология и анализ:
-> [REST API Benchmark](https://github.com/apostoldevel/apostol/blob/version2/doc/BENCHMARK.ru-RU.md).
+> [REST API Benchmark](https://github.com/apostoldevel/apostol/blob/master/doc/BENCHMARK.ru-RU.md).
 
 ---
 

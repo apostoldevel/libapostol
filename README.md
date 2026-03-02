@@ -188,30 +188,30 @@ benchmark under identical Docker conditions.
 
 | Service | RPS | Latency p50 |
 |---------|----:|------------:|
-| Nginx (static return) | 585,000 | 119us |
-| **Apostol v2** | **271,000** | **351us** |
-| Go (net/http) | 115,000 | 0.87ms |
-| Apostol v1 | 67,000 | 1.48ms |
-| Node.js (Fastify) | 54,000 | 1.77ms |
+| Nginx (static return) | 566,000 | 111us |
+| **Apostol v2** | **507,000** | **170us** |
+| Go (net/http) | 211,000 | 0.45ms |
+| Apostol v1 | 128,000 | 790us |
+| Node.js (Fastify) | 102,000 | 0.95ms |
 | Python (FastAPI) | 2,400 | 41ms |
 
 ### /db/ping — PostgreSQL round-trip (keep-alive ON, 100 connections)
 
 | Service | RPS | Latency p50 |
 |---------|----:|------------:|
-| **Apostol v2** | **69,000** | **1.42ms** |
-| Go | 58,000 | 1.62ms |
-| Apostol v1 | 33,000 | 3.02ms |
-| Node.js | 26,000 | 3.69ms |
+| **Apostol v2** | **112,000** | **0.91ms** |
+| Go | 72,000 | 1.07ms |
+| Apostol v1 | 61,000 | 1.61ms |
+| Node.js | 36,000 | 2.65ms |
 | Python | 2,300 | 42ms |
 
 **Key findings:**
 - Apostol v2 is **4x faster** than v1 and **2.4x faster** than Go on /ping
-- Apostol v2 **surpasses Nginx** at 1000 connections with keep-alive OFF (84K vs 74K RPS) thanks to `SO_REUSEPORT`
-- Tightest p99 latency spread of any service (1.7x at 1000 connections)
+- Apostol v2 reaches **90% of Nginx's throughput** on /ping with keep-alive (507K vs 566K) and **matches Nginx** without keep-alive (84K vs 84K at c100)
+- At 1000 connections without keep-alive, Apostol v2 **surpasses Nginx** (81K vs 75K RPS) thanks to `SO_REUSEPORT`
 
 > Full results, methodology, and analysis:
-> [REST API Benchmark](https://github.com/apostoldevel/apostol/blob/version2/doc/BENCHMARK.md).
+> [REST API Benchmark](https://github.com/apostoldevel/apostol/blob/master/doc/BENCHMARK.md).
 
 ---
 
