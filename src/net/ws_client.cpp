@@ -158,6 +158,8 @@ void WsClient::do_connect()
         if (auto_reconnect_ &&
             (state_ == WsClientState::Connected || state_ == WsClientState::Error))
         {
+            // Notify caller before reconnecting so they can log the reason
+            if (on_close_) on_close_(1006, "connection lost");
             state_ = WsClientState::Reconnecting;
             start_reconnect_timer();
         } else {
@@ -173,6 +175,8 @@ void WsClient::do_connect()
                                 state_ == WsClientState::Connecting ||
                                 state_ == WsClientState::Upgrading))
         {
+            // Notify caller before reconnecting so they can log the reason
+            if (on_error_) on_error_(err);
             state_ = WsClientState::Reconnecting;
             start_reconnect_timer();
         } else {
