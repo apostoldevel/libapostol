@@ -122,6 +122,7 @@ private:
     // Resolved address
     struct sockaddr_storage peer_addr_{};
     socklen_t peer_len_{0};
+    std::string hostname_;  // saved for TLS SNI
 
     // Output buffering
     struct WriteChunk {

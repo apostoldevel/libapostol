@@ -48,6 +48,7 @@ void TcpClient::connect(std::string_view host, uint16_t port)
     cleanup();
     state_ = TcpClientState::Resolving;
     output_.clear();
+    hostname_ = std::string(host);
 
     do_resolve(host, port);
     if (state_ == TcpClientState::Error)
@@ -436,6 +437,10 @@ void TcpClient::do_tls_handshake()
             return;
         }
         ::SSL_set_fd(ssl_.get(), fd_);
+
+        // SNI: tell the server which hostname we're connecting to
+        if (!hostname_.empty())
+            ::SSL_set_tlsext_host_name(ssl_.get(), hostname_.c_str());
     }
 
     int rc = ::SSL_connect(ssl_.get());
