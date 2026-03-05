@@ -149,12 +149,15 @@ void WsClient::do_connect()
     });
 
     tcp_.on_close([this] {
-        if (state_ == WsClientState::Closing || state_ == WsClientState::Closed)
+        if (state_ == WsClientState::Closing || state_ == WsClientState::Closed ||
+            state_ == WsClientState::Reconnecting)
             return;
 
         cancel_ping_timer();
 
-        if (auto_reconnect_ && state_ == WsClientState::Connected) {
+        if (auto_reconnect_ &&
+            (state_ == WsClientState::Connected || state_ == WsClientState::Error))
+        {
             state_ = WsClientState::Reconnecting;
             start_reconnect_timer();
         } else {
@@ -511,7 +514,16 @@ void WsClient::start_ping_timer()
             if (pong_pending_) {
                 ++pong_miss_count_;
                 if (pong_miss_count_ >= 2) {
-                    enter_error("pong timeout");
+                    // Pong timeout — force reconnect instead of entering
+                    // dead Error state (tcp_.on_close won't reconnect from Error).
+                    cancel_ping_timer();
+                    if (auto_reconnect_) {
+                        state_ = WsClientState::Reconnecting;
+                        tcp_.close();
+                        start_reconnect_timer();
+                    } else {
+                        enter_error("pong timeout");
+                    }
                     return;
                 }
             } else {
