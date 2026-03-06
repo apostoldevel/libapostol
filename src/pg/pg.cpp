@@ -360,7 +360,8 @@ void PgPool::on_io(PgConnection& conn, uint32_t /*events*/)
         }
 
         case PgConnState::Ready:
-            conn.consume_notify({});
+            // Worker connections have no LISTEN subscriptions —
+            // NOTIFY is handled by the dedicated listener_ connection.
             break;
 
         case PgConnState::Busy: {
