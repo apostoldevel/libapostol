@@ -590,6 +590,11 @@ void PgPool::on_listener_io(uint32_t /*events*/)
                 pg_logger_->error("{} Listener Error: {}", conn_tag(*listener_), listener_->error_message());
             loop_.remove_io(listener_->fd());
             listener_.reset();
+            // Re-populate pending channels so they get re-LISTENed on reconnect
+            for (const auto& [ch, _] : notify_handlers_)
+                pending_listens_.insert(ch);
+            if (!notify_handlers_.empty())
+                start_listener();
             break;
     }
 }
