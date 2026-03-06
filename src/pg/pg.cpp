@@ -137,6 +137,7 @@ bool PgConnection::connect_start()
         PQsetNoticeProcessor(raw, &PgConnection::notice_processor, this);
 
     fd_ = PQsocket(raw);
+    resetting_ = false;
     return true;
 }
 
@@ -159,6 +160,7 @@ bool PgConnection::reset_start()
         return false;
     }
     state_ = PgConnState::Connecting;
+    resetting_ = true;
     fd_    = PQsocket(conn_.get());
     return true;
 }
@@ -331,20 +333,28 @@ void PgPool::on_io(PgConnection& conn, uint32_t /*events*/)
     switch (conn.state()) {
 
         case PgConnState::Connecting: {
-            auto ps = conn.connect_poll();
+            // Use reset_poll for reconnecting connections, connect_poll for new ones
+            auto ps = conn.resetting() ? conn.reset_poll() : conn.connect_poll();
 
             if (pg_logger_)
-                pg_logger_->debug("{} PollingStatus: {}", conn_tag(conn), polling_status_name(ps));
+                pg_logger_->debug("{} {} PollingStatus: {}",
+                                 conn_tag(conn),
+                                 conn.resetting() ? "Reset" : "Connect",
+                                 polling_status_name(ps));
 
             if (ps == PGRES_POLLING_OK) {
                 if (pg_logger_)
-                    pg_logger_->notice("{} Connected.", conn_tag(conn));
+                    pg_logger_->notice("{} {}.",
+                                      conn_tag(conn),
+                                      conn.resetting() ? "Reconnected" : "Connected");
                 loop_.modify_io(conn.fd(), EPOLLIN);
                 dispatch_queue(conn);
             } else if (ps == PGRES_POLLING_FAILED) {
                 if (pg_logger_)
-                    pg_logger_->error("{} Error: {}", conn_tag(conn), conn.error_message());
-                loop_.remove_io(conn.fd());
+                    pg_logger_->error("{} Connect/Reset failed: {}",
+                                     conn_tag(conn), conn.error_message());
+                // Replace this dead connection
+                replace_connection(conn);
             }
             break;
         }
@@ -390,11 +400,20 @@ void PgPool::on_io(PgConnection& conn, uint32_t /*events*/)
             break;
         }
 
-        case PgConnState::Error:
+        case PgConnState::Error: {
             if (pg_logger_)
                 pg_logger_->error("{} Error: {}", conn_tag(conn), conn.error_message());
-            loop_.remove_io(conn.fd());
+
+            // Fail any in-flight query on this connection
+            fail_inflight_query(conn, conn.error_message());
+
+            // Attempt reconnect (mirrors v1 GetReadyConnection -> ResetStart)
+            if (!try_reconnect(conn)) {
+                // Reconnect failed — replace with a new connection
+                replace_connection(conn);
+            }
             break;
+        }
     }
 }
 
@@ -402,6 +421,16 @@ void PgPool::dispatch_queue(PgConnection& conn)
 {
     if (queue_.empty())
         return;
+
+    // Verify connection is actually alive before dispatching
+    if (!conn.connected()) {
+        if (pg_logger_)
+            pg_logger_->error("{} CONNECTION_BAD in dispatch_queue(), reconnecting",
+                             conn_tag(conn));
+        conn.set_state(PgConnState::Error);
+        try_reconnect(conn);
+        return;  // queue will be drained when connection recovers
+    }
 
     auto query = std::move(queue_.front());
     queue_.pop();
@@ -414,9 +443,13 @@ void PgPool::dispatch_queue(PgConnection& conn)
 
     if (!conn.send_query(query->sql())) {
         if (pg_logger_)
-            pg_logger_->error("{} ConnectException: Failed to send query", conn_tag(conn));
-        query->fail("Failed to send query");
+            pg_logger_->error("{} ConnectException: Failed to send query, re-queuing",
+                             conn_tag(conn));
         conn.set_current_query(nullptr);
+        // Re-queue the query instead of losing it (P1 Fix: retry)
+        queue_.push(std::move(query));
+        conn.set_state(PgConnState::Error);
+        try_reconnect(conn);
         return;
     }
 
@@ -432,9 +465,19 @@ void PgPool::execute(std::string              sql,
     q->on_result(std::move(on_result));
     q->on_exception(std::move(on_exception));
 
-    // Find a ready connection
+    // Find a ready connection (mirrors v1 GetReadyConnection)
     for (auto& c : conns_) {
         if (c->state() == PgConnState::Ready) {
+            // P0 Fix: verify actual PQstatus before using (v1 checks Connected())
+            if (!c->connected()) {
+                if (pg_logger_)
+                    pg_logger_->error("{} CONNECTION_BAD detected in execute(), reconnecting",
+                                     conn_tag(*c));
+                c->set_state(PgConnState::Error);
+                try_reconnect(*c);
+                continue;  // skip to next connection
+            }
+
             PgQuery* raw_q = q.get();
             c->set_current_query(raw_q);
 
@@ -445,14 +488,154 @@ void PgPool::execute(std::string              sql,
                 inflight_.push_back(std::move(q));
                 return;
             }
+
+            // send_query failed — connection probably died
             if (pg_logger_)
-                pg_logger_->error("{} ConnectException: Failed to send query", conn_tag(*c));
+                pg_logger_->error("{} ConnectException: Failed to send query, reconnecting",
+                                 conn_tag(*c));
             c->set_current_query(nullptr);
+            c->set_state(PgConnState::Error);
+            try_reconnect(*c);
+            // Don't return — try next connection or queue
         }
     }
 
     // No ready connection — queue
     queue_.push(std::move(q));
+
+    // Ensure we have enough connections to eventually drain the queue
+    ensure_min_connections();
+}
+
+// ── PgPool — Reconnect & Health ───────────────────────────────────────────────
+
+bool PgPool::try_reconnect(PgConnection& conn)
+{
+    int old_fd = conn.fd();
+
+    // Attempt async reset (reuses existing PGconn handle — cheapest reconnect)
+    if (!conn.reset_start()) {
+        if (pg_logger_)
+            pg_logger_->error("{} reset_start() failed", conn_tag(conn));
+        return false;
+    }
+
+    int new_fd = conn.fd();
+
+    if (pg_logger_)
+        pg_logger_->notice("{} Reconnecting (reset_start)...", conn_tag(conn));
+
+    // Handle fd change (v1: OnChangeSocket)
+    if (new_fd != old_fd) {
+        if (old_fd >= 0)
+            loop_.remove_io(old_fd);
+        if (new_fd >= 0) {
+            loop_.add_io(new_fd, EPOLLIN | EPOLLOUT, [this, &conn](uint32_t events) {
+                on_io(conn, events);
+            });
+        }
+    } else {
+        // Same fd — re-enable write events for polling
+        if (new_fd >= 0)
+            loop_.modify_io(new_fd, EPOLLIN | EPOLLOUT);
+    }
+
+    return true;
+}
+
+void PgPool::replace_connection(PgConnection& conn)
+{
+    int old_fd = conn.fd();
+    if (old_fd >= 0)
+        loop_.remove_io(old_fd);
+
+    // Find and erase this connection from conns_
+    auto it = std::find_if(conns_.begin(), conns_.end(),
+        [&conn](const std::unique_ptr<PgConnection>& p) {
+            return p.get() == &conn;
+        });
+
+    if (it != conns_.end()) {
+        if (pg_logger_)
+            pg_logger_->notice("{} Replacing dead connection", conn_tag(conn));
+        conns_.erase(it);
+    }
+
+    // Create replacement
+    ensure_min_connections();
+}
+
+void PgPool::fail_inflight_query(PgConnection& conn, std::string_view reason)
+{
+    PgQuery* raw_q = conn.current_query();
+    conn.set_current_query(nullptr);
+
+    if (!raw_q)
+        return;
+
+    auto it = std::find_if(inflight_.begin(), inflight_.end(),
+        [raw_q](const std::unique_ptr<PgQuery>& p) {
+            return p.get() == raw_q;
+        });
+
+    if (it != inflight_.end()) {
+        auto owned = std::move(*it);
+        inflight_.erase(it);
+        // Re-queue the query for retry instead of failing it permanently
+        if (pg_logger_)
+            pg_logger_->notice("Re-queuing query after connection error: {}",
+                              owned->sql().substr(0, 80));
+        queue_.push(std::move(owned));
+    }
+}
+
+void PgPool::ensure_min_connections()
+{
+    auto healthy = healthy_count();
+    while (healthy < min_conns_ && conns_.size() < max_conns_ + min_conns_) {
+        new_connection();
+        healthy++;
+    }
+}
+
+std::size_t PgPool::healthy_count() const
+{
+    std::size_t count = 0;
+    for (const auto& c : conns_) {
+        auto s = c->state();
+        if ((s == PgConnState::Ready || s == PgConnState::Busy || s == PgConnState::Connecting)
+            && c->fd() >= 0)
+            count++;
+    }
+    return count;
+}
+
+void PgPool::heartbeat()
+{
+    // Check each connection's actual PQstatus (not cached state_)
+    for (auto& c : conns_) {
+        if (c->state() == PgConnState::Ready || c->state() == PgConnState::Busy) {
+            if (!c->connected()) {
+                if (pg_logger_)
+                    pg_logger_->error("{} CONNECTION_BAD detected in heartbeat, reconnecting",
+                                     conn_tag(*c));
+                fail_inflight_query(*c, "connection lost");
+                if (!try_reconnect(*c)) {
+                    replace_connection(*c);
+                    break;  // conns_ was modified, restart on next heartbeat
+                }
+            }
+        }
+    }
+
+    // Ensure min_conns
+    ensure_min_connections();
+
+    // Drain queue if there are ready connections
+    for (auto& c : conns_) {
+        if (c->state() == PgConnState::Ready && !queue_.empty())
+            dispatch_queue(*c);
+    }
 }
 
 // ── PgPool — LISTEN / NOTIFY ──────────────────────────────────────────────────

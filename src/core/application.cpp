@@ -878,6 +878,17 @@ void Application::helper_run()
             module_manager_.heartbeat(std::chrono::system_clock::now());
         });
 
+#ifdef WITH_POSTGRESQL
+    // PgPool heartbeat — every 60 seconds (connection health check + reconnect)
+    if (db_pool_) {
+        loop.add_timer(std::chrono::seconds(60),
+            [this]
+            {
+                db_pool_->heartbeat();
+            });
+    }
+#endif
+
     loop.run();
 
     module_manager_.on_stop();
@@ -1443,6 +1454,17 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
         {
             module_manager_.heartbeat(std::chrono::system_clock::now());
         });
+
+#ifdef WITH_POSTGRESQL
+    // PgPool heartbeat — every 60 seconds (connection health check + reconnect)
+    if (db_pool_) {
+        loop.add_timer(std::chrono::seconds(60),
+            [this]
+            {
+                db_pool_->heartbeat();
+            });
+    }
+#endif
 }
 
 } // namespace apostol

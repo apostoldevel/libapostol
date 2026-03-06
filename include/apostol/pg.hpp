@@ -137,6 +137,7 @@ public:
     bool         connected() const;
     PgConnState  state()     const { return state_; }
     void         set_state(PgConnState s) { state_ = s; }
+    bool         resetting() const { return resetting_; }
 
     const char*  error_message() const;
 
@@ -162,6 +163,7 @@ private:
     PgConnState      state_{PgConnState::Connecting};
     PgQuery*         current_query_{nullptr};
     int              fd_{-1};
+    bool             resetting_{false};
     NoticeCallback   notice_cb_;
 };
 
@@ -170,6 +172,11 @@ private:
 /// Connection pool.
 /// Owns N PgConnections, integrates with EventLoop.
 /// execute() dispatches to a ready connection or queues the query.
+///
+/// Reconnect strategy (mirrors v1 CPQConnectPoll):
+/// - On Error state: attempt PQresetStart() to reconnect in-place
+/// - On dispatch: verify PQstatus() before sending queries
+/// - Periodic heartbeat: check health, restore min_conns, cleanup idle
 class PgPool
 {
 public:
@@ -193,6 +200,10 @@ public:
                  PgQuery::ExceptionHandler on_exception = {},
                  bool                      quiet = false);
 
+    /// Call periodically (e.g. every 60s from module heartbeat).
+    /// Checks connection health, reconnects dead connections, restores min_conns.
+    void heartbeat();
+
     // ── LISTEN / NOTIFY ───────────────────────────────────────────────────────
 
     using NotifyHandler = std::function<void(std::string_view channel,
@@ -213,6 +224,23 @@ private:
     void new_connection();
     void on_io(PgConnection& conn, uint32_t events);
     void dispatch_queue(PgConnection& conn);
+
+    /// Attempt to reconnect a connection via PQresetStart.
+    /// Handles fd change (remove old epoll, add new).
+    /// Returns true if reset was initiated successfully.
+    bool try_reconnect(PgConnection& conn);
+
+    /// Remove a dead connection from the pool and create a replacement.
+    void replace_connection(PgConnection& conn);
+
+    /// Fail any in-flight query on this connection and re-queue it if retriable.
+    void fail_inflight_query(PgConnection& conn, std::string_view reason);
+
+    /// Ensure at least min_conns_ healthy connections exist.
+    void ensure_min_connections();
+
+    /// Count connections in Ready or Busy state.
+    std::size_t healthy_count() const;
 
     /// Format v1-style connection tag: [backend_pid] [fd] [postgresql://user@host:port/dbname]
     std::string conn_tag(const PgConnection& conn) const;
