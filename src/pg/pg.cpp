@@ -144,6 +144,7 @@ bool PgConnection::connect_start()
 PostgresPollingStatusType PgConnection::connect_poll()
 {
     auto ps = PQconnectPoll(conn_.get());
+    fd_ = PQsocket(conn_.get());  // docs: re-determine socket after each poll
 
     if (ps == PGRES_POLLING_OK)
         state_ = PgConnState::Ready;
@@ -159,6 +160,7 @@ bool PgConnection::reset_start()
         state_ = PgConnState::Error;
         return false;
     }
+    PQsetnonblocking(conn_.get(), 1);  // restore nonblocking after reset
     state_ = PgConnState::Connecting;
     resetting_ = true;
     fd_    = PQsocket(conn_.get());
@@ -168,6 +170,7 @@ bool PgConnection::reset_start()
 PostgresPollingStatusType PgConnection::reset_poll()
 {
     auto ps = PQresetPoll(conn_.get());
+    fd_ = PQsocket(conn_.get());  // docs: re-determine socket after each poll
 
     if (ps == PGRES_POLLING_OK)
         state_ = PgConnState::Ready;
@@ -188,8 +191,10 @@ bool PgConnection::send_query(const std::string& sql)
         return false;
     if (PQsendQuery(conn_.get(), sql.c_str()) == 0)
         return false;
-    // Best-effort flush — on loopback this always succeeds immediately
-    PQflush(conn_.get());
+    int flush_ret = PQflush(conn_.get());
+    if (flush_ret == -1)
+        return false;  // flush error — treat as send failure
+    needs_flush_ = (flush_ret == 1);  // 1 = more data to send, need EPOLLOUT
     state_ = PgConnState::Busy;
     return true;
 }
@@ -198,8 +203,10 @@ std::vector<PgResult> PgConnection::collect_results()
 {
     std::vector<PgResult> out;
 
-    if (PQconsumeInput(conn_.get()) == 0)
-        return out;   // error consuming — return empty
+    if (PQconsumeInput(conn_.get()) == 0) {
+        state_ = PgConnState::Error;  // connection is dead
+        return out;
+    }
 
     // PQisBusy returns 1 if the query is still in progress
     while (PQisBusy(conn_.get()) == 0) {
@@ -217,7 +224,10 @@ std::vector<PgResult> PgConnection::collect_results()
 
 bool PgConnection::flush()
 {
-    return PQflush(conn_.get()) == 0;
+    int ret = PQflush(conn_.get());
+    if (ret == 0)
+        needs_flush_ = false;
+    return ret == 0;
 }
 
 int PgConnection::consume_notify(
@@ -328,13 +338,27 @@ void PgPool::new_connection()
     });
 }
 
-void PgPool::on_io(PgConnection& conn, uint32_t /*events*/)
+void PgPool::on_io(PgConnection& conn, uint32_t events)
 {
     switch (conn.state()) {
 
         case PgConnState::Connecting: {
+            int old_fd = conn.fd();
+
             // Use reset_poll for reconnecting connections, connect_poll for new ones
             auto ps = conn.resetting() ? conn.reset_poll() : conn.connect_poll();
+
+            // Handle fd change during handshake (docs: PQsocket can change after each poll)
+            int new_fd = conn.fd();
+            if (new_fd != old_fd) {
+                if (old_fd >= 0)
+                    loop_.remove_io(old_fd);
+                if (new_fd >= 0) {
+                    loop_.add_io(new_fd, EPOLLIN | EPOLLOUT, [this, &conn](uint32_t ev) {
+                        on_io(conn, ev);
+                    });
+                }
+            }
 
             if (pg_logger_)
                 pg_logger_->debug("{} {} PollingStatus: {}",
@@ -355,6 +379,13 @@ void PgPool::on_io(PgConnection& conn, uint32_t /*events*/)
                                      conn_tag(conn), conn.error_message());
                 // Replace this dead connection
                 replace_connection(conn);
+            } else {
+                // Adjust epoll for what poll needs next (Issue #5)
+                uint32_t want = (ps == PGRES_POLLING_READING) ? EPOLLIN
+                              : (ps == PGRES_POLLING_WRITING) ? EPOLLOUT
+                              : (EPOLLIN | EPOLLOUT);
+                if (conn.fd() >= 0)
+                    loop_.modify_io(conn.fd(), want);
             }
             break;
         }
@@ -365,9 +396,32 @@ void PgPool::on_io(PgConnection& conn, uint32_t /*events*/)
             break;
 
         case PgConnState::Busy: {
+            // Handle pending flush on writable event (Issue #2)
+            if ((events & EPOLLOUT) && conn.needs_flush()) {
+                if (conn.flush()) {
+                    // Fully flushed — only need EPOLLIN for results
+                    loop_.modify_io(conn.fd(), EPOLLIN);
+                }
+                // If flush() returned false (PQflush==1), keep EPOLLOUT
+                if (!(events & EPOLLIN))
+                    break;  // no readable data yet
+            }
+
             auto results = conn.collect_results();
+
+            // Issue #1: PQconsumeInput failed — connection is dead
+            if (conn.state() == PgConnState::Error) {
+                if (pg_logger_)
+                    pg_logger_->error("{} PQconsumeInput failed: {}",
+                                     conn_tag(conn), conn.error_message());
+                fail_inflight_query(conn, conn.error_message());
+                if (!try_reconnect(conn))
+                    replace_connection(conn);
+                break;
+            }
+
             if (results.empty())
-                break;  // still in progress
+                break;  // still in progress (PQisBusy == 1)
 
             if (pg_logger_) {
                 bool quiet = conn.current_query() && conn.current_query()->quiet();
@@ -454,6 +508,10 @@ void PgPool::dispatch_queue(PgConnection& conn)
         return;
     }
 
+    // If flush was incomplete, need EPOLLOUT to continue flushing
+    if (conn.needs_flush())
+        loop_.modify_io(conn.fd(), EPOLLIN | EPOLLOUT);
+
     inflight_.push_back(std::move(query));
 }
 
@@ -486,6 +544,8 @@ void PgPool::execute(std::string              sql,
                 pg_logger_->debug("{} Query: {}", conn_tag(*c), q->sql());
 
             if (c->send_query(q->sql())) {
+                if (c->needs_flush())
+                    loop_.modify_io(c->fd(), EPOLLIN | EPOLLOUT);
                 inflight_.push_back(std::move(q));
                 return;
             }

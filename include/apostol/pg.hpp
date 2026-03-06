@@ -138,6 +138,7 @@ public:
     PgConnState  state()     const { return state_; }
     void         set_state(PgConnState s) { state_ = s; }
     bool         resetting() const { return resetting_; }
+    bool         needs_flush() const { return needs_flush_; }
 
     const char*  error_message() const;
 
@@ -164,6 +165,7 @@ private:
     PgQuery*         current_query_{nullptr};
     int              fd_{-1};
     bool             resetting_{false};
+    bool             needs_flush_{false};
     NoticeCallback   notice_cb_;
 };
 
