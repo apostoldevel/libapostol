@@ -100,6 +100,10 @@ void CurlClient::perform(std::string_view url,
     curl_easy_setopt(xfer->easy, CURLOPT_ACCEPT_ENCODING, "gzip, deflate, br");
     curl_easy_setopt(xfer->easy, CURLOPT_HTTP_CONTENT_DECODING, 1L);
 
+    // Follow HTTP redirects (S3 pre-signed URLs, CDN 301/302)
+    curl_easy_setopt(xfer->easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(xfer->easy, CURLOPT_MAXREDIRS, 5L);
+
     // Timeout
     if (timeout_ms_ > 0)
         curl_easy_setopt(xfer->easy, CURLOPT_TIMEOUT_MS, timeout_ms_);

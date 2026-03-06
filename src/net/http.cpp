@@ -1,12 +1,18 @@
 #include "apostol/http.hpp"
+#include "apostol/event_loop.hpp"
 
 #include <llhttp.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <fcntl.h>
 #include <fmt/format.h>
 #include <stdexcept>
 #include <string>
+#include <sys/sendfile.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace apostol
 {
@@ -600,8 +606,16 @@ bool HttpParser::feed(const char* data, std::size_t len)
 
 // ─── HttpConnection ───────────────────────────────────────────────────────────
 
-HttpConnection::HttpConnection(TcpConnection conn) : conn_(std::move(conn))
+HttpConnection::HttpConnection(TcpConnection conn, EventLoop* loop)
+    : conn_(std::move(conn))
+    , loop_(loop)
 {}
+
+HttpConnection::~HttpConnection()
+{
+    if (file_fd_ >= 0)
+        ::close(file_fd_);
+}
 
 bool HttpConnection::on_readable(RequestHandler handler)
 {
@@ -657,15 +671,30 @@ bool HttpConnection::on_readable(RequestHandler handler)
 
 void HttpConnection::send_response(const HttpResponse& resp)
 {
+    if (closed_) return;
+
     std::string data = resp.serialize();
-    const char* ptr  = data.data();
-    std::size_t rem  = data.size();
+
+    // If there are already pending writes, just append
+    if (write_pos_ < write_buf_.size() || file_fd_ >= 0) {
+        write_buf_.append(data);
+        return;
+    }
+
+    const char* ptr = data.data();
+    std::size_t rem = data.size();
 
     while (rem > 0) {
         ssize_t n = conn_.write(ptr, rem);
         if (n < 0) {
-            // EAGAIN — in a production implementation we'd buffer; here we
-            // spin briefly (write buffer on loopback flushes immediately)
+            // EAGAIN — buffer remainder and register EPOLLOUT
+            if (loop_) {
+                write_buf_.assign(ptr, rem);
+                write_pos_ = 0;
+                update_write_interest();
+                return;
+            }
+            // No EventLoop — spin (legacy behavior for tests)
             continue;
         }
         if (n == 0) break;
@@ -674,8 +703,170 @@ void HttpConnection::send_response(const HttpResponse& resp)
     }
 }
 
+void HttpConnection::send_file(const std::string& path, std::string_view mime_type)
+{
+    if (closed_) return;
+
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        HttpResponse r;
+        r.set_status(HttpStatus::not_found).set_body("file not readable");
+        send_response(r);
+        return;
+    }
+
+    struct stat st;
+    if (::fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        ::close(fd);
+        HttpResponse r;
+        r.set_status(HttpStatus::not_found).set_body("not a regular file");
+        send_response(r);
+        return;
+    }
+
+    auto file_size = static_cast<std::size_t>(st.st_size);
+
+    // Construct HTTP response headers
+    auto headers = fmt::format(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: {}\r\n"
+        "Content-Length: {}\r\n"
+        "\r\n",
+        mime_type, file_size);
+
+    // If there are already pending writes, append headers and queue file
+    if (write_pos_ < write_buf_.size() || file_fd_ >= 0) {
+        write_buf_.append(headers);
+        // Can't queue two files — fallback to buffered read
+        if (file_fd_ >= 0) {
+            // Read entire file into write buffer (rare edge case)
+            std::string buf(file_size, '\0');
+            ::read(fd, buf.data(), file_size);
+            ::close(fd);
+            write_buf_.append(buf);
+            return;
+        }
+        file_fd_ = fd;
+        file_offset_ = 0;
+        file_remaining_ = file_size;
+        update_write_interest();
+        return;
+    }
+
+    // Try to write headers immediately
+    const char* ptr = headers.data();
+    std::size_t rem = headers.size();
+
+    while (rem > 0) {
+        ssize_t n = conn_.write(ptr, rem);
+        if (n < 0) {
+            // EAGAIN — buffer headers + queue file
+            write_buf_.assign(ptr, rem);
+            write_pos_ = 0;
+            file_fd_ = fd;
+            file_offset_ = 0;
+            file_remaining_ = file_size;
+            update_write_interest();
+            return;
+        }
+        if (n == 0) { ::close(fd); return; }
+        ptr += n;
+        rem -= static_cast<std::size_t>(n);
+    }
+
+    // Headers sent — now sendfile
+    file_fd_ = fd;
+    file_offset_ = 0;
+    file_remaining_ = file_size;
+
+    if (drain_file())
+        return;  // File fully sent
+
+    // Partial — register EPOLLOUT for remainder
+    update_write_interest();
+}
+
+bool HttpConnection::on_writable()
+{
+    if (closed_) return false;
+
+    // Drain buffered data first (headers, serialized responses)
+    if (!drain_buffer())
+        return true;
+
+    // Then drain file via sendfile(2)
+    if (file_fd_ >= 0) {
+        if (!drain_file())
+            return true;
+    }
+
+    // All done — remove EPOLLOUT interest
+    update_write_interest();
+    return false;
+}
+
+bool HttpConnection::has_pending_writes() const noexcept
+{
+    return write_pos_ < write_buf_.size() || file_fd_ >= 0;
+}
+
+bool HttpConnection::drain_buffer()
+{
+    while (write_pos_ < write_buf_.size()) {
+        ssize_t n = conn_.write(
+            write_buf_.data() + write_pos_,
+            write_buf_.size() - write_pos_);
+        if (n < 0)
+            return false;  // EAGAIN — try again on next EPOLLOUT
+        if (n == 0) {
+            closed_ = true;
+            return true;
+        }
+        write_pos_ += static_cast<std::size_t>(n);
+    }
+    write_buf_.clear();
+    write_pos_ = 0;
+    return true;
+}
+
+bool HttpConnection::drain_file()
+{
+    while (file_remaining_ > 0) {
+        ssize_t n = ::sendfile(conn_.fd(), file_fd_,
+                               &file_offset_, file_remaining_);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return false;  // Try again on next EPOLLOUT
+            // Actual error (EPIPE, etc.) — give up
+            break;
+        }
+        if (n == 0)
+            break;  // EOF
+        file_remaining_ -= static_cast<std::size_t>(n);
+    }
+
+    ::close(file_fd_);
+    file_fd_ = -1;
+    file_remaining_ = 0;
+    return true;
+}
+
+void HttpConnection::update_write_interest()
+{
+    if (!loop_) return;
+
+    if (has_pending_writes())
+        loop_->modify_io(conn_.fd(), EPOLLIN | EPOLLOUT | EPOLLRDHUP);
+    else
+        loop_->modify_io(conn_.fd(), EPOLLIN | EPOLLRDHUP);
+}
+
 TcpConnection HttpConnection::release_tcp()
 {
+    if (file_fd_ >= 0) {
+        ::close(file_fd_);
+        file_fd_ = -1;
+    }
     closed_ = true;
     return std::move(conn_);
 }

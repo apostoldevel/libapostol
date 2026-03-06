@@ -20,6 +20,8 @@ using llhttp_settings_t = llhttp_settings_s;
 namespace apostol
 {
 
+class EventLoop;  // forward declaration for HttpConnection async writes
+
 // ─── HttpStatus ──────────────────────────────────────────────────────────────
 
 enum class HttpStatus : int {
@@ -270,14 +272,26 @@ private:
 
 /// Owns a TcpConnection and an HttpParser.
 /// Call on_readable() each time the fd becomes readable (EPOLLIN).
+///
+/// Supports async writes: if a write cannot complete immediately, the remainder
+/// is buffered and flushed via EPOLLOUT (requires EventLoop* passed to ctor).
+/// send_file() uses sendfile(2) for zero-copy file serving.
 class HttpConnection
 {
 public:
     using RequestHandler = std::function<void(const HttpRequest&, HttpResponse&)>;
 
-    explicit HttpConnection(TcpConnection conn);
+    /// @param loop  If non-null, enables async write buffering + sendfile.
+    explicit HttpConnection(TcpConnection conn, EventLoop* loop = nullptr);
+    ~HttpConnection();
+
+    HttpConnection(const HttpConnection&)            = delete;
+    HttpConnection& operator=(const HttpConnection&) = delete;
+    HttpConnection(HttpConnection&&)                 = delete;
+    HttpConnection& operator=(HttpConnection&&)      = delete;
 
     int fd() const noexcept { return conn_.fd(); }
+    bool closed() const noexcept { return closed_; }
 
     /// Read available data, parse HTTP, and call @p handler for each complete
     /// request.  Sends the response synchronously via send_response().
@@ -285,7 +299,21 @@ public:
     bool on_readable(RequestHandler handler);
 
     /// Write the serialized response to the socket.
+    /// If EventLoop is available and the write would block, the remainder is
+    /// buffered and flushed asynchronously via EPOLLOUT.
     void send_response(const HttpResponse& resp);
+
+    /// Send a file directly from disk using sendfile(2) zero-copy.
+    /// Constructs and sends HTTP 200 headers, then streams file data.
+    /// Requires EventLoop* (falls back to buffered read if null).
+    void send_file(const std::string& path, std::string_view mime_type);
+
+    /// Drain pending writes. Call on EPOLLOUT events.
+    /// Returns true if there are still pending writes.
+    bool on_writable();
+
+    /// True if there is buffered data or an active file transfer.
+    bool has_pending_writes() const noexcept;
 
     /// Transfer ownership of the underlying TCP connection out of this
     /// HttpConnection. After this call do not call on_readable() or
@@ -295,7 +323,21 @@ public:
 private:
     TcpConnection conn_;
     HttpParser    parser_;
+    EventLoop*    loop_{nullptr};
     bool          closed_{false};
+
+    // Async write buffer
+    std::string   write_buf_;
+    std::size_t   write_pos_{0};
+
+    // sendfile(2) state
+    int           file_fd_{-1};
+    off_t         file_offset_{0};
+    std::size_t   file_remaining_{0};
+
+    bool drain_buffer();
+    bool drain_file();
+    void update_write_interest();
 };
 
 } // namespace apostol

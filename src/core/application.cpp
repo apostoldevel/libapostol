@@ -1404,12 +1404,19 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
             if (!conn_opt)
                 return;
 
-            auto http_conn = std::make_shared<HttpConnection>(std::move(*conn_opt));
+            auto http_conn = std::make_shared<HttpConnection>(std::move(*conn_opt), &loop);
             int  conn_fd   = http_conn->fd();
 
             loop.add_io(conn_fd, EPOLLIN | EPOLLRDHUP,
-                [this, &loop, http_conn, conn_fd](uint32_t)
+                [this, &loop, http_conn, conn_fd](uint32_t events)
                 {
+                    // Drain pending async writes (sendfile, buffered responses)
+                    if (events & EPOLLOUT)
+                        http_conn->on_writable();
+
+                    if (!(events & (EPOLLIN | EPOLLRDHUP)))
+                        return;
+
                     bool upgraded = false;
 
                     bool keep = http_conn->on_readable(
