@@ -660,19 +660,15 @@ bool PgPool::try_reconnect(PgConnection& conn)
     if (pg_logger_)
         pg_logger_->notice("{} Reconnecting (reset_start)...", conn_tag(conn));
 
-    // Handle fd change (v1: OnChangeSocket)
-    if (new_fd != old_fd) {
-        if (old_fd >= 0)
-            loop_.remove_io(old_fd);
-        if (new_fd >= 0) {
-            loop_.add_io(new_fd, EPOLLIN | EPOLLOUT, [this, &conn](uint32_t events) {
-                on_io(conn, events);
-            });
-        }
-    } else {
-        // Same fd — re-enable write events for polling
-        if (new_fd >= 0)
-            loop_.modify_io(new_fd, EPOLLIN | EPOLLOUT);
+    // PQresetStart() closes the old socket internally, which removes it from
+    // epoll.  Even when libpq re-opens a socket with the same fd number, the
+    // kernel epoll registration is gone.  Always remove + re-add to be safe.
+    if (old_fd >= 0)
+        loop_.remove_io(old_fd);
+    if (new_fd >= 0) {
+        loop_.add_io(new_fd, EPOLLIN | EPOLLOUT, [this, &conn](uint32_t events) {
+            on_io(conn, events);
+        });
     }
 
     return true;
