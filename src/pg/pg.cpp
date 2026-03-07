@@ -64,7 +64,8 @@ bool PgResult::ok() const
 // ── PgQuery ───────────────────────────────────────────────────────────────────
 
 PgQuery::PgQuery(std::string sql, bool quiet)
-    : sql_(std::move(sql))
+    : id_(++next_id_)
+    , sql_(std::move(sql))
     , quiet_(quiet)
 {
 }
@@ -183,6 +184,30 @@ PostgresPollingStatusType PgConnection::reset_poll()
 bool PgConnection::connected() const
 {
     return conn_ && PQstatus(conn_.get()) == CONNECTION_OK;
+}
+
+bool PgConnection::cancel(std::string& errbuf)
+{
+    if (!conn_) {
+        errbuf = "no connection";
+        return false;
+    }
+
+    PGcancel* pgcancel = PQgetCancel(conn_.get());
+    if (!pgcancel) {
+        errbuf = "PQgetCancel returned null";
+        return false;
+    }
+
+    char buf[256]{};
+    int ok = PQcancel(pgcancel, buf, sizeof(buf));
+    PQfreeCancel(pgcancel);
+
+    if (!ok) {
+        errbuf = buf;
+        return false;
+    }
+    return true;
 }
 
 bool PgConnection::send_query(const std::string& sql)
@@ -447,7 +472,12 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                 if (it != inflight_.end()) {
                     auto owned = std::move(*it);
                     inflight_.erase(it);
-                    owned->deliver(std::move(results));
+                    if (owned->canceled()) {
+                        if (pg_logger_)
+                            pg_logger_->debug("Discarding results of canceled query {}", owned->id());
+                    } else {
+                        owned->deliver(std::move(results));
+                    }
                 }
             }
 
@@ -472,8 +502,48 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
     }
 }
 
+bool PgPool::cancel(QueryId id)
+{
+    if (id == 0)
+        return false;
+
+    // Check in-flight queries — send PQcancel to PostgreSQL
+    for (auto& conn : conns_) {
+        if (conn->current_query() && conn->current_query()->id() == id) {
+            conn->current_query()->mark_canceled();
+            std::string err;
+            bool ok = conn->cancel(err);
+            if (pg_logger_) {
+                if (ok)
+                    pg_logger_->notice("{} Canceled query {}", conn_tag(*conn), id);
+                else
+                    pg_logger_->error("{} PQcancel failed for query {}: {}",
+                                     conn_tag(*conn), id, err);
+            }
+            return ok;
+        }
+    }
+
+    // Not in-flight — mark for removal from queue
+    canceled_ids_.insert(id);
+    return true;
+}
+
 void PgPool::dispatch_queue(PgConnection& conn)
 {
+    // Skip canceled queued queries
+    while (!queue_.empty()) {
+        auto& front = queue_.front();
+        if (canceled_ids_.count(front->id())) {
+            if (pg_logger_)
+                pg_logger_->debug("Dropping canceled queued query {}", front->id());
+            canceled_ids_.erase(front->id());
+            queue_.pop();
+            continue;
+        }
+        break;
+    }
+
     if (queue_.empty())
         return;
 
@@ -515,14 +585,16 @@ void PgPool::dispatch_queue(PgConnection& conn)
     inflight_.push_back(std::move(query));
 }
 
-void PgPool::execute(std::string              sql,
-                     PgQuery::ResultHandler    on_result,
-                     PgQuery::ExceptionHandler on_exception,
-                     bool                      quiet)
+PgPool::QueryId PgPool::execute(std::string              sql,
+                                PgQuery::ResultHandler    on_result,
+                                PgQuery::ExceptionHandler on_exception,
+                                bool                      quiet)
 {
     auto q = std::make_unique<PgQuery>(std::move(sql), quiet);
     q->on_result(std::move(on_result));
     q->on_exception(std::move(on_exception));
+
+    auto qid = q->id();
 
     // Find a ready connection (mirrors v1 GetReadyConnection)
     for (auto& c : conns_) {
@@ -547,7 +619,7 @@ void PgPool::execute(std::string              sql,
                 if (c->needs_flush())
                     loop_.modify_io(c->fd(), EPOLLIN | EPOLLOUT);
                 inflight_.push_back(std::move(q));
-                return;
+                return qid;
             }
 
             // send_query failed — connection probably died
@@ -566,6 +638,8 @@ void PgPool::execute(std::string              sql,
 
     // Ensure we have enough connections to eventually drain the queue
     ensure_min_connections();
+
+    return qid;
 }
 
 // ── PgPool — Reconnect & Health ───────────────────────────────────────────────

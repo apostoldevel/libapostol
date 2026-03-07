@@ -75,15 +75,23 @@ public:
     PgQuery& on_result   (ResultHandler    h);
     PgQuery& on_exception(ExceptionHandler h);
 
-    const std::string& sql() const { return sql_; }
-    bool quiet() const { return quiet_; }
+    uint64_t           id()    const { return id_; }
+    const std::string& sql()   const { return sql_; }
+    bool               quiet() const { return quiet_; }
+
+    bool canceled() const      { return canceled_; }
+    void mark_canceled()       { canceled_ = true; }
 
     void deliver(std::vector<PgResult> results);
     void fail   (std::string_view error);
 
 private:
+    static inline uint64_t next_id_{0};
+
+    uint64_t         id_;
     std::string      sql_;
     bool             quiet_{false};
+    bool             canceled_{false};
     ResultHandler    result_handler_;
     ExceptionHandler exception_handler_;
 };
@@ -122,6 +130,10 @@ public:
     /// Send a query asynchronously. Connection must be in Ready state.
     /// Returns false on error.
     bool send_query(const std::string& sql);
+
+    /// Cancel the currently running query via PQcancel (out-of-band signal).
+    /// On failure, writes the error into errbuf and returns false.
+    bool cancel(std::string& errbuf);
 
     /// Consume input and collect all completed results.
     /// Call when fd becomes readable in Busy state.
@@ -195,12 +207,21 @@ public:
     /// Open min_conns connections and register them with the event loop.
     void start();
 
+    using QueryId = uint64_t;
+
     /// Schedule a query. Calls on_result when done, on_error on failure.
     /// Set quiet=true to suppress Query/ResultStatus logging (e.g. heartbeat).
-    void execute(std::string              sql,
-                 PgQuery::ResultHandler    on_result,
-                 PgQuery::ExceptionHandler on_exception = {},
-                 bool                      quiet = false);
+    /// Returns a QueryId that can be passed to cancel().
+    QueryId execute(std::string              sql,
+                    PgQuery::ResultHandler    on_result,
+                    PgQuery::ExceptionHandler on_exception = {},
+                    bool                      quiet = false);
+
+    /// Cancel a running or queued query.
+    /// For in-flight queries: sends PQcancel to PostgreSQL; result is silently discarded.
+    /// For queued queries: removed from the queue without dispatching.
+    /// Returns true if the query was found and cancel was initiated.
+    bool cancel(QueryId id);
 
     /// Call periodically (e.g. every 60s from module heartbeat).
     /// Checks connection health, reconnects dead connections, restores min_conns.
@@ -258,7 +279,8 @@ private:
 
     std::vector<std::unique_ptr<PgConnection>> conns_;
     std::queue<std::unique_ptr<PgQuery>>       queue_;
-    std::vector<std::unique_ptr<PgQuery>>      inflight_;  // queries currently executing
+    std::vector<std::unique_ptr<PgQuery>>      inflight_;     // queries currently executing
+    std::unordered_set<uint64_t>               canceled_ids_; // queued queries pending cancel
 
     // ── Listener (dedicated connection for LISTEN/NOTIFY) ─────────────────────
     void start_listener();
