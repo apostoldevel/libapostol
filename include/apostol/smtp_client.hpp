@@ -22,6 +22,7 @@ struct SmtpConfig
     uint16_t    port{587};     // 25=plain, 587=STARTTLS, 465=implicit TLS
     std::string username;
     std::string password;
+    std::string from;          // envelope sender (defaults to username if empty)
 };
 
 // ─── SmtpMessage ─────────────────────────────────────────────────────────────

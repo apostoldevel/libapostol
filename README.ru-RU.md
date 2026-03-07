@@ -275,9 +275,4 @@ CMakeLists.txt          конфигурация сборки
 
 ---
 
-[^crm]: **Apostol CRM** — абстрактный термин, а не самостоятельный продукт. Он обозначает
-любой проект, в котором совместно используются фреймворк
-[Apostol](https://github.com/apostoldevel/apostol) (C++) и
-[db-platform](https://github.com/apostoldevel/db-platform) через специально разработанные
-модули и процессы. Каждый фреймворк можно использовать независимо; вместе они образуют
-полноценную backend-платформу.
+[^crm]: **Apostol CRM** — шаблон-проект построенный на фреймворках [A-POST-OL](https://github.com/apostoldevel/libapostol) (C++20) и [PostgreSQL Framework for Backend Development](https://github.com/apostoldevel/db-platform).
