@@ -201,6 +201,18 @@ protected:
                          std::string_view             format      = "",
                          std::string_view             object_name = "");
 
+    // pg_sql_to_json() serializes a PgResult as a JSON array of objects
+    // using column names as keys. Unlike pg_result_to_json() (which expects
+    // col 0 to contain pre-built JSON), this builds JSON from raw SQL columns.
+    // Numeric PG types (int2/4/8, float4/8, numeric, bool) are emitted unquoted.
+
+    static std::string pg_sql_to_json(const PgResult& result);
+
+    /// Like reply_pg() but for raw SQL results (no row_to_json() needed).
+    /// Always returns a JSON array of objects.
+    static void reply_sql(HttpResponse&                resp,
+                          const std::vector<PgResult>& results);
+
     // ── PostgreSQL utility delegates ────────────────────────────────────────
 
     /// SQL-escape a string literal without PGconn* (manual E'...' escaping).

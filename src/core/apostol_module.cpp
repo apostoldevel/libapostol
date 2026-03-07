@@ -426,6 +426,90 @@ void ApostolModule::reply_pg(HttpResponse&                resp,
                   "application/json");
 }
 
+// PG type OIDs (stable across all PG versions).
+// Mirrors libdelphi PQResultToJson type handling.
+static constexpr Oid kBoolOid    = 16;
+static constexpr Oid kInt2Oid    = 21;
+static constexpr Oid kInt4Oid    = 23;
+static constexpr Oid kInt8Oid    = 20;
+static constexpr Oid kOidOid     = 26;
+static constexpr Oid kFloat4Oid  = 700;
+static constexpr Oid kFloat8Oid  = 701;
+static constexpr Oid kNumericOid = 1700;
+static constexpr Oid kJsonOid    = 114;
+static constexpr Oid kJsonbOid   = 3802;
+
+std::string ApostolModule::pg_sql_to_json(const PgResult& result)
+{
+    const int nrows = result.rows();
+    const int ncols = result.columns();
+
+    std::string json;
+    json.reserve(nrows * ncols * 32);
+    json += '[';
+
+    for (int r = 0; r < nrows; ++r) {
+        if (r > 0) json += ',';
+        json += '{';
+        for (int c = 0; c < ncols; ++c) {
+            if (c > 0) json += ',';
+            json += '"';
+            json += json_escape(result.column_name(c));
+            json += "\":";
+
+            if (result.is_null(r, c)) {
+                json += "null";
+                continue;
+            }
+
+            const Oid type = result.column_type(c);
+            const char* val = result.value(r, c);
+
+            if (type == kBoolOid) {
+                // PG returns "t"/"f" for bool
+                json += (val[0] == 't') ? "true" : "false";
+            } else if (type == kJsonOid || type == kJsonbOid) {
+                // Embedded JSON — emit raw
+                json += val;
+            } else if (type == kInt2Oid || type == kInt4Oid ||
+                       type == kInt8Oid || type == kOidOid) {
+                json += val;
+            } else if (type == kFloat4Oid || type == kFloat8Oid || type == kNumericOid) {
+                // Emit as JSON number (float/numeric with decimals are valid JSON numbers)
+                json += val;
+            } else {
+                json += '"';
+                json += json_escape(val);
+                json += '"';
+            }
+        }
+        json += '}';
+    }
+
+    json += ']';
+    return json;
+}
+
+void ApostolModule::reply_sql(HttpResponse&                resp,
+                               const std::vector<PgResult>& results)
+{
+    if (results.empty()) {
+        reply_error(resp, HttpStatus::internal_server_error, "empty result set");
+        return;
+    }
+
+    const auto& first = results.front();
+    if (!first.ok()) {
+        const char* err = first.error_message();
+        reply_error(resp, HttpStatus::internal_server_error,
+                    (err && *err) ? err : "query failed");
+        return;
+    }
+
+    resp.set_status(HttpStatus::ok)
+        .set_body(pg_sql_to_json(first), "application/json");
+}
+
 // ─── PostgreSQL utility delegates ─────────────────────────────────────────────
 
 std::string ApostolModule::pq_quote_literal(std::string_view val)
