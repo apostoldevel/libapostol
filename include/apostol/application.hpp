@@ -313,6 +313,10 @@ private:
     // Mirrors v1 ~1.55 s deadline (50→100→200→400→800 ms doubling).
     // Can be changed by subclass before run() if needed.
     int kill_timeout_secs_{5};
+
+    // Respawn rate limiting: prevent tight crash loops
+    std::chrono::steady_clock::time_point last_respawn_time_{};
+    int rapid_respawn_count_{0};
 };
 
 } // namespace apostol

@@ -684,13 +684,17 @@ void Application::master_run()
         on_reload();
     });
 
-    // SIGWINCH — gracefully stop workers, keep master alive
+    // SIGWINCH — gracefully stop workers only (keep custom + helper alive).
+    // Mirrors v1: SignalToProcess(ptWorker, SIG_SHUTDOWN).
     loop.add_signal(SIGWINCH, [this](const signalfd_siginfo&) {
         logger_->notice("SIGWINCH received — gracefully stopping workers");
         for (auto& child : children_)
         {
-            child.shutting_down = true;
-            ::kill(child.pid, SIGQUIT);
+            if (child.role == ProcessRole::worker)
+            {
+                child.shutting_down = true;
+                ::kill(child.pid, SIGQUIT);
+            }
         }
     });
 
@@ -1046,8 +1050,63 @@ void Application::reap_children()
 
         if (respawn)
         {
+            // ── Respawn rate limiting ────────────────────────────────────────
+            // Prevent tight crash loops: if a child exits too quickly, delay
+            // the respawn with exponential backoff (1s → 2s → 4s, max 30s).
+            // Resets after 60s of stable running.
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_respawn_time_ < std::chrono::seconds(2))
+            {
+                ++rapid_respawn_count_;
+                if (rapid_respawn_count_ > 3)
+                {
+                    auto delay = std::min(1 << (rapid_respawn_count_ - 3), 30);
+                    logger_->warn("rapid respawn detected ({} in a row) — delaying {} '{}' by {}s",
+                                  rapid_respawn_count_, role_name(respawn_role), respawn_name, delay);
+                    ::sleep(static_cast<unsigned>(delay));
+                }
+            }
+            else if (now - last_respawn_time_ > std::chrono::seconds(60))
+            {
+                rapid_respawn_count_ = 0;
+            }
+            last_respawn_time_ = now;
+
             logger_->notice("respawning {} '{}'", role_name(respawn_role), respawn_name);
-            fork_child(respawn_role, std::move(respawn_name));
+
+            if (respawn_role == ProcessRole::custom)
+            {
+                // Find the CustomProcessEntry by name and re-create the lambda
+                // so that custom_process_run() is called in the child.
+                bool found = false;
+                for (auto& cp : custom_processes_) {
+                    if (cp.name == respawn_name) {
+#ifdef WITH_POSTGRESQL
+                        fork_child(respawn_role, std::move(respawn_name),
+                            [this, &cp] { custom_process_run(*cp.process); });
+#else
+                        auto fn = cp.fn;
+                        fork_child(respawn_role, std::move(respawn_name),
+                            [this, fn] {
+                                EventLoop loop;
+                                loop.add_signal(SIGTERM, [&loop](const signalfd_siginfo&) { loop.stop(); });
+                                loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
+                                fn(loop);
+                                loop.run();
+                            });
+#endif
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    logger_->error("cannot respawn custom '{}': entry not found", respawn_name);
+                }
+            }
+            else
+            {
+                fork_child(respawn_role, std::move(respawn_name));
+            }
         }
     }
 }
@@ -1109,19 +1168,41 @@ void Application::rolling_restart()
         if (::setlocale(LC_ALL, settings_.locale.c_str()) == nullptr)
             logger_->warn("setlocale('{}') failed on reload", settings_.locale);
 
-    // Mark old workers for retirement
+    // Mark old workers and helpers for retirement
+    // (custom processes are also restarted — mirrors v1 StartCustomProcesses(JUST_RESPAWN))
     for (auto& child : children_)
-        if (child.role == ProcessRole::worker)
-            child.shutting_down = true;
+        child.shutting_down = true;
 
-    // Spawn fresh workers first
+    // Spawn fresh custom processes
+    for (auto& cp : custom_processes_)
+    {
+#ifdef WITH_POSTGRESQL
+        fork_child(ProcessRole::custom, cp.name, [this, &cp] {
+            custom_process_run(*cp.process);
+        });
+#else
+        auto fn = cp.fn;
+        fork_child(ProcessRole::custom, cp.name, [this, fn] {
+            EventLoop loop;
+            loop.add_signal(SIGTERM, [&loop](const signalfd_siginfo&) { loop.stop(); });
+            loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
+            fn(loop);
+            loop.run();
+        });
+#endif
+    }
+
+    // Spawn fresh helper (if configured)
+    if (cfg_helper()) spawn_helper();
+
+    // Spawn fresh workers
     spawn_workers();
 
-    // Allow new workers a moment to bind and start accepting before old ones stop
+    // Allow new processes a moment to start before old ones stop
     // (mirrors v1 usleep(100 * 1000) in CProcessMaster::Run sig_reconfigure branch)
     ::usleep(100 * 1000);
 
-    // Then tell old workers to exit gracefully
+    // Then tell old processes to exit gracefully
     for (auto& child : children_)
     {
         if (child.shutting_down)
