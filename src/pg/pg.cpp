@@ -236,13 +236,18 @@ std::vector<PgResult> PgConnection::collect_results()
     // PQisBusy returns 1 if the query is still in progress
     while (PQisBusy(conn_.get()) == 0) {
         PGresult* r = PQgetResult(conn_.get());
-        if (!r)
-            break;   // nullptr means all results for this query are done
+        if (!r) {
+            // NULL → all results for this query are done, connection is idle.
+            // Only transition to Ready here — PQsendQuery requires PQgetResult
+            // to have returned NULL before a new query can be sent.
+            state_ = PgConnState::Ready;
+            break;
+        }
         out.emplace_back(r);
     }
-
-    if (!out.empty())
-        state_ = PgConnState::Ready;
+    // If loop exited via PQisBusy==1, state stays Busy — the trailing NULL
+    // (ReadyForQuery) hasn't arrived yet.  Results in `out` are complete and
+    // safe to deliver; the next EPOLLIN will consume the NULL and set Ready.
 
     return out;
 }
@@ -445,8 +450,15 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                 break;
             }
 
-            if (results.empty())
-                break;  // still in progress (PQisBusy == 1)
+            if (results.empty()) {
+                // No new result rows.  Two sub-cases:
+                // a) PQisBusy==1: still waiting for data → nothing to do.
+                // b) PQgetResult returned NULL after a previous split-TCP
+                //    delivery → state is now Ready, drain the queue.
+                if (conn.state() == PgConnState::Ready)
+                    dispatch_queue(conn);
+                break;
+            }
 
             if (pg_logger_) {
                 bool quiet = conn.current_query() && conn.current_query()->quiet();
@@ -547,6 +559,12 @@ void PgPool::dispatch_queue(PgConnection& conn)
     if (queue_.empty())
         return;
 
+    // Only dispatch on an idle connection — PQsendQuery requires PQgetResult
+    // to have returned NULL.  After a split-TCP collect_results() the conn may
+    // still be Busy (results delivered, but trailing NULL not yet consumed).
+    if (conn.state() != PgConnState::Ready)
+        return;
+
     // Verify connection is actually alive before dispatching
     if (!conn.connected()) {
         if (pg_logger_)
@@ -568,8 +586,10 @@ void PgPool::dispatch_queue(PgConnection& conn)
 
     if (!conn.send_query(query->sql())) {
         if (pg_logger_)
-            pg_logger_->error("{} ConnectException: Failed to send query, re-queuing",
-                             conn_tag(conn));
+            pg_logger_->error("{} send_query failed in dispatch (state={}): {}, re-queuing",
+                             conn_tag(conn),
+                             static_cast<int>(conn.state()),
+                             conn.error_message());
         conn.set_current_query(nullptr);
         // Re-queue the query instead of losing it (P1 Fix: retry)
         queue_.push(std::move(query));
@@ -624,8 +644,10 @@ PgPool::QueryId PgPool::execute(std::string              sql,
 
             // send_query failed — connection probably died
             if (pg_logger_)
-                pg_logger_->error("{} ConnectException: Failed to send query, reconnecting",
-                                 conn_tag(*c));
+                pg_logger_->error("{} send_query failed (state={}): {}, reconnecting",
+                                 conn_tag(*c),
+                                 static_cast<int>(c->state()),
+                                 c->error_message());
             c->set_current_query(nullptr);
             c->set_state(PgConnState::Error);
             try_reconnect(*c);
