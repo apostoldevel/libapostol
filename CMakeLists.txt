@@ -95,6 +95,7 @@ add_library(apostol STATIC
     src/core/oauth_providers.cpp
     src/core/site_config.cpp
     src/net/ws_client.cpp
+    src/net/ws_message_client.cpp
 )
 
 if(WITH_POSTGRESQL)

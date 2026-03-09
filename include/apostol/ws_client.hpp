@@ -9,25 +9,10 @@
 #include <functional>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
-
-#include <nlohmann/json.hpp>
 
 namespace apostol
 {
-
-// ── WsMessage ────────────────────────────────────────────────────────────────
-
-struct WsMessage
-{
-    std::string    id;       // correlation ID
-    std::string    action;   // action/method name
-    nlohmann::json payload;  // JSON payload
-
-    std::string to_json() const;
-    static WsMessage from_json(std::string_view text);
-};
 
 // ── WsClientState ────────────────────────────────────────────────────────────
 
@@ -45,6 +30,10 @@ enum class WsClientState {
 // ── WsClient ─────────────────────────────────────────────────────────────────
 //
 // Async WebSocket client built on TcpClient.
+// Handles connection, TLS, ping/pong, auto-reconnect.
+// Delivers raw TEXT and BINARY frames via on_message callback.
+//
+// For structured JSON-RPC dispatch (id/action/payload), use WsMessageClient.
 //
 // Usage:
 //   WsClient ws(loop);
@@ -57,7 +46,7 @@ class WsClient
 {
 public:
     explicit WsClient(EventLoop& loop);
-    ~WsClient();
+    virtual ~WsClient();
 
     WsClient(const WsClient&)            = delete;
     WsClient& operator=(const WsClient&) = delete;
@@ -79,10 +68,6 @@ public:
     void send_binary(std::string_view data);
     void send_ping(std::string_view data = {});
 
-    using ResponseHandler = std::function<void(const WsMessage& response)>;
-    void send(const WsMessage& message, ResponseHandler on_response = {},
-              std::chrono::milliseconds timeout = std::chrono::seconds(30));
-
     // ── Callbacks ────────────────────────────────────────────────────────────
 
     using MessageHandler = std::function<void(uint8_t opcode, std::string payload)>;
@@ -91,14 +76,8 @@ public:
 
     void on_connect(std::function<void()> cb)  { on_connect_ = std::move(cb); }
     void on_message(MessageHandler cb)         { on_message_ = std::move(cb); }
-    void set_raw_text_mode(bool enable)        { raw_text_mode_ = enable; }
     void on_close(CloseHandler cb)             { on_close_   = std::move(cb); }
     void on_error(ErrorHandler cb)             { on_error_   = std::move(cb); }
-
-    using ActionHandler = std::function<void(WsClient& client,
-                                             const WsMessage& request,
-                                             WsMessage& response)>;
-    void on_action(std::string_view action, ActionHandler handler);
 
     // ── Settings ─────────────────────────────────────────────────────────────
 
@@ -111,6 +90,16 @@ public:
     void enable_tls(bool verify = true);
 #endif
 
+    // ── Utilities ────────────────────────────────────────────────────────────
+
+    static std::string generate_id();
+
+protected:
+    EventLoop&    loop_;
+
+    /// Called before reconnect — derived classes can clean up state.
+    virtual void on_before_reconnect() {}
+
 private:
     struct ParsedUrl {
         std::string scheme;
@@ -121,14 +110,12 @@ private:
 
     static ParsedUrl parse_url(std::string_view url);
     static std::string generate_key();
-    static std::string generate_id();
 
     void do_connect();
     void send_upgrade_request();
     void on_upgrade_complete();
     void on_tcp_data(const char* data, std::size_t len);
     void on_ws_message(uint8_t opcode, std::string payload);
-    void handle_text_message(std::string payload);
     void handle_close_frame(std::string_view payload);
     void start_ping_timer();
     void cancel_ping_timer();
@@ -138,12 +125,11 @@ private:
     void enter_error(std::string_view msg);
     void cleanup();
 
-    EventLoop&    loop_;
     TcpClient     tcp_;
     WsParser      ws_parser_;
     WsClientState state_{WsClientState::Idle};
 
-    // Upgrade handshake buffer (manual HTTP parse, avoids llhttp upgrade issue)
+    // Upgrade handshake buffer
     std::string upgrade_buf_;
     bool        upgrading_{false};
     std::string ws_key_;
@@ -158,7 +144,6 @@ private:
     MessageHandler                 on_message_;
     CloseHandler                   on_close_;
     ErrorHandler                   on_error_;
-    std::unordered_map<std::string, ActionHandler> action_handlers_;
 
     // Ping/pong
     std::chrono::seconds   ping_interval_{30};
@@ -166,21 +151,11 @@ private:
     bool                   pong_pending_{false};
     int                    pong_miss_count_{0};
 
-    // Raw text mode: skip WsMessage JSON parse on incoming TEXT frames
-    bool                   raw_text_mode_{false};
-
     // Auto-reconnect
     bool                   auto_reconnect_{false};
     std::chrono::seconds   reconnect_delay_{1};
     std::chrono::seconds   reconnect_max_delay_{60};
     EventLoop::TimerId     reconnect_timer_{EventLoop::kInvalidTimer};
-
-    // Request/response correlation
-    struct PendingResponse {
-        ResponseHandler    handler;
-        EventLoop::TimerId timer;
-    };
-    std::unordered_map<std::string, PendingResponse> pending_responses_;
 
 #ifdef WITH_SSL
     bool tls_enabled_{false};
