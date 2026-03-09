@@ -355,6 +355,14 @@ void WsClient::on_ws_message(uint8_t opcode, std::string payload)
 
 void WsClient::handle_text_message(std::string payload)
 {
+    // Raw text mode: skip WsMessage JSON parse — pass directly to on_message_.
+    // Used by exchange WS clients where messages are high-frequency BBO/ticker
+    // data that never contain id/action fields.
+    if (raw_text_mode_) {
+        if (on_message_) on_message_(WS_OP_TEXT, std::move(payload));
+        return;
+    }
+
     auto msg = WsMessage::from_json(payload);
 
     // Check correlation (request/response)

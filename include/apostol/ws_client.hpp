@@ -91,6 +91,7 @@ public:
 
     void on_connect(std::function<void()> cb)  { on_connect_ = std::move(cb); }
     void on_message(MessageHandler cb)         { on_message_ = std::move(cb); }
+    void set_raw_text_mode(bool enable)        { raw_text_mode_ = enable; }
     void on_close(CloseHandler cb)             { on_close_   = std::move(cb); }
     void on_error(ErrorHandler cb)             { on_error_   = std::move(cb); }
 
@@ -164,6 +165,9 @@ private:
     EventLoop::TimerId     ping_timer_{EventLoop::kInvalidTimer};
     bool                   pong_pending_{false};
     int                    pong_miss_count_{0};
+
+    // Raw text mode: skip WsMessage JSON parse on incoming TEXT frames
+    bool                   raw_text_mode_{false};
 
     // Auto-reconnect
     bool                   auto_reconnect_{false};
