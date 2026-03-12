@@ -20,6 +20,7 @@ struct OAuthApp
     std::vector<std::string> issuers;            // JWT iss claim values
     std::vector<std::string> javascript_origins; // CORS origins
     std::vector<std::string> redirect_uris;      // allowed redirect URIs
+    std::vector<std::string> allowed_ips;         // IP whitelist (empty = any)
     std::vector<std::string> scopes;             // allowed OAuth2 scopes
     std::string auth_uri;           // authorization endpoint
     std::string token_uri;          // token exchange endpoint

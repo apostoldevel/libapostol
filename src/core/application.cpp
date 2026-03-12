@@ -475,10 +475,10 @@ void Application::load_config()
         }
     }
 
-    // Load OAuth2 provider configs (conf/oauth2/*.json).
+    // Load OAuth2 provider configs (oauth2/*.json) — v1 convention.
     // clear() + load() is safe for repeated calls on SIGHUP.
     providers_.clear();
-    providers_.load(settings_.resolve("conf/oauth2"));
+    providers_.load(settings_.resolve("oauth2"));
 
     // Load site configs (sites/*.json) — v1 convention.
     sites_.clear();
