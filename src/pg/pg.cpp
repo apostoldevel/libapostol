@@ -421,8 +421,11 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
         }
 
         case PgConnState::Ready:
-            // Worker connections have no LISTEN subscriptions —
+            // Drain any async data from the socket (ParameterStatus,
+            // NoticeResponse, etc.) so level-triggered EPOLLIN doesn't
+            // spin.  Worker connections have no LISTEN subscriptions —
             // NOTIFY is handled by the dedicated listener_ connection.
+            conn.consume_notify(nullptr);
             break;
 
         case PgConnState::Busy: {
