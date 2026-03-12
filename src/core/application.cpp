@@ -480,9 +480,9 @@ void Application::load_config()
     providers_.clear();
     providers_.load(settings_.resolve("conf/oauth2"));
 
-    // Load site configs (conf/sites/*.json).
+    // Load site configs (sites/*.json) — v1 convention.
     sites_.clear();
-    sites_.load(settings_.resolve("conf/sites"));
+    sites_.load(settings_.resolve("sites"));
 }
 
 // ─── PID file ────────────────────────────────────────────────────────────────
