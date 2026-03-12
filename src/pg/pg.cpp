@@ -879,6 +879,13 @@ void PgPool::on_listener_io(uint32_t /*events*/)
                     pg_logger_->error("{} Listener Error: {}", conn_tag(*listener_), listener_->error_message());
                 loop_.remove_io(listener_->fd());
                 listener_.reset();
+            } else {
+                // Adjust epoll for what poll needs next (same as worker connections)
+                uint32_t want = (ps == PGRES_POLLING_READING) ? EPOLLIN
+                              : (ps == PGRES_POLLING_WRITING) ? EPOLLOUT
+                              : (EPOLLIN | EPOLLOUT);
+                if (listener_->fd() >= 0)
+                    loop_.modify_io(listener_->fd(), want);
             }
             break;
         }
