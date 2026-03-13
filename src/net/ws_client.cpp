@@ -19,6 +19,16 @@ std::string WsMessage::to_json() const
     if (!id.empty())        j["id"]      = id;
     if (!action.empty())    j["action"]  = action;
     if (!payload.is_null()) j["payload"] = payload;
+
+    if (type == Type::Error) {
+        j["type"] = "error";
+        if (!error_code.empty())        j["error_code"]        = error_code;
+        if (!error_description.empty()) j["error_description"] = error_description;
+    } else if (type == Type::Response) {
+        j["type"] = "response";
+    }
+    // Type::Request is the default — omit for backward compatibility
+
     return j.dump();
 }
 
@@ -34,6 +44,19 @@ WsMessage WsMessage::from_json(std::string_view text)
         msg.action = j["action"].get<std::string>();
     if (j.contains("payload"))
         msg.payload = j["payload"];
+
+    if (j.contains("type") && j["type"].is_string()) {
+        auto t = j["type"].get<std::string>();
+        if (t == "response")  msg.type = Type::Response;
+        else if (t == "error") {
+            msg.type = Type::Error;
+            if (j.contains("error_code") && j["error_code"].is_string())
+                msg.error_code = j["error_code"].get<std::string>();
+            if (j.contains("error_description") && j["error_description"].is_string())
+                msg.error_description = j["error_description"].get<std::string>();
+        }
+    }
+
     return msg;
 }
 
@@ -355,7 +378,8 @@ void WsClient::on_ws_message(uint8_t opcode, std::string payload)
 
 void WsClient::handle_text_message(std::string payload)
 {
-    auto msg = WsMessage::from_json(payload);
+    auto msg = codec_ ? codec_->deserialize(payload)
+                      : WsMessage::from_json(payload);
 
     // Check correlation (request/response)
     if (!msg.id.empty()) {
@@ -376,8 +400,11 @@ void WsClient::handle_text_message(std::string payload)
             WsMessage response;
             response.id = msg.id;
             it->second(*this, msg, response);
-            if (!response.action.empty() || !response.payload.is_null())
-                send_text(response.to_json());
+            if (!response.action.empty() || !response.payload.is_null()) {
+                auto text = codec_ ? codec_->serialize(response)
+                                   : response.to_json();
+                send_text(text);
+            }
             return;
         }
     }
@@ -462,7 +489,8 @@ void WsClient::send(const WsMessage& message, ResponseHandler on_response,
         pending_responses_[msg.id] = {std::move(on_response), timer};
     }
 
-    send_text(msg.to_json());
+    auto text = codec_ ? codec_->serialize(msg) : msg.to_json();
+    send_text(text);
 }
 
 // ── Close ────────────────────────────────────────────────────────────────────
@@ -493,6 +521,11 @@ void WsClient::on_action(std::string_view action, ActionHandler handler)
 void WsClient::set_connect_timeout(std::chrono::milliseconds ms)
 {
     tcp_.set_connect_timeout(ms);
+}
+
+void WsClient::set_codec(std::unique_ptr<WsCodec> codec)
+{
+    codec_ = std::move(codec);
 }
 
 #ifdef WITH_SSL

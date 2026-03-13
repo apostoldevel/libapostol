@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -21,12 +22,37 @@ namespace apostol
 
 struct WsMessage
 {
+    /// Message type — maps to request/response/error in any protocol.
+    enum class Type { Request, Response, Error };
+
+    Type           type = Type::Request;
     std::string    id;       // correlation ID
-    std::string    action;   // action/method name
+    std::string    action;   // action/method name (Request only)
     nlohmann::json payload;  // JSON payload
 
+    // Error fields (Type::Error only)
+    std::string    error_code;
+    std::string    error_description;
+
+    /// Default serialization: {"id":"...","action":"...","payload":{...}}
     std::string to_json() const;
     static WsMessage from_json(std::string_view text);
+};
+
+// ── WsCodec ─────────────────────────────────────────────────────────────────
+//
+// Strategy interface for custom wire formats.
+// Override to support protocols with non-standard framing
+// (OCPP arrays, JSON-RPC, MsgPack, etc.).
+//
+// Usage:
+//   ws.set_codec(std::make_unique<OcppCodec>());
+//
+struct WsCodec
+{
+    virtual ~WsCodec() = default;
+    virtual std::string serialize(const WsMessage& msg) const = 0;
+    virtual WsMessage  deserialize(std::string_view text) const = 0;
 };
 
 // ── WsClientState ────────────────────────────────────────────────────────────
@@ -105,6 +131,7 @@ public:
     void set_reconnect_max_delay(std::chrono::seconds max) { reconnect_max_delay_ = max; }
     void set_ping_interval(std::chrono::seconds interval)  { ping_interval_ = interval; }
     void set_connect_timeout(std::chrono::milliseconds ms);
+    void set_codec(std::unique_ptr<WsCodec> codec);
 
 #ifdef WITH_SSL
     void enable_tls(bool verify = true);
@@ -170,6 +197,9 @@ private:
     std::chrono::seconds   reconnect_delay_{1};
     std::chrono::seconds   reconnect_max_delay_{60};
     EventLoop::TimerId     reconnect_timer_{EventLoop::kInvalidTimer};
+
+    // Custom codec (OCPP, JSON-RPC, etc.)
+    std::unique_ptr<WsCodec> codec_;
 
     // Request/response correlation
     struct PendingResponse {
