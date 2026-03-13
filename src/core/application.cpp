@@ -889,6 +889,8 @@ void Application::helper_run()
             [this]
             {
                 db_pool_->heartbeat();
+                for (auto& [_, pool] : named_pools_)
+                    pool->heartbeat();
             });
     }
 #endif
@@ -1426,6 +1428,46 @@ PgPool& Application::db_pool()
     return *db_pool_;
 }
 
+PgPool& Application::db_pool(std::string_view role)
+{
+    // "worker" or empty → default pool
+    if (role.empty() || role == "worker")
+        return db_pool();
+
+    std::string key(role);
+
+    // Return cached pool if already created
+    auto it = named_pools_.find(key);
+    if (it != named_pools_.end())
+        return *it->second;
+
+    // Determine conninfo for the requested role
+    std::string conninfo;
+    if (role == "helper")
+        conninfo = settings_.pg_conninfo_helper;
+    else if (role == "kernel")
+        conninfo = settings_.pg_conninfo_kernel;
+    else
+        throw std::logic_error(fmt::format("unknown db_pool role: '{}'", role));
+
+    if (conninfo.empty())
+        throw std::logic_error(fmt::format("postgres.{} not configured", role));
+
+    if (!worker_loop_)
+        throw std::logic_error("db_pool(role) called before event loop is ready");
+
+    // Create pool with the same logger and pool size settings
+    auto pool = std::make_unique<PgPool>(*worker_loop_, std::move(conninfo),
+        static_cast<std::size_t>(settings_.pg_pool_min),
+        static_cast<std::size_t>(settings_.pg_pool_max),
+        pg_logger_.get());
+    pool->start();
+
+    auto& ref = *pool;
+    named_pools_.emplace(std::move(key), std::move(pool));
+    return ref;
+}
+
 #endif // WITH_POSTGRESQL
 
 // ─── Stream logger ───────────────────────────────────────────────────────────
@@ -1550,6 +1592,8 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
             [this]
             {
                 db_pool_->heartbeat();
+                for (auto& [_, pool] : named_pools_)
+                    pool->heartbeat();
             });
     }
 #endif
