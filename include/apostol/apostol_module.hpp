@@ -178,42 +178,10 @@ protected:
     static std::string_view mime_type(const std::string& ext);
 
 #ifdef WITH_POSTGRESQL
-    // ── PostgreSQL utilities ──────────────────────────────────────────────────
-    //
-    // Mirrors v1 CApostolModule PQResultToJson / DoPostgresQueryExecuted.
-    //
-    // pg_result_to_json() formats a single PgResult as a JSON string.
-    // The @p format parameter controls wrapping:
-    //   ""  or absent  — auto: single row → plain value; multiple rows → array
-    //   "array"        — always return a JSON array
-    //   "null"         — empty result → literal "null" (not "{}" or "[]")
-    // @p object_name, when set, wraps the result in {"<name>": ...}.
-
-    static std::string pg_result_to_json(const PgResult&  result,
-                                         std::string_view format      = "",
-                                         std::string_view object_name = "");
-
-    /// Set @p resp body from the first ok() result in @p results.
-    /// Content-Type is set to application/json.
-    /// On DB error (empty vector or !ok()), sets 500 + JSON error body.
-    static void reply_pg(HttpResponse&                resp,
-                         const std::vector<PgResult>& results,
-                         std::string_view             format      = "",
-                         std::string_view             object_name = "");
-
-    // pg_sql_to_json() serializes a PgResult as a JSON array of objects
-    // using column names as keys. Unlike pg_result_to_json() (which expects
-    // col 0 to contain pre-built JSON), this builds JSON from raw SQL columns.
-    // Numeric PG types (int2/4/8, float4/8, numeric, bool) are emitted unquoted.
-
-    static std::string pg_sql_to_json(const PgResult& result);
-
-    /// Like reply_pg() but for raw SQL results (no row_to_json() needed).
-    /// Always returns a JSON array of objects.
-    static void reply_sql(HttpResponse&                resp,
-                          const std::vector<PgResult>& results);
-
     // ── PostgreSQL utility delegates ────────────────────────────────────────
+    //
+    // pg_result_to_json, reply_pg, pg_sql_to_json, reply_sql are free
+    // functions in pg_utils.hpp — use them directly.
 
     /// SQL-escape a string literal without PGconn* (manual E'...' escaping).
     static std::string pq_quote_literal(std::string_view val);
