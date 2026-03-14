@@ -174,14 +174,12 @@ static bool addr2line_resolve(void* addr,
             loc_out[0] = '\0'; // no file:line — omit
         else
         {
-            ::strncpy(loc_out, loc, loc_sz - 1);
-            loc_out[loc_sz - 1] = '\0';
+            ::snprintf(loc_out, loc_sz, "%s", loc);
         }
     }
     else
     {
-        ::strncpy(func_out, buf, func_sz - 1);
-        func_out[func_sz - 1] = '\0';
+        ::snprintf(func_out, func_sz, "%s", buf);
     }
 
     return func_out[0] != '\0';
