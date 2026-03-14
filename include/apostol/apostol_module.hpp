@@ -174,6 +174,27 @@ protected:
     bool serve_file(const std::filesystem::path& path,
                     HttpResponse& resp, bool head_only);
 
+    /// Serve static content with try-files fallback (like nginx try_files).
+    ///
+    /// Resolution order for request path:
+    ///   1. Exact file match (root / path)
+    ///   2. Directory with index: if path is a directory, try path/index.html
+    ///      - If path has no trailing slash, send 301 redirect to path + "/"
+    ///   3. Each entry in @p fallbacks (e.g. "/index.html" for SPA)
+    ///   4. 404 Not Found
+    ///
+    /// @param root      Document root directory
+    /// @param req       HTTP request (uses path and provides host for redirect)
+    /// @param resp      HTTP response to fill
+    /// @param head_only If true, suppress body (HEAD request)
+    /// @param fallbacks List of absolute paths to try as fallback (e.g. {"/index.html"})
+    /// @return true if a response was sent (file, redirect, or 404)
+    bool try_files(const std::filesystem::path& root,
+                   const HttpRequest& req,
+                   HttpResponse& resp,
+                   bool head_only,
+                   const std::vector<std::string>& fallbacks = {"/index.html"});
+
     /// Map file extension (with leading dot, e.g. ".html") to MIME type.
     static std::string_view mime_type(const std::string& ext);
 

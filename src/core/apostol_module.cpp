@@ -323,6 +323,54 @@ bool ApostolModule::serve_file(const std::filesystem::path& path,
     return true;
 }
 
+bool ApostolModule::try_files(const std::filesystem::path& root,
+                               const HttpRequest& req,
+                               HttpResponse& resp,
+                               bool head_only,
+                               const std::vector<std::string>& fallbacks)
+{
+    namespace fs = std::filesystem;
+
+    const auto& path = req.path;
+
+    // 1. Try exact file
+    if (path.size() > 1) {
+        auto file_path = root / path.substr(1);
+        if (serve_file(file_path, resp, head_only))
+            return true;
+    }
+
+    // 2. Directory handling: try path/index.html
+    auto rel = (path.size() > 1) ? path.substr(1) : std::string{};
+    auto dir_index = root / rel / "index.html";
+
+    std::error_code ec;
+    if (fs::is_regular_file(dir_index, ec) && !ec) {
+        // Redirect to path + "/" if missing trailing slash (fixes relative URLs)
+        if (!path.empty() && path.back() != '/') {
+            resp.set_status(HttpStatus::moved_permanently)
+                .set_header("Location", path + "/")
+                .set_body("", "text/plain");
+            return true;
+        }
+        // Has trailing slash — serve the index
+        if (serve_file(dir_index, resp, head_only))
+            return true;
+    }
+
+    // 3. Fallbacks (e.g. SPA → /index.html)
+    for (const auto& fallback : fallbacks) {
+        auto file_path = root / fallback.substr(1);
+        if (serve_file(file_path, resp, head_only))
+            return true;
+    }
+
+    // 4. Nothing found
+    resp.set_status(HttpStatus::not_found)
+        .set_body("404 Not Found", "text/plain");
+    return true;
+}
+
 std::string_view ApostolModule::mime_type(const std::string& ext)
 {
     static const std::unordered_map<std::string, std::string_view> types{
