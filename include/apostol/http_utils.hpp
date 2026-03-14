@@ -53,6 +53,11 @@ std::string get_hostname();
 void redirect(HttpResponse& resp, std::string_view location,
               HttpStatus code = HttpStatus::found);
 
+// ─── IP classification ──────────────────────────────────────────────────────
+
+/// True if @p ip is loopback (127.x, ::1) or RFC 1918 private (10.x, 172.16-31.x, 192.168.x).
+bool is_private_ip(std::string_view ip);
+
 // ─── Authorization parsing ──────────────────────────────────────────────────
 
 /// Parsed Authorization header value.
