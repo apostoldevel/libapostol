@@ -96,6 +96,7 @@ public:
                  const std::vector<std::string>& protocols = {},
                  const std::vector<std::pair<std::string, std::string>>& headers = {});
     void close(uint16_t code = 1000, std::string_view reason = {});
+    void reconnect();
     bool connected() const noexcept { return state_ == WsClientState::Connected; }
     WsClientState state() const noexcept { return state_; }
 

@@ -509,6 +509,18 @@ void WsClient::close(uint16_t code, std::string_view reason)
     tcp_.send(ws_build_client_frame(WS_OP_CLOSE, payload));
 }
 
+void WsClient::reconnect()
+{
+    if (state_ == WsClientState::Reconnecting)
+        return;
+
+    cancel_ping_timer();
+    state_ = WsClientState::Reconnecting;
+    reconnect_delay_ = std::chrono::seconds(1);
+    tcp_.close();
+    start_reconnect_timer();
+}
+
 // ── Action handlers ──────────────────────────────────────────────────────────
 
 void WsClient::on_action(std::string_view action, ActionHandler handler)
