@@ -1287,6 +1287,10 @@ void Application::set_user(std::string_view user, std::string_view group)
     if (user.empty())
         return;
 
+    // Only root can switch user/group — skip silently when running unprivileged
+    if (::getuid() != 0)
+        return;
+
     // Look up group first (if specified)
     if (!group.empty())
     {
