@@ -956,8 +956,8 @@ void Application::custom_process_run(CustomProcess& proc)
     // Set process title AFTER on_start (modules may be registered)
     auto names = module_manager_.module_names();
     set_process_title(names.empty()
-        ? fmt::format("{}: {} process", name_, proc.name())
-        : fmt::format("{}: {} process ({})", name_, proc.name(), names));
+        ? fmt::format("{}: {} process", name_, proc.title())
+        : fmt::format("{}: {} process ({})", name_, proc.title(), names));
 
     // 7. Heartbeat timer (1s)
     loop.add_timer(std::chrono::seconds(1),

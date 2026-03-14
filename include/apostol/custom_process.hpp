@@ -35,8 +35,11 @@ class CustomProcess
 public:
     virtual ~CustomProcess() = default;
 
-    /// Process name — used in logs and process title.
+    /// Process name — used in config lookup and registration.
     virtual std::string_view name() const = 0;
+
+    /// Display name shown in process title (defaults to name()).
+    virtual std::string_view title() const { return name(); }
 
     /// Called once after EventLoop + PgPool are ready.
     /// Set up timers, LISTEN channels, BotSession, etc.
