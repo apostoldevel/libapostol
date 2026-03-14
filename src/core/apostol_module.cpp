@@ -305,6 +305,10 @@ bool ApostolModule::match_path(std::string_view path,
 bool ApostolModule::serve_file(const std::filesystem::path& path,
                                 HttpResponse& resp, bool head_only)
 {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec) || ec)
+        return false;
+
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open())
         return false;
