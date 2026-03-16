@@ -83,7 +83,7 @@ class WsClient
 {
 public:
     explicit WsClient(EventLoop& loop);
-    ~WsClient();
+    virtual ~WsClient();
 
     WsClient(const WsClient&)            = delete;
     WsClient& operator=(const WsClient&) = delete;
@@ -138,6 +138,11 @@ public:
     void enable_tls(bool verify = true);
 #endif
 
+protected:
+    EventLoop&    loop_;
+    static std::string generate_id();
+    virtual void on_before_reconnect() {}
+
 private:
     struct ParsedUrl {
         std::string scheme;
@@ -148,7 +153,6 @@ private:
 
     static ParsedUrl parse_url(std::string_view url);
     static std::string generate_key();
-    static std::string generate_id();
 
     void do_connect();
     void send_upgrade_request();
@@ -165,7 +169,6 @@ private:
     void enter_error(std::string_view msg);
     void cleanup();
 
-    EventLoop&    loop_;
     TcpClient     tcp_;
     WsParser      ws_parser_;
     WsClientState state_{WsClientState::Idle};

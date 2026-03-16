@@ -9,22 +9,6 @@
 namespace apostol
 {
 
-// ── WsMessage ────────────────────────────────────────────────────────────────
-//
-// Application-level JSON message with correlation ID and action dispatch.
-// Protocol: { "id": "...", "action": "...", "payload": { ... } }
-//
-
-struct WsMessage
-{
-    std::string    id;       // correlation ID
-    std::string    action;   // action/method name
-    nlohmann::json payload;  // JSON payload
-
-    std::string to_json() const;
-    static WsMessage from_json(std::string_view text);
-};
-
 // ── WsMessageClient ──────────────────────────────────────────────────────────
 //
 // WsClient with built-in JSON-RPC-like dispatch.

@@ -621,6 +621,8 @@ void WsClient::cancel_reconnect_timer()
 
 void WsClient::do_reconnect()
 {
+    on_before_reconnect();
+
     // Clear pending responses (cannot survive reconnect)
     for (auto& [id, pending] : pending_responses_)
         loop_.cancel_timer(pending.timer);
