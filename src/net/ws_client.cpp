@@ -7,10 +7,58 @@
 #include <cctype>
 #include <charconv>
 #include <random>
-#include <unordered_map>
 
 namespace apostol
 {
+
+// ── WsMessage ────────────────────────────────────────────────────────────────
+
+std::string WsMessage::to_json() const
+{
+    nlohmann::json j;
+    if (!id.empty())        j["id"]      = id;
+    if (!action.empty())    j["action"]  = action;
+    if (!payload.is_null()) j["payload"] = payload;
+
+    if (type == Type::Error) {
+        j["type"] = "error";
+        if (!error_code.empty())        j["error_code"]        = error_code;
+        if (!error_description.empty()) j["error_description"] = error_description;
+    } else if (type == Type::Response) {
+        j["type"] = "response";
+    }
+    // Type::Request is the default — omit for backward compatibility
+
+    return j.dump();
+}
+
+WsMessage WsMessage::from_json(std::string_view text)
+{
+    auto j = nlohmann::json::parse(text, nullptr, false);
+    if (j.is_discarded()) return {};
+
+    WsMessage msg;
+    if (j.contains("id") && j["id"].is_string())
+        msg.id = j["id"].get<std::string>();
+    if (j.contains("action") && j["action"].is_string())
+        msg.action = j["action"].get<std::string>();
+    if (j.contains("payload"))
+        msg.payload = j["payload"];
+
+    if (j.contains("type") && j["type"].is_string()) {
+        auto t = j["type"].get<std::string>();
+        if (t == "response")  msg.type = Type::Response;
+        else if (t == "error") {
+            msg.type = Type::Error;
+            if (j.contains("error_code") && j["error_code"].is_string())
+                msg.error_code = j["error_code"].get<std::string>();
+            if (j.contains("error_description") && j["error_description"].is_string())
+                msg.error_description = j["error_description"].get<std::string>();
+        }
+    }
+
+    return msg;
+}
 
 // ── URL parsing ──────────────────────────────────────────────────────────────
 
@@ -133,6 +181,7 @@ void WsClient::do_connect()
         if (auto_reconnect_ &&
             (state_ == WsClientState::Connected || state_ == WsClientState::Error))
         {
+            // Notify caller before reconnecting so they can log the reason
             if (on_close_) on_close_(1006, "connection lost");
             state_ = WsClientState::Reconnecting;
             start_reconnect_timer();
@@ -149,6 +198,7 @@ void WsClient::do_connect()
                                 state_ == WsClientState::Connecting ||
                                 state_ == WsClientState::Upgrading))
         {
+            // Notify caller before reconnecting so they can log the reason
             if (on_error_) on_error_(err);
             state_ = WsClientState::Reconnecting;
             start_reconnect_timer();
@@ -204,6 +254,7 @@ void WsClient::on_tcp_data(const char* data, std::size_t len)
     if (upgrading_) {
         upgrade_buf_.append(data, len);
 
+        // Guard against unbounded buffering from malicious server
         constexpr std::size_t kMaxUpgradeResponse = 8192;
         if (upgrade_buf_.size() > kMaxUpgradeResponse &&
             upgrade_buf_.find("\r\n\r\n") == std::string::npos)
@@ -213,8 +264,9 @@ void WsClient::on_tcp_data(const char* data, std::size_t len)
         }
 
         auto end = upgrade_buf_.find("\r\n\r\n");
-        if (end == std::string::npos) return;
+        if (end == std::string::npos) return;  // incomplete headers
 
+        // Parse status line
         auto line_end = upgrade_buf_.find("\r\n");
         auto status_line = std::string_view(upgrade_buf_).substr(0, line_end);
 
@@ -234,6 +286,7 @@ void WsClient::on_tcp_data(const char* data, std::size_t len)
             return;
         }
 
+        // Parse headers (case-insensitive)
         std::unordered_map<std::string, std::string> headers;
         auto hdr_block = std::string_view(upgrade_buf_).substr(line_end + 2,
                                                                 end - line_end - 2);
@@ -258,6 +311,7 @@ void WsClient::on_tcp_data(const char* data, std::size_t len)
             hdr_block.remove_prefix(le + 2);
         }
 
+        // Validate Sec-WebSocket-Accept
         auto it = headers.find("sec-websocket-accept");
         if (it == headers.end() || it->second != ws_accept_key(ws_key_)) {
             enter_error("invalid Sec-WebSocket-Accept");
@@ -266,6 +320,7 @@ void WsClient::on_tcp_data(const char* data, std::size_t len)
 
         on_upgrade_complete();
 
+        // Feed leftover bytes (WS frames that arrived with the 101)
         std::size_t ws_start = end + 4;
         if (ws_start < upgrade_buf_.size())
             ws_parser_.feed(upgrade_buf_.data() + ws_start,
@@ -283,7 +338,7 @@ void WsClient::on_upgrade_complete()
 {
     upgrading_ = false;
     state_ = WsClientState::Connected;
-    reconnect_delay_ = std::chrono::seconds(1);
+    reconnect_delay_ = std::chrono::seconds(1);  // reset backoff
 
     ws_parser_ = WsParser{};
     ws_parser_.set_handler([this](uint8_t opcode, std::string payload) {
@@ -300,10 +355,13 @@ void WsClient::on_ws_message(uint8_t opcode, std::string payload)
 {
     switch (opcode) {
     case WS_OP_TEXT:
+        handle_text_message(std::move(payload));
+        break;
     case WS_OP_BINARY:
         if (on_message_) on_message_(opcode, std::move(payload));
         break;
     case WS_OP_PING:
+        // RFC 6455: MUST respond with pong echoing the data
         tcp_.send(ws_build_client_frame(WS_OP_PONG, payload));
         break;
     case WS_OP_PONG:
@@ -316,6 +374,43 @@ void WsClient::on_ws_message(uint8_t opcode, std::string payload)
         if (on_message_) on_message_(opcode, std::move(payload));
         break;
     }
+}
+
+void WsClient::handle_text_message(std::string payload)
+{
+    auto msg = codec_ ? codec_->deserialize(payload)
+                      : WsMessage::from_json(payload);
+
+    // Check correlation (request/response)
+    if (!msg.id.empty()) {
+        auto it = pending_responses_.find(msg.id);
+        if (it != pending_responses_.end()) {
+            auto handler = std::move(it->second.handler);
+            loop_.cancel_timer(it->second.timer);
+            pending_responses_.erase(it);
+            if (handler) handler(msg);
+            return;
+        }
+    }
+
+    // Check action dispatch
+    if (!msg.action.empty()) {
+        auto it = action_handlers_.find(msg.action);
+        if (it != action_handlers_.end()) {
+            WsMessage response;
+            response.id = msg.id;
+            it->second(*this, msg, response);
+            if (!response.action.empty() || !response.payload.is_null()) {
+                auto text = codec_ ? codec_->serialize(response)
+                                   : response.to_json();
+                send_text(text);
+            }
+            return;
+        }
+    }
+
+    // Fallback to generic message handler
+    if (on_message_) on_message_(WS_OP_TEXT, std::move(payload));
 }
 
 void WsClient::handle_close_frame(std::string_view payload)
@@ -332,6 +427,7 @@ void WsClient::handle_close_frame(std::string_view payload)
 
     bool we_initiated = (state_ == WsClientState::Closing);
 
+    // If server initiated, echo close frame
     if (!we_initiated) {
         std::string close_payload;
         close_payload.push_back(static_cast<char>(code >> 8));
@@ -344,6 +440,7 @@ void WsClient::handle_close_frame(std::string_view payload)
 
     if (on_close_) on_close_(code, reason);
 
+    // Auto-reconnect only if server initiated close
     if (auto_reconnect_ && !we_initiated) {
         state_ = WsClientState::Reconnecting;
         start_reconnect_timer();
@@ -370,6 +467,32 @@ void WsClient::send_ping(std::string_view data)
     tcp_.send(ws_build_client_frame(WS_OP_PING, data));
 }
 
+void WsClient::send(const WsMessage& message, ResponseHandler on_response,
+                     std::chrono::milliseconds timeout)
+{
+    if (state_ != WsClientState::Connected) return;
+
+    WsMessage msg = message;
+    if (msg.id.empty())
+        msg.id = generate_id();
+
+    if (on_response) {
+        auto timer = loop_.add_timer(timeout, [this, id = msg.id] {
+            auto it = pending_responses_.find(id);
+            if (it != pending_responses_.end()) {
+                pending_responses_.erase(it);
+                if (on_error_)
+                    on_error_(fmt::format("response timeout for {}", id));
+            }
+        }, false);
+
+        pending_responses_[msg.id] = {std::move(on_response), timer};
+    }
+
+    auto text = codec_ ? codec_->serialize(msg) : msg.to_json();
+    send_text(text);
+}
+
 // ── Close ────────────────────────────────────────────────────────────────────
 
 void WsClient::close(uint16_t code, std::string_view reason)
@@ -386,11 +509,35 @@ void WsClient::close(uint16_t code, std::string_view reason)
     tcp_.send(ws_build_client_frame(WS_OP_CLOSE, payload));
 }
 
+void WsClient::reconnect()
+{
+    if (state_ == WsClientState::Reconnecting)
+        return;
+
+    cancel_ping_timer();
+    state_ = WsClientState::Reconnecting;
+    reconnect_delay_ = std::chrono::seconds(1);
+    tcp_.close();
+    start_reconnect_timer();
+}
+
+// ── Action handlers ──────────────────────────────────────────────────────────
+
+void WsClient::on_action(std::string_view action, ActionHandler handler)
+{
+    action_handlers_[std::string(action)] = std::move(handler);
+}
+
 // ── Settings ─────────────────────────────────────────────────────────────────
 
 void WsClient::set_connect_timeout(std::chrono::milliseconds ms)
 {
     tcp_.set_connect_timeout(ms);
+}
+
+void WsClient::set_codec(std::unique_ptr<WsCodec> codec)
+{
+    codec_ = std::move(codec);
 }
 
 #ifdef WITH_SSL
@@ -416,6 +563,8 @@ void WsClient::start_ping_timer()
             if (pong_pending_) {
                 ++pong_miss_count_;
                 if (pong_miss_count_ >= 2) {
+                    // Pong timeout — force reconnect instead of entering
+                    // dead Error state (tcp_.on_close won't reconnect from Error).
                     cancel_ping_timer();
                     if (auto_reconnect_) {
                         state_ = WsClientState::Reconnecting;
@@ -458,6 +607,7 @@ void WsClient::start_reconnect_timer()
         },
         false);
 
+    // Exponential backoff
     reconnect_delay_ = std::min(reconnect_delay_ * 2, reconnect_max_delay_);
 }
 
@@ -471,7 +621,11 @@ void WsClient::cancel_reconnect_timer()
 
 void WsClient::do_reconnect()
 {
-    on_before_reconnect();
+    // Clear pending responses (cannot survive reconnect)
+    for (auto& [id, pending] : pending_responses_)
+        loop_.cancel_timer(pending.timer);
+    pending_responses_.clear();
+
     do_connect();
 }
 
@@ -489,6 +643,10 @@ void WsClient::cleanup()
 {
     cancel_ping_timer();
     cancel_reconnect_timer();
+
+    for (auto& [id, pending] : pending_responses_)
+        loop_.cancel_timer(pending.timer);
+    pending_responses_.clear();
 }
 
 } // namespace apostol

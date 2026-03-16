@@ -139,6 +139,28 @@ void BotSession::refresh_if_needed()
         });
 }
 
+// ─── execute_action ──────────────────────────────────────────────────────────
+
+void BotSession::execute_action(const std::string& id, std::string_view action,
+                                PgQuery::ResultHandler    on_result,
+                                PgQuery::ExceptionHandler on_error)
+{
+    if (!valid()) {
+        if (on_error)
+            on_error("BotSession: not authenticated");
+        return;
+    }
+
+    auto sql = fmt::format(
+        "SELECT * FROM api.authorize({});\n"
+        "SELECT * FROM api.execute_object_action({}::uuid, {})",
+        pq_quote_literal(session_),
+        pq_quote_literal(id),
+        pq_quote_literal(action));
+
+    pool_.execute(sql, std::move(on_result), std::move(on_error));
+}
+
 // ─── sign_out ────────────────────────────────────────────────────────────────
 
 void BotSession::sign_out()

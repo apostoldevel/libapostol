@@ -48,7 +48,7 @@ std::string ModuleManager::module_names() const
         if (m->enabled()) {
             if (!result.empty()) result += ", ";
             result += '"';
-            result += m->name();
+            result += m->title();
             result += '"';
         }
     }

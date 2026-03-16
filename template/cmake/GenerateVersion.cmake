@@ -8,6 +8,7 @@
 #   SOURCE_DIR       — path to the project root (where .git lives)
 #   PROJECT_VERSION  — semver string from CMake project()
 #   PROJECT_VERSION_MAJOR / _MINOR / _PATCH
+#   APP_NAME         — application name (for status message)
 #   VERSION_IN       — absolute path to cmake/version.hpp.in
 #   VERSION_OUT      — absolute path for the generated header
 
@@ -33,4 +34,4 @@ endif()
 
 configure_file("${VERSION_IN}" "${VERSION_OUT}" @ONLY)
 
-message(STATUS "apostol version: ${PROJECT_VERSION}+${GIT_HASH}")
+message(STATUS "${APP_NAME} version: ${PROJECT_VERSION}+${GIT_HASH}")

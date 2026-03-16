@@ -49,6 +49,13 @@ public:
     /// Sign out the current session. Call from on_stop().
     void sign_out();
 
+    /// Execute api.authorize(session) + api.execute_object_action(id, action).
+    /// Calls on_result on success, on_error on failure.
+    /// If session is not valid, calls on_error immediately.
+    void execute_action(const std::string& id, std::string_view action,
+                        PgQuery::ResultHandler    on_result,
+                        PgQuery::ExceptionHandler on_error);
+
 private:
     PgPool&     pool_;
     std::string agent_;

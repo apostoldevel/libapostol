@@ -73,7 +73,12 @@ void reply_error(HttpResponse& resp, int code, std::string_view message)
 
 std::string get_real_ip(const HttpRequest& req)
 {
-    return req.header("X-Real-IP");
+    auto ip = req.header("X-Real-IP");
+    if (ip.empty())
+        ip = req.header("X-Forwarded-For");
+    if (ip.empty())
+        ip = req.peer_ip;
+    return ip;
 }
 
 std::string get_origin(const HttpRequest& req)
@@ -114,6 +119,37 @@ void redirect(HttpResponse& resp, std::string_view location, HttpStatus code)
     resp.set_status(code)
         .set_header("Location", std::string(location))
         .set_body("", "text/plain");
+}
+
+// ─── is_private_ip ──────────────────────────────────────────────────────────
+
+bool is_private_ip(std::string_view ip)
+{
+    if (ip == "::1" || ip.starts_with("127."))
+        return true;
+
+    if (ip.starts_with("10.") || ip.starts_with("192.168."))
+        return true;
+
+    // 172.16.0.0 – 172.31.255.255
+    if (ip.starts_with("172.") && ip.size() > 6) {
+        auto dot2 = ip.find('.', 4);
+        if (dot2 != std::string_view::npos) {
+            int octet = 0;
+            for (std::size_t i = 4; i < dot2; ++i) {
+                if (ip[i] < '0' || ip[i] > '9') return false;
+                octet = octet * 10 + (ip[i] - '0');
+            }
+            if (octet >= 16 && octet <= 31)
+                return true;
+        }
+    }
+
+    // IPv6 ULA: fc00::/7
+    if (ip.starts_with("fc") || ip.starts_with("fd"))
+        return true;
+
+    return false;
 }
 
 // ─── Authorization parsing ──────────────────────────────────────────────────

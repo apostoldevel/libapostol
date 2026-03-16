@@ -1,5 +1,7 @@
 #pragma once
 
+#include <map>
+
 #include "apostol/config.hpp"
 #include "apostol/event_loop.hpp"
 #include "apostol/logger.hpp"
@@ -104,6 +106,12 @@ public:
     /// called first.
     PgPool& db_pool();
 
+    /// Access a named PgPool by role ("worker", "helper", "kernel").
+    /// On first call for a given role, lazily creates a pool using the
+    /// corresponding conninfo from settings (pg_conninfo_worker/helper/kernel).
+    /// Analogous to v1 GetQuery(conn, "helper") / PQClientStart("helper").
+    PgPool& db_pool(std::string_view role);
+
     /// True if setup_db() was called and the pool is alive.
     bool has_db_pool() const noexcept { return db_pool_ != nullptr; }
 
@@ -111,7 +119,10 @@ public:
     /// Call this at the end of on_worker_start() (or test helper) BEFORE
     /// the EventLoop is destroyed; PgPool::~PgPool() calls loop_.remove_io()
     /// which requires the loop to be alive.
-    void stop_db() noexcept { db_pool_.reset(); }
+    void stop_db() noexcept {
+        db_pool_.reset();
+        named_pools_.clear();
+    }
 #else
     void stop_db() noexcept {} // no-op when built without PostgreSQL
 #endif // WITH_POSTGRESQL
@@ -296,6 +307,7 @@ private:
 #ifdef WITH_POSTGRESQL
     std::unique_ptr<PgPool>   db_pool_;
     std::unique_ptr<Logger>   pg_logger_;
+    std::map<std::string, std::unique_ptr<PgPool>> named_pools_;
 #endif
     WsHandler                ws_handler_;
     EventLoop*               worker_loop_{nullptr};

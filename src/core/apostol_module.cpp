@@ -305,6 +305,10 @@ bool ApostolModule::match_path(std::string_view path,
 bool ApostolModule::serve_file(const std::filesystem::path& path,
                                 HttpResponse& resp, bool head_only)
 {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec) || ec)
+        return false;
+
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open())
         return false;
@@ -316,6 +320,54 @@ bool ApostolModule::serve_file(const std::filesystem::path& path,
     if (head_only)
         resp.suppress_body();
 
+    return true;
+}
+
+bool ApostolModule::try_files(const std::filesystem::path& root,
+                               const HttpRequest& req,
+                               HttpResponse& resp,
+                               bool head_only,
+                               const std::vector<std::string>& fallbacks)
+{
+    namespace fs = std::filesystem;
+
+    const auto& path = req.path;
+
+    // 1. Try exact file
+    if (path.size() > 1) {
+        auto file_path = root / path.substr(1);
+        if (serve_file(file_path, resp, head_only))
+            return true;
+    }
+
+    // 2. Directory handling: try path/index.html
+    auto rel = (path.size() > 1) ? path.substr(1) : std::string{};
+    auto dir_index = root / rel / "index.html";
+
+    std::error_code ec;
+    if (fs::is_regular_file(dir_index, ec) && !ec) {
+        // Redirect to path + "/" if missing trailing slash (fixes relative URLs)
+        if (!path.empty() && path.back() != '/') {
+            resp.set_status(HttpStatus::moved_permanently)
+                .set_header("Location", path + "/")
+                .set_body("", "text/plain");
+            return true;
+        }
+        // Has trailing slash — serve the index
+        if (serve_file(dir_index, resp, head_only))
+            return true;
+    }
+
+    // 3. Fallbacks (e.g. SPA → /index.html)
+    for (const auto& fallback : fallbacks) {
+        auto file_path = root / fallback.substr(1);
+        if (serve_file(file_path, resp, head_only))
+            return true;
+    }
+
+    // 4. Nothing found
+    resp.set_status(HttpStatus::not_found)
+        .set_body("404 Not Found", "text/plain");
     return true;
 }
 
@@ -353,164 +405,9 @@ std::string_view ApostolModule::mime_type(const std::string& ext)
     return it != types.end() ? it->second : "application/octet-stream";
 }
 
-// ─── PostgreSQL utilities ─────────────────────────────────────────────────────
+// ─── PostgreSQL utility delegates ─────────────────────────────────────────────
 
 #ifdef WITH_POSTGRESQL
-
-std::string ApostolModule::pg_result_to_json(const PgResult&  result,
-                                              std::string_view format,
-                                              std::string_view object_name)
-{
-    const bool wrap_object = !object_name.empty();
-    // Mirrors v1 PQResultToJson: bDataArray logic
-    const bool as_array    = wrap_object || format == "array" || result.rows() > 1;
-    const char* empty_data = as_array ? "[]" : "{}";
-
-    if (result.rows() == 0) {
-        // "null" format: empty result → literal "null" (mirrors v1)
-        if (format == "null")
-            return "null";
-        if (wrap_object)
-            return fmt::format("{{\"{}\":{}}}", object_name, empty_data);
-        return empty_data;
-    }
-
-    std::string json;
-    json.reserve(512);
-
-    if (wrap_object)
-        json += fmt::format("{{\"{}\":", object_name);
-
-    if (as_array)
-        json += '[';
-
-    for (int row = 0; row < result.rows(); ++row) {
-        if (row > 0) json += ',';
-        if (!result.is_null(row, 0)) {
-            // Col 0 is expected to hold a JSON value (e.g. from json_build_object)
-            json += result.value(row, 0);
-        } else {
-            json += as_array ? "null" : "{}";
-        }
-    }
-
-    if (as_array)
-        json += ']';
-
-    if (wrap_object)
-        json += '}';
-
-    return json;
-}
-
-void ApostolModule::reply_pg(HttpResponse&                resp,
-                              const std::vector<PgResult>& results,
-                              std::string_view             format,
-                              std::string_view             object_name)
-{
-    if (results.empty()) {
-        reply_error(resp, HttpStatus::internal_server_error, "empty result set");
-        return;
-    }
-
-    const auto& first = results.front();
-    if (!first.ok()) {
-        const char* err = first.error_message();
-        reply_error(resp, HttpStatus::internal_server_error,
-                    (err && *err) ? err : "query failed");
-        return;
-    }
-
-    resp.set_status(HttpStatus::ok)
-        .set_body(pg_result_to_json(first, format, object_name),
-                  "application/json");
-}
-
-// PG type OIDs (stable across all PG versions).
-// Mirrors libdelphi PQResultToJson type handling.
-static constexpr Oid kBoolOid    = 16;
-static constexpr Oid kInt2Oid    = 21;
-static constexpr Oid kInt4Oid    = 23;
-static constexpr Oid kInt8Oid    = 20;
-static constexpr Oid kOidOid     = 26;
-static constexpr Oid kFloat4Oid  = 700;
-static constexpr Oid kFloat8Oid  = 701;
-static constexpr Oid kNumericOid = 1700;
-static constexpr Oid kJsonOid    = 114;
-static constexpr Oid kJsonbOid   = 3802;
-
-std::string ApostolModule::pg_sql_to_json(const PgResult& result)
-{
-    const int nrows = result.rows();
-    const int ncols = result.columns();
-
-    std::string json;
-    json.reserve(nrows * ncols * 32);
-    json += '[';
-
-    for (int r = 0; r < nrows; ++r) {
-        if (r > 0) json += ',';
-        json += '{';
-        for (int c = 0; c < ncols; ++c) {
-            if (c > 0) json += ',';
-            json += '"';
-            json += json_escape(result.column_name(c));
-            json += "\":";
-
-            if (result.is_null(r, c)) {
-                json += "null";
-                continue;
-            }
-
-            const Oid type = result.column_type(c);
-            const char* val = result.value(r, c);
-
-            if (type == kBoolOid) {
-                // PG returns "t"/"f" for bool
-                json += (val[0] == 't') ? "true" : "false";
-            } else if (type == kJsonOid || type == kJsonbOid) {
-                // Embedded JSON — emit raw
-                json += val;
-            } else if (type == kInt2Oid || type == kInt4Oid ||
-                       type == kInt8Oid || type == kOidOid) {
-                json += val;
-            } else if (type == kFloat4Oid || type == kFloat8Oid || type == kNumericOid) {
-                // Emit as JSON number (float/numeric with decimals are valid JSON numbers)
-                json += val;
-            } else {
-                json += '"';
-                json += json_escape(val);
-                json += '"';
-            }
-        }
-        json += '}';
-    }
-
-    json += ']';
-    return json;
-}
-
-void ApostolModule::reply_sql(HttpResponse&                resp,
-                               const std::vector<PgResult>& results)
-{
-    if (results.empty()) {
-        reply_error(resp, HttpStatus::internal_server_error, "empty result set");
-        return;
-    }
-
-    const auto& first = results.front();
-    if (!first.ok()) {
-        const char* err = first.error_message();
-        reply_error(resp, HttpStatus::internal_server_error,
-                    (err && *err) ? err : "query failed");
-        return;
-    }
-
-    resp.set_status(HttpStatus::ok)
-        .set_body(pg_sql_to_json(first), "application/json");
-}
-
-// ─── PostgreSQL utility delegates ─────────────────────────────────────────────
 
 std::string ApostolModule::pq_quote_literal(std::string_view val)
 {

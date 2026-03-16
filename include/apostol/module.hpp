@@ -23,8 +23,11 @@ class Module
 public:
     virtual ~Module() = default;
 
-    /// Identifier shown in logs.
+    /// Identifier used in config lookup and module registration.
     virtual std::string_view name() const = 0;
+
+    /// Display name shown in process title and logs (defaults to name()).
+    virtual std::string_view title() const { return name(); }
 
     /// When false the module is excluded from both execute and heartbeat.
     virtual bool enabled() const = 0;

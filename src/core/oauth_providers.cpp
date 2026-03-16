@@ -65,6 +65,11 @@ void OAuthProviders::load(const std::filesystem::path& oauth2_dir)
                         if (sc.is_string())
                             app.scopes.push_back(sc.get<std::string>());
 
+                if (auto it = section.find("allowed_ips"); it != section.end() && it->is_array())
+                    for (const auto& ip : *it)
+                        if (ip.is_string())
+                            app.allowed_ips.push_back(ip.get<std::string>());
+
                 if (auto it = section.find("auth_uri"); it != section.end() && it->is_string())
                     app.auth_uri = it->get<std::string>();
 
