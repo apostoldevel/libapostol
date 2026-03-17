@@ -636,8 +636,12 @@ bool HttpConnection::on_readable(RequestHandler handler)
         // or if the handler marked it as deferred (async PG response)
         if (!closed_ && !resp.is_deferred())
             send_response(resp);
-        if (!req.keep_alive())
-            should_close = true;
+        if (!req.keep_alive()) {
+            if (resp.is_deferred())
+                close_after_send_ = true;  // close after deferred response is sent
+            else
+                should_close = true;
+        }
     });
 
     for (;;) {
@@ -700,6 +704,14 @@ void HttpConnection::send_response(const HttpResponse& resp)
         if (n == 0) break;
         ptr += n;
         rem -= static_cast<std::size_t>(n);
+    }
+
+    // Deferred response with Connection: close — close now that response is sent
+    if (close_after_send_) {
+        close_after_send_ = false;
+        closed_ = true;
+        if (loop_)
+            loop_->remove_io(conn_.fd());
     }
 }
 
@@ -802,6 +814,15 @@ bool HttpConnection::on_writable()
 
     // All done — remove EPOLLOUT interest
     update_write_interest();
+
+    // Deferred response with Connection: close — close after write completes
+    if (close_after_send_) {
+        close_after_send_ = false;
+        closed_ = true;
+        if (loop_)
+            loop_->remove_io(conn_.fd());
+    }
+
     return false;
 }
 

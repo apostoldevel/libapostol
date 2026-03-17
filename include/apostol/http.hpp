@@ -325,6 +325,7 @@ private:
     HttpParser    parser_;
     EventLoop*    loop_{nullptr};
     bool          closed_{false};
+    bool          close_after_send_{false};  // deferred response + Connection: close
 
     // Async write buffer
     std::string   write_buf_;
