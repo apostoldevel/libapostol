@@ -179,6 +179,11 @@ private:
     bool             resetting_{false};
     bool             needs_flush_{false};
     NoticeCallback   notice_cb_;
+
+    /// Accumulator for multi-statement query results across split-TCP deliveries.
+    /// Results are collected here until PQgetResult returns NULL (all statements
+    /// complete), then returned as a single batch to prevent partial delivery.
+    std::vector<PgResult> pending_results_;
 };
 
 // ── PgPool ────────────────────────────────────────────────────────────────────

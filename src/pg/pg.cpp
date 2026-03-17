@@ -157,6 +157,7 @@ PostgresPollingStatusType PgConnection::connect_poll()
 
 bool PgConnection::reset_start()
 {
+    pending_results_.clear();
     if (!PQresetStart(conn_.get())) {
         state_ = PgConnState::Error;
         return false;
@@ -226,11 +227,10 @@ bool PgConnection::send_query(const std::string& sql)
 
 std::vector<PgResult> PgConnection::collect_results()
 {
-    std::vector<PgResult> out;
-
     if (PQconsumeInput(conn_.get()) == 0) {
         state_ = PgConnState::Error;  // connection is dead
-        return out;
+        pending_results_.clear();
+        return {};
     }
 
     // PQisBusy returns 1 if the query is still in progress
@@ -243,13 +243,22 @@ std::vector<PgResult> PgConnection::collect_results()
             state_ = PgConnState::Ready;
             break;
         }
-        out.emplace_back(r);
+        pending_results_.emplace_back(r);
     }
-    // If loop exited via PQisBusy==1, state stays Busy — the trailing NULL
-    // (ReadyForQuery) hasn't arrived yet.  Results in `out` are complete and
-    // safe to deliver; the next EPOLLIN will consume the NULL and set Ready.
 
-    return out;
+    // Return results only when ALL statements in the multi-statement query
+    // are complete (PQgetResult returned NULL → state is Ready).  This prevents
+    // split-TCP delivery from causing partial result sets: if the response spans
+    // multiple TCP segments, earlier EPOLLIN events may deliver only some results
+    // while PQisBusy==1 for the rest.  Accumulating in pending_results_ ensures
+    // the callback always receives the full result vector.
+    if (state_ == PgConnState::Ready) {
+        auto out = std::move(pending_results_);
+        pending_results_.clear();
+        return out;
+    }
+
+    return {};  // still busy — wait for remaining results
 }
 
 bool PgConnection::flush()
@@ -454,12 +463,28 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
             }
 
             if (results.empty()) {
-                // No new result rows.  Two sub-cases:
-                // a) PQisBusy==1: still waiting for data → nothing to do.
-                // b) PQgetResult returned NULL after a previous split-TCP
-                //    delivery → state is now Ready, drain the queue.
-                if (conn.state() == PgConnState::Ready)
+                // collect_results() accumulates partial results internally
+                // and only returns them when all statements are complete
+                // (state == Ready).  Empty return means either:
+                //   a) PQisBusy==1: still waiting for more data.
+                //   b) Query produced zero results (edge case) — clear it.
+                if (conn.state() == PgConnState::Ready) {
+                    const PgQuery* raw_q = conn.current_query();
+                    conn.set_current_query(nullptr);
+                    if (raw_q) {
+                        auto it = std::find_if(inflight_.begin(), inflight_.end(),
+                            [raw_q](const std::unique_ptr<PgQuery>& p) {
+                                return p.get() == raw_q;
+                            });
+                        if (it != inflight_.end()) {
+                            auto owned = std::move(*it);
+                            inflight_.erase(it);
+                            if (!owned->canceled())
+                                owned->deliver({});
+                        }
+                    }
                     dispatch_queue(conn);
+                }
                 break;
             }
 
@@ -563,8 +588,8 @@ void PgPool::dispatch_queue(PgConnection& conn)
         return;
 
     // Only dispatch on an idle connection — PQsendQuery requires PQgetResult
-    // to have returned NULL.  After a split-TCP collect_results() the conn may
-    // still be Busy (results delivered, but trailing NULL not yet consumed).
+    // to have returned NULL.  collect_results() accumulates partial results
+    // and only returns them when all statements are complete (state == Ready).
     if (conn.state() != PgConnState::Ready)
         return;
 
