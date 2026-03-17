@@ -300,13 +300,20 @@ std::string SmtpClient::build_message_data(const SmtpMessage& msg)
     std::string out;
     out.reserve(256 + msg.body.size());
 
-    out += fmt::format("From: {}\r\n", msg.from);
-    for (const auto& to : msg.to)
-        out += fmt::format("To: {}\r\n", to);
-    out += fmt::format("Subject: {}\r\n", msg.subject);
-    out += "MIME-Version: 1.0\r\n";
-    out += fmt::format("Content-Type: {}; charset=UTF-8\r\n", msg.content_type);
-    out += "\r\n";
+    // If the body already contains full MIME headers (from CreateMailBody),
+    // use it as-is — don't wrap with another set of headers.
+    bool raw_mime = (msg.body.find("MIME-Version:") != std::string::npos
+                  && msg.body.find("Content-Type:") != std::string::npos);
+
+    if (!raw_mime) {
+        out += fmt::format("From: {}\r\n", msg.from);
+        for (const auto& to : msg.to)
+            out += fmt::format("To: {}\r\n", to);
+        out += fmt::format("Subject: {}\r\n", msg.subject);
+        out += "MIME-Version: 1.0\r\n";
+        out += fmt::format("Content-Type: {}; charset=UTF-8\r\n", msg.content_type);
+        out += "\r\n";
+    }
 
     // Dot-stuffing: lines starting with '.' get an extra '.'
     std::string_view body = msg.body;
