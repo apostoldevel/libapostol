@@ -97,7 +97,7 @@ void StderrTarget::write(LogLevel level, std::string_view message)
         line += color;
         line += message;
         line += "\033[0m\n";
-        ::write(STDERR_FILENO, line.data(), line.size());
+        (void) ::write(STDERR_FILENO, line.data(), line.size());
     }
     else
     {

@@ -174,7 +174,7 @@ void EventLoop::dispatch_timer(int timer_fd)
 {
     // Consume the expiration count — required to re-arm EPOLLIN
     uint64_t count = 0;
-    ::read(timer_fd, &count, sizeof(count));
+    (void) ::read(timer_fd, &count, sizeof(count));
 
     auto id_it = timer_fd_to_id_.find(timer_fd);
     if (id_it == timer_fd_to_id_.end())

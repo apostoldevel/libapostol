@@ -753,7 +753,7 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
         if (file_fd_ >= 0) {
             // Read entire file into write buffer (rare edge case)
             std::string buf(file_size, '\0');
-            ::read(fd, buf.data(), file_size);
+            (void) ::read(fd, buf.data(), file_size);
             ::close(fd);
             write_buf_.append(buf);
             return;
