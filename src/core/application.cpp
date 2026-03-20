@@ -989,6 +989,8 @@ pid_t Application::fork_child(ProcessRole role, std::string child_name,
     if (pid == 0)
     {
         // ── Child process ──────────────────────────────────────────────────
+        ::prctl(PR_SET_PDEATHSIG, SIGTERM);
+
         role_ = role;
 
         if (role == ProcessRole::worker)
