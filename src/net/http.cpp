@@ -245,6 +245,8 @@ HttpResponse& HttpResponse::set_cookie(std::string_view name,
         cookie_val += fmt::format("; Path={}", path);
     if (max_age > 0)
         cookie_val += fmt::format("; Max-Age={}", max_age);
+    else if (max_age < 0)
+        cookie_val += "; Max-Age=0";
     if (!domain.empty())
         cookie_val += fmt::format("; Domain={}", domain);
     if (http_only)
