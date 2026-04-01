@@ -400,7 +400,8 @@ void WsClient::handle_text_message(std::string payload)
             WsMessage response;
             response.id = msg.id;
             it->second(*this, msg, response);
-            if (!response.action.empty() || !response.payload.is_null()) {
+            if (response.type == WsMessage::Type::Error ||
+                !response.action.empty() || !response.payload.is_null()) {
                 auto text = codec_ ? codec_->serialize(response)
                                    : response.to_json();
                 send_text(text);
