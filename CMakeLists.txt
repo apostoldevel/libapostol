@@ -10,6 +10,14 @@ option(WITH_POSTGRESQL "Build with PostgreSQL (libpq)" ON)
 option(WITH_SSL        "Build with OpenSSL"            ON)
 option(WITH_CURL       "Build with libcurl"            ON)
 
+# Edge-triggered + one-shot epoll migration (in progress).
+# When ON, EventLoop::add_io registers fds with EPOLLET|EPOLLONESHOT;
+# handlers must drain to EAGAIN and call rearm_io() after each event.
+# See docs/plans/2026-04-19-epoll-edge-triggered-migration.md in consuming
+# project apostol-csms. Default OFF until the framework-wide migration
+# (readers, writers, timers, signals) is complete and validated.
+option(APOSTOL_EPOLL_ET "Edge-triggered + one-shot epoll (migration in progress)" OFF)
+
 # ─── Dependencies (FetchContent) ─────────────────────────────────────────────
 
 include(FetchContent)
@@ -132,6 +140,7 @@ target_compile_definitions(apostol PUBLIC
     $<$<BOOL:${WITH_POSTGRESQL}>:WITH_POSTGRESQL>
     $<$<BOOL:${WITH_SSL}>:WITH_SSL>
     $<$<BOOL:${WITH_CURL}>:WITH_CURL>
+    $<$<BOOL:${APOSTOL_EPOLL_ET}>:APOSTOL_EPOLL_ET>
 )
 
 target_compile_options(apostol PRIVATE
