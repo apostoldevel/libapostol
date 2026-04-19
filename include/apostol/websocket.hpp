@@ -102,7 +102,8 @@ public:
 
     explicit WsConnection(TcpConnection conn);
 
-    int fd() const noexcept { return conn_.fd(); }
+    int  fd()     const noexcept { return conn_.fd(); }
+    bool closed() const noexcept { return closed_; }
 
     /// Called each time the fd becomes readable.
     /// Delivers messages via @p on_msg, auto-pongs pings.

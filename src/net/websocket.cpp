@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <random>
@@ -365,12 +366,26 @@ WsConnection::WsConnection(TcpConnection conn) : conn_(std::move(conn)) {}
 
 void WsConnection::send_raw(uint8_t opcode, std::string_view payload, bool fin)
 {
+    if (closed_) return;
+
     auto frame = ws_build_frame(opcode, payload, fin);
     const char* ptr = frame.data();
     std::size_t rem = frame.size();
     while (rem > 0) {
         ssize_t n = conn_.write(ptr, rem);
-        if (n < 0) continue;   // EAGAIN on loopback — spin
+        if (n < 0) {
+            // TcpConnection::write returns -1 for any send() error.
+            // WebSocket framing does not allow partial frames, so any
+            // send failure — EAGAIN (buffer full) or fatal (EPIPE/EBADF/
+            // ECONNRESET) — forces us to drop the connection: retrying
+            // under EAGAIN without waiting for EPOLLOUT would busy-spin
+            // and block the event loop; continuing after a fatal error
+            // would spin forever on a dead peer. Mark the connection
+            // closed and bail; the next remove_session call finishes
+            // cleanup.
+            closed_ = true;
+            break;
+        }
         if (n == 0) break;
         ptr += n;
         rem -= static_cast<std::size_t>(n);
@@ -434,7 +449,12 @@ bool WsConnection::on_readable(MessageHandler on_msg, CloseHandler on_close)
         return false;
     }
 
-    return !got_eof;
+    if (got_eof) {
+        closed_ = true;
+        return false;
+    }
+
+    return true;
 }
 
 // ── ws_upgrade ────────────────────────────────────────────────────────────────
