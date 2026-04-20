@@ -10,13 +10,16 @@ option(WITH_POSTGRESQL "Build with PostgreSQL (libpq)" ON)
 option(WITH_SSL        "Build with OpenSSL"            ON)
 option(WITH_CURL       "Build with libcurl"            ON)
 
-# Edge-triggered + one-shot epoll migration (in progress).
+# Edge-triggered + one-shot epoll — defense-in-depth against the class of
+# "forgotten remove_io" bugs that spin the event loop at 100% CPU on a
+# closed socket (see a3660c2 / 23347f6 production fixes).
 # When ON, EventLoop::add_io registers fds with EPOLLET|EPOLLONESHOT;
-# handlers must drain to EAGAIN and call rearm_io() after each event.
-# See docs/plans/2026-04-19-epoll-edge-triggered-migration.md in consuming
-# project apostol-csms. Default OFF until the framework-wide migration
-# (readers, writers, timers, signals) is complete and validated.
-option(APOSTOL_EPOLL_ET "Edge-triggered + one-shot epoll (migration in progress)" OFF)
+# handlers must drain to EAGAIN and call rearm_io() after each event, or
+# the fd goes idle (no spin, by design).
+# Default OFF here so downstreams opt in explicitly; apostol-csms's
+# backend/configure and Dockerfile default it to ON with an
+# APOSTOL_EPOLL_ET=OFF rollback env var.
+option(APOSTOL_EPOLL_ET "Edge-triggered + one-shot epoll (defense-in-depth against forgotten remove_io spins)" OFF)
 
 # ─── Dependencies (FetchContent) ─────────────────────────────────────────────
 
