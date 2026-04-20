@@ -54,6 +54,14 @@ public:
     // Change monitored events for an already-registered fd.
     void modify_io(int fd, uint32_t events);
 
+    // Re-arm a fd registered with APOSTOL_EPOLL_ET (edge-triggered + one-shot)
+    // so further events resume being delivered. With @p events==0 (default)
+    // the mask last set by add_io or modify_io is reused. No-op if the fd is
+    // not currently registered (defensive — a handler may have removed it
+    // just before rearm was requested). With APOSTOL_EPOLL_ET disabled, this
+    // is a cheap no-op: level-triggered fds stay armed.
+    void rearm_io(int fd, uint32_t events = 0);
+
     // Remove fd from epoll. Does NOT close it.
     void remove_io(int fd);
 

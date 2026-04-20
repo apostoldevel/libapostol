@@ -692,15 +692,23 @@ void HttpConnection::send_response(const HttpResponse& resp)
 
     while (rem > 0) {
         ssize_t n = conn_.write(ptr, rem);
-        if (n < 0) {
-            // EAGAIN — buffer remainder and register EPOLLOUT
+        if (n == -2) {
+            // Fatal error (EPIPE / ECONNRESET / EBADF) — peer or socket
+            // is gone. Mark closed and bail; retrying spins forever.
+            closed_ = true;
+            if (loop_)
+                loop_->remove_io(conn_.fd());
+            return;
+        }
+        if (n == -1) {
+            // EAGAIN — backpressure. Buffer remainder and register EPOLLOUT.
             if (loop_) {
                 write_buf_.assign(ptr, rem);
                 write_pos_ = 0;
                 update_write_interest();
                 return;
             }
-            // No EventLoop — spin (legacy behavior for tests)
+            // No EventLoop — legacy short-spin for tests / sync handlers.
             continue;
         }
         if (n == 0) break;
@@ -773,7 +781,15 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
 
     while (rem > 0) {
         ssize_t n = conn_.write(ptr, rem);
-        if (n < 0) {
+        if (n == -2) {
+            // Fatal — peer gone. Abort send_file; we never queued fd yet.
+            ::close(fd);
+            closed_ = true;
+            if (loop_)
+                loop_->remove_io(conn_.fd());
+            return;
+        }
+        if (n == -1) {
             // EAGAIN — buffer headers + queue file
             write_buf_.assign(ptr, rem);
             write_pos_ = 0;
@@ -839,7 +855,17 @@ bool HttpConnection::drain_buffer()
         ssize_t n = conn_.write(
             write_buf_.data() + write_pos_,
             write_buf_.size() - write_pos_);
-        if (n < 0)
+        if (n == -2) {
+            // Fatal — peer gone. Drop the buffered tail; on_writable will
+            // observe closed_ and disarm.
+            closed_ = true;
+            if (loop_)
+                loop_->remove_io(conn_.fd());
+            write_buf_.clear();
+            write_pos_ = 0;
+            return true;   // nothing left to drain
+        }
+        if (n == -1)
             return false;  // EAGAIN — try again on next EPOLLOUT
         if (n == 0) {
             closed_ = true;
@@ -854,13 +880,18 @@ bool HttpConnection::drain_buffer()
 
 bool HttpConnection::drain_file()
 {
+    bool fatal = false;
     while (file_remaining_ > 0) {
         ssize_t n = ::sendfile(conn_.fd(), file_fd_,
                                &file_offset_, file_remaining_);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 return false;  // Try again on next EPOLLOUT
-            // Actual error (EPIPE, etc.) — give up
+            // Actual error (EPIPE, ECONNRESET, EBADF) — peer or socket
+            // is gone. Truncated HTTP response is already on the wire;
+            // close the connection so the caller tears down instead of
+            // leaving it armed for EPOLLIN on a dead fd.
+            fatal = true;
             break;
         }
         if (n == 0)
@@ -871,6 +902,13 @@ bool HttpConnection::drain_file()
     ::close(file_fd_);
     file_fd_ = -1;
     file_remaining_ = 0;
+
+    if (fatal) {
+        closed_ = true;
+        if (loop_)
+            loop_->remove_io(conn_.fd());
+    }
+
     return true;
 }
 

@@ -73,12 +73,40 @@ ssize_t TcpConnection::read(void* buf, std::size_t len) noexcept
     return n;
 }
 
+ssize_t TcpConnection::read_drain(std::string& out)
+{
+    constexpr std::size_t kChunk = 4096;
+    ssize_t total = 0;
+    char buf[kChunk];
+
+    for (;;) {
+        ssize_t n = ::recv(fd_, buf, sizeof(buf), 0);
+        if (n > 0) {
+            out.append(buf, static_cast<std::size_t>(n));
+            total += n;
+            continue;
+        }
+        if (n == 0)
+            return -2;   // peer closed
+        // n < 0
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return total;
+        if (errno == EINTR)
+            continue;
+        // Other errors (ECONNRESET, EBADF, ...) — treat as closed.
+        return -2;
+    }
+}
+
 ssize_t TcpConnection::write(const void* buf, std::size_t len) noexcept
 {
     ssize_t n = ::send(fd_, buf, len, MSG_NOSIGNAL);
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-        return -1;
-    return n;
+    if (n >= 0)
+        return n;
+    if (errno == EAGAIN || errno == EWOULDBLOCK)
+        return -1;   // backpressure — caller buffers + rearms EPOLLOUT
+    // EPIPE / ECONNRESET / EBADF / ENOBUFS / … — peer or socket gone.
+    return -2;
 }
 
 // ─── TcpListener ─────────────────────────────────────────────────────────────
@@ -183,6 +211,30 @@ std::optional<TcpConnection> TcpListener::accept()
     ::setsockopt(conn_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     return TcpConnection{conn_fd, peer, len};
+}
+
+int TcpListener::accept_drain(const AcceptHandler& on_conn)
+{
+    int count = 0;
+    for (;;) {
+        std::optional<TcpConnection> conn_opt;
+        try {
+            conn_opt = accept();
+        } catch (const std::system_error&) {
+            // EMFILE / ENFILE / ECONNABORTED / EPROTO — swallow so the
+            // exception doesn't propagate out of the epoll callback and
+            // leave the listener disarmed under ET. The caller will see
+            // the accepted count so far; the next readable transition
+            // (or descriptor-table recovery) will retry. Without this
+            // catch an fd-exhausted worker would go dark until restart.
+            return count;
+        }
+        if (!conn_opt)
+            return count;
+        if (on_conn)
+            on_conn(std::move(*conn_opt));
+        ++count;
+    }
 }
 
 } // namespace apostol

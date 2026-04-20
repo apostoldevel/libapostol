@@ -9,6 +9,8 @@
 #include <string>
 #include <string_view>
 
+namespace apostol { class EventLoop; }
+
 namespace apostol
 {
 
@@ -105,11 +107,47 @@ public:
     int  fd()     const noexcept { return conn_.fd(); }
     bool closed() const noexcept { return closed_; }
 
+    /// Bind an EventLoop so send_* can arm EPOLLOUT automatically when a
+    /// write hits EAGAIN. Optional — without it the caller is responsible
+    /// for watching EPOLLOUT and calling on_writable() themselves.
+    void bind_event_loop(EventLoop& loop) noexcept { loop_ = &loop; }
+
     /// Called each time the fd becomes readable.
     /// Delivers messages via @p on_msg, auto-pongs pings.
     /// Returns false when the connection should be closed (close frame or EOF).
     bool on_readable(MessageHandler on_msg, CloseHandler on_close = {});
 
+    /// Drain bytes buffered by an earlier EAGAIN. Call on EPOLLOUT events.
+    /// Returns true when the pending buffer is fully flushed (EPOLLOUT can
+    /// be dropped); false if more bytes still need sending (keep EPOLLOUT).
+    /// On fatal error sets closed() — caller should tear the session down.
+    bool on_writable();
+
+    /// True while send_* bytes wait for EPOLLOUT to drain them.
+    bool has_pending_writes() const noexcept
+    {
+        return pending_pos_ < pending_.size();
+    }
+
+    /// Unsent bytes currently queued for EPOLLOUT (for metrics / tests).
+    std::size_t pending_bytes() const noexcept
+    {
+        return pending_.size() - pending_pos_;
+    }
+
+    /// Cap on the backpressure buffer. When a send_* would push pending_
+    /// past this size, the session is closed instead of queueing more —
+    /// prevents an unbounded buffer when the peer stalls under a chatty
+    /// observer stream. Default 1 MiB; 0 disables the cap.
+    void set_max_pending_bytes(std::size_t bytes) noexcept { max_pending_ = bytes; }
+    std::size_t max_pending_bytes() const noexcept { return max_pending_; }
+
+    /// Send functions are fire-and-forget: they queue or fail silently and
+    /// return void. The caller cannot observe delivery from the return path.
+    /// On fatal socket errors or pending_ overflow the session is marked
+    /// closed(); callers polling that flag can detect dead sessions. There
+    /// is no API to confirm the bytes reached the peer — the WebSocket spec
+    /// offers no such guarantee either.
     void send_text  (std::string_view text);
     void send_binary(std::string_view data);
     void send_ping  (std::string_view data = {});
@@ -118,9 +156,18 @@ public:
 private:
     TcpConnection conn_;
     WsParser      parser_;
+    EventLoop*    loop_{nullptr};
     bool          closed_{false};
 
+    // Outbound backpressure buffer. Holds the tail of any frame that
+    // EAGAIN'd mid-write, plus any subsequent frames queued while that
+    // tail is still pending (frame order must be preserved on the wire).
+    std::string   pending_;
+    std::size_t   max_pending_{1024 * 1024};  // 1 MiB default cap
+    std::size_t   pending_pos_{0};
+
     void send_raw(uint8_t opcode, std::string_view payload, bool fin = true);
+    void arm_write_interest();
 };
 
 // ── HTTP → WebSocket upgrade ──────────────────────────────────────────────────

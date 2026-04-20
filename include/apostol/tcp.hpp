@@ -4,6 +4,7 @@
 #include <sys/socket.h>
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -36,8 +37,25 @@ public:
     /// Returns: >0 bytes read, 0 on EOF (peer closed), -1 on EAGAIN/EWOULDBLOCK.
     ssize_t read(void* buf, std::size_t len) noexcept;
 
+    /// Drain the socket's receive buffer into @p out, appending.
+    /// Required by the APOSTOL_EPOLL_ET migration: edge-triggered handlers
+    /// must read everything available before returning.
+    ///
+    /// Returns: total bytes appended this call (may be 0 if nothing was
+    ///          buffered),
+    ///          or -2 if the peer has closed (and any buffered prefix is
+    ///          still appended to @p out).
+    /// Never returns -1 — EAGAIN is the expected loop-exit condition.
+    ssize_t read_drain(std::string& out);
+
     /// Non-blocking write.
-    /// Returns: bytes written (may be < len), -1 on EAGAIN/EWOULDBLOCK.
+    /// Returns: bytes written (may be < len),
+    ///          -1 on EAGAIN/EWOULDBLOCK (backpressure — caller should
+    ///          buffer the remainder and rearm EPOLLOUT),
+    ///          -2 on fatal error such as EPIPE / ECONNRESET / EBADF
+    ///          (peer or socket gone — caller should close, not retry).
+    /// Mirrors read_drain's -2 = fatal convention so ET-aware callers can
+    /// distinguish backpressure from a dead peer in one check.
     ssize_t write(const void* buf, std::size_t len) noexcept;
 
 private:
@@ -75,6 +93,15 @@ public:
     /// Non-blocking accept.
     /// Returns nullopt if there is no pending connection (EAGAIN/EWOULDBLOCK).
     std::optional<TcpConnection> accept();
+
+    /// Accept every pending connection in a tight loop, invoking @p on_conn
+    /// for each. Required by the APOSTOL_EPOLL_ET migration: edge-triggered
+    /// listeners receive one event per readable transition, so the handler
+    /// must drain the accept queue before returning, otherwise subsequent
+    /// pending connections are stranded until the next new connect().
+    /// Returns the number of connections accepted (≥ 0).
+    using AcceptHandler = std::function<void(TcpConnection)>;
+    int accept_drain(const AcceptHandler& on_conn);
 
 private:
     explicit TcpListener(int fd, bool owns) noexcept;

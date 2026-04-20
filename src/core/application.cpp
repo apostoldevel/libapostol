@@ -1525,63 +1525,99 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
 
     logger_->notice("HTTP server listening on port {}", http_port_);
 
-    // Accept loop
-    loop.add_io(listener->fd(), EPOLLIN,
-        [this, &loop, listener](uint32_t)
+    // Accept loop — under APOSTOL_EPOLL_ET the listener fires one event per
+    // readable transition, so we must drain the accept queue each time.
+    // accept_drain loops until EAGAIN; rearm_io re-enables further events.
+    // Under LT (flag OFF) the loop is equivalent — single accept per event
+    // still works because LT re-fires until the queue empties, but the
+    // drain shape is harmless and keeps one code path.
+    int listen_fd = listener->fd();
+    loop.add_io(listen_fd, EPOLLIN,
+        [this, &loop, listener, listen_fd](uint32_t)
         {
-            auto conn_opt = listener->accept();
-            if (!conn_opt)
-                return;
+            // Under APOSTOL_EPOLL_ET the listener is disarmed by ONESHOT
+            // after this event. Always rearm, even on exceptions from the
+            // accept handlers — otherwise a single bad alloc or handler
+            // throw would permanently stop accepting new connections.
+            try {
+                listener->accept_drain(
+                    [this, &loop](TcpConnection raw_conn)
+                    {
+                        auto http_conn = std::make_shared<HttpConnection>(std::move(raw_conn), &loop);
+                        int  conn_fd   = http_conn->fd();
 
-            auto http_conn = std::make_shared<HttpConnection>(std::move(*conn_opt), &loop);
-            int  conn_fd   = http_conn->fd();
-
-            loop.add_io(conn_fd, EPOLLIN | EPOLLRDHUP,
-                [this, &loop, http_conn, conn_fd](uint32_t events)
-                {
-                    // Drain pending async writes (sendfile, buffered responses)
-                    if (events & EPOLLOUT)
-                        http_conn->on_writable();
-
-                    if (!(events & (EPOLLIN | EPOLLRDHUP)))
-                        return;
-
-                    bool upgraded = false;
-
-                    bool keep = http_conn->on_readable(
-                        [this, &loop, &http_conn, conn_fd, &upgraded]
-                        (const HttpRequest& req, HttpResponse& resp)
-                        {
-                            // Expose the connection handle so async modules
-                            // (e.g. PGHTTP) can send deferred responses later.
-                            req.connection_ctx = http_conn;
-
-                            // WebSocket upgrade?
-                            if (ws_handler_ && is_ws_upgrade(req))
+                        loop.add_io(conn_fd, EPOLLIN | EPOLLRDHUP,
+                            [this, &loop, http_conn, conn_fd](uint32_t events)
                             {
-                                auto ws_opt = ws_upgrade(*http_conn, req);
-                                if (ws_opt)
-                                {
-                                    upgraded = true;
-                                    ws_handler_(loop, std::move(*ws_opt), req);
-                                }
-                                else
-                                {
-                                    resp.set_status(400, "Bad Request")
-                                        .set_body("WebSocket upgrade failed");
-                                }
-                                return;
-                            }
+                                // Always re-arm or detach this fd before returning,
+                                // even if a handler throws. Leaking it armed-but-
+                                // disabled under ET = dark connection forever.
+                                try {
+                                    // Drain pending async writes (sendfile, buffered responses)
+                                    if (events & EPOLLOUT)
+                                        http_conn->on_writable();
 
-                            // Normal HTTP dispatch
-                            if (!module_manager_.execute(req, resp))
-                                resp.set_status(404, "Not Found")
-                                    .set_body("404 Not Found");
-                        });
+                                    if (!(events & (EPOLLIN | EPOLLRDHUP))) {
+                                        loop.rearm_io(conn_fd);
+                                        return;
+                                    }
 
-                    if (!keep && !upgraded)
-                        loop.remove_io(conn_fd);
-                });
+                                    bool upgraded = false;
+
+                                    bool keep = http_conn->on_readable(
+                                        [this, &loop, &http_conn, conn_fd, &upgraded]
+                                        (const HttpRequest& req, HttpResponse& resp)
+                                        {
+                                            req.connection_ctx = http_conn;
+
+                                            if (ws_handler_ && is_ws_upgrade(req))
+                                            {
+                                                auto ws_opt = ws_upgrade(*http_conn, req);
+                                                if (ws_opt)
+                                                {
+                                                    upgraded = true;
+                                                    ws_handler_(loop, std::move(*ws_opt), req);
+                                                }
+                                                else
+                                                {
+                                                    resp.set_status(400, "Bad Request")
+                                                        .set_body("WebSocket upgrade failed");
+                                                }
+                                                return;
+                                            }
+
+                                            if (!module_manager_.execute(req, resp))
+                                                resp.set_status(404, "Not Found")
+                                                    .set_body("404 Not Found");
+                                        });
+
+                                    if (upgraded)
+                                        return;   // ws_handler re-registered its own I/O
+                                    if (!keep)
+                                        loop.remove_io(conn_fd);
+                                    else
+                                        loop.rearm_io(conn_fd);
+                                } catch (const std::exception& e) {
+                                    if (logger_)
+                                        logger_->error("HTTP handler threw: {} — dropping connection fd={}",
+                                                       e.what(), conn_fd);
+                                    loop.remove_io(conn_fd);
+                                } catch (...) {
+                                    if (logger_)
+                                        logger_->error("HTTP handler threw unknown exception — dropping connection fd={}",
+                                                       conn_fd);
+                                    loop.remove_io(conn_fd);
+                                }
+                            });
+                    });
+            } catch (const std::exception& e) {
+                if (logger_)
+                    logger_->error("Accept loop threw: {} — listener will rearm", e.what());
+            } catch (...) {
+                if (logger_)
+                    logger_->error("Accept loop threw unknown exception — listener will rearm");
+            }
+            loop.rearm_io(listen_fd);
         });
 
     // Module heartbeat — every 1 second

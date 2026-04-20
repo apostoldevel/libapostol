@@ -86,10 +86,26 @@ void EventLoop::stop() noexcept
 
 // ── I/O ──────────────────────────────────────────────────────────────────────
 
+// When APOSTOL_EPOLL_ET is enabled, user-facing I/O fds are registered with
+// edge-triggered + one-shot semantics: handlers must drain to EAGAIN and
+// explicitly re-arm (see rearm_io) or remove themselves. This is a
+// defence-in-depth property against forgotten remove_io spins — see the
+// plan docs/plans/2026-04-19-epoll-edge-triggered-migration.md.
+// Internal fds registered directly via epoll_ctl (timer fds, signal fd)
+// continue to use level-triggered — they are owned by EventLoop and
+// drained internally.
+static constexpr uint32_t kExtraFlags =
+#ifdef APOSTOL_EPOLL_ET
+    EPOLLET | EPOLLONESHOT
+#else
+    0
+#endif
+    ;
+
 void EventLoop::add_io(int fd, uint32_t events, IOCallback cb)
 {
     epoll_event ev{};
-    ev.events = events;
+    ev.events = events | kExtraFlags;
     ev.data.fd = fd;
 
     if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0)
@@ -102,7 +118,7 @@ void EventLoop::add_io(int fd, uint32_t events, IOCallback cb)
 void EventLoop::modify_io(int fd, uint32_t events)
 {
     epoll_event ev{};
-    ev.events = events;
+    ev.events = events | kExtraFlags;
     ev.data.fd = fd;
 
     if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0)
@@ -111,6 +127,29 @@ void EventLoop::modify_io(int fd, uint32_t events)
 
     if (auto it = io_handlers_.find(fd); it != io_handlers_.end())
         it->second.events = events;
+}
+
+void EventLoop::rearm_io(int fd, uint32_t events)
+{
+#ifdef APOSTOL_EPOLL_ET
+    auto it = io_handlers_.find(fd);
+    if (it == io_handlers_.end())
+        return;   // defensive: handler may have just removed itself
+
+    epoll_event ev{};
+    ev.events  = (events ? events : it->second.events) | EPOLLET | EPOLLONESHOT;
+    ev.data.fd = fd;
+
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0 && errno != ENOENT)
+        throw std::system_error(errno, std::system_category(),
+            fmt::format("epoll_ctl MOD (rearm) fd={}", fd));
+
+    if (events)
+        it->second.events = events;
+#else
+    (void)fd;
+    (void)events;   // level-triggered: nothing to rearm
+#endif
 }
 
 void EventLoop::remove_io(int fd)

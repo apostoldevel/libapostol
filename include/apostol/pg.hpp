@@ -287,6 +287,12 @@ private:
     std::vector<std::unique_ptr<PgQuery>>      inflight_;     // queries currently executing
     std::unordered_set<uint64_t>               canceled_ids_; // queued queries pending cancel
 
+    // Pointer set of connections currently registered with EventLoop.
+    // Used by on_io to decide whether it's safe to rearm a conn after a
+    // handler may have destroyed it via replace_connection (which erases
+    // from conns_, invalidating the reference passed to on_io).
+    std::unordered_set<PgConnection*>          registered_conns_;
+
     // ── Listener (dedicated connection for LISTEN/NOTIFY) ─────────────────────
     void start_listener();
     void on_listener_io(uint32_t events);

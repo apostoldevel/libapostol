@@ -28,10 +28,15 @@ void UdpClient::start()
         for (;;) {
             auto dgram = sock_.recv();
             if (!dgram)
-                break;  // EAGAIN
+                break;  // EAGAIN — drained
             if (on_datagram_)
                 on_datagram_(*dgram);
         }
+        // Under APOSTOL_EPOLL_ET the fd was armed with EPOLLONESHOT and
+        // disabled after this event. Rearm for the next datagram batch.
+        // Under LT flag OFF rearm_io is a no-op.
+        if (running_)
+            loop_.rearm_io(sock_.fd(), EPOLLIN);
     });
     running_ = true;
 }

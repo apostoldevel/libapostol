@@ -234,6 +234,15 @@ int CurlClient::socket_callback(CURL* /*easy*/, curl_socket_t s, int what,
                     self->loop_.cancel_timer(self->timer_id_);
                     self->timer_id_ = EventLoop::kInvalidTimer;
                 }
+
+                // Under APOSTOL_EPOLL_ET the fd was armed with EPOLLONESHOT
+                // and the kernel disabled further delivery. Rearm so libcurl
+                // receives subsequent IO events (it manages the mask itself
+                // via socket_callback → modify_io when direction changes).
+                // rearm_io is a silent no-op if socket_callback has already
+                // removed this fd above (CURL_POLL_REMOVE). Under LT this
+                // is a no-op.
+                self->loop_.rearm_io(static_cast<int>(s));
             });
     }
 

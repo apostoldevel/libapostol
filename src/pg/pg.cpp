@@ -371,6 +371,7 @@ void PgPool::new_connection()
 
     PgConnection* raw = conn.get();
     conns_.push_back(std::move(conn));
+    registered_conns_.insert(raw);
 
     loop_.add_io(raw->fd(), EPOLLIN | EPOLLOUT, [this, raw](uint32_t events) {
         on_io(*raw, events);
@@ -379,6 +380,12 @@ void PgPool::new_connection()
 
 void PgPool::on_io(PgConnection& conn, uint32_t events)
 {
+    // Remember identity so we can detect whether the handlers below
+    // destroyed this connection. replace_connection() erases it from
+    // conns_, leaving the caller with a dangling reference; the rearm_io
+    // at the end must skip that case.
+    const PgConnection* conn_ptr = &conn;
+
     switch (conn.state()) {
 
         case PgConnState::Connecting: {
@@ -539,6 +546,18 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
             }
             break;
         }
+    }
+
+    // Under APOSTOL_EPOLL_ET the fd was armed with EPOLLONESHOT and the
+    // kernel disabled further delivery. Rearm the current mask (set by
+    // modify_io inside the switch) so the next read/write transition is
+    // signalled. Under LT (flag off) rearm_io is a no-op. registered_conns_
+    // lookup is O(1) and survives replace_connection (which erases the
+    // pointer from the set before destroying the object), so accessing
+    // conn.fd() here is safe only when the set reports still registered.
+    if (registered_conns_.count(const_cast<PgConnection*>(conn_ptr))) {
+        if (conn.fd() >= 0)
+            loop_.rearm_io(conn.fd());
     }
 }
 
@@ -730,6 +749,12 @@ void PgPool::replace_connection(PgConnection& conn)
     if (old_fd >= 0)
         loop_.remove_io(old_fd);
 
+    // Drop the pointer from the registered set BEFORE erasing the unique_ptr
+    // below (which destroys the object) — otherwise on_io, if it runs the
+    // rearm check against a dangling pointer, could observe a false
+    // "registered" state.
+    registered_conns_.erase(&conn);
+
     // Find and erase this connection from conns_
     auto it = std::find_if(conns_.begin(), conns_.end(),
         [&conn](const std::unique_ptr<PgConnection>& p) {
@@ -884,9 +909,16 @@ void PgPool::send_pending_listens()
     listener_->send_query(sql);  // listener → Busy
 }
 
-void PgPool::on_listener_io(uint32_t /*events*/)
+void PgPool::on_listener_io(uint32_t events)
 {
     if (!listener_) return;
+
+    // EPOLLERR/EPOLLHUP on the listener connection = libpq socket is gone.
+    // Transition to Error state so the Error branch below reconnects from
+    // scratch; without this the listener would silently loop rearming a
+    // dead fd under LT, or stay disarmed under ET.
+    if (events & (EPOLLERR | EPOLLHUP))
+        listener_->set_state(PgConnState::Error);
 
     switch (listener_->state()) {
 
@@ -967,6 +999,16 @@ void PgPool::on_listener_io(uint32_t /*events*/)
             if (!notify_handlers_.empty())
                 start_listener();
             break;
+    }
+
+    // Under APOSTOL_EPOLL_ET every fd is armed with EPOLLONESHOT and must be
+    // rearmed after each event. Skip when the handler destroyed or replaced
+    // the listener (Error path calls listener_.reset(); start_listener()
+    // registers the new fd via add_io, which arms it on its own).
+    if (listener_ && listener_->fd() >= 0 &&
+        listener_->state() != PgConnState::Error)
+    {
+        loop_.rearm_io(listener_->fd());
     }
 }
 

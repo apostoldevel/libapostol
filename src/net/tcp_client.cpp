@@ -184,6 +184,14 @@ void TcpClient::on_io(uint32_t events)
         default:
             break;
     }
+
+    // Under APOSTOL_EPOLL_ET the fd was armed with EPOLLONESHOT and the
+    // kernel disabled further delivery once this event fired. Handlers
+    // either tear the fd down (cleanup() calls remove_io) or it must be
+    // rearmed here with the mask last set by modify_io/add_io. Under LT
+    // (flag off) rearm_io is a no-op, so behaviour is unchanged.
+    if (fd_ >= 0 && io_registered_)
+        loop_.rearm_io(fd_);
 }
 
 void TcpClient::handle_connect_result()

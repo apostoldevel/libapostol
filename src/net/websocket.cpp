@@ -1,10 +1,14 @@
 #include "apostol/websocket.hpp"
 
+#include "apostol/event_loop.hpp"
+
 #ifdef WITH_SSL
 #  include <openssl/bio.h>
 #  include <openssl/buffer.h>
 #  include <openssl/evp.h>
 #endif
+
+#include <sys/epoll.h>
 
 #include <algorithm>
 #include <array>
@@ -364,32 +368,105 @@ bool WsParser::deliver_frame()
 
 WsConnection::WsConnection(TcpConnection conn) : conn_(std::move(conn)) {}
 
+void WsConnection::arm_write_interest()
+{
+    // NOTE: EPOLLIN|EPOLLOUT overrides the fd's full event mask. If a caller
+    // later registers the WS fd with additional flags (e.g. EPOLLRDHUP for
+    // peer half-close detection), this modify_io will drop them. Revisit
+    // this assumption if the WebSocketAPI handler widens its mask.
+    if (loop_ && !closed_ && conn_.fd() >= 0)
+        loop_->modify_io(conn_.fd(), EPOLLIN | EPOLLOUT);
+}
+
 void WsConnection::send_raw(uint8_t opcode, std::string_view payload, bool fin)
 {
     if (closed_) return;
 
     auto frame = ws_build_frame(opcode, payload, fin);
+
+    // Preserve wire order: if a previous frame is still queued waiting for
+    // EPOLLOUT, append this one to the tail instead of trying to write now
+    // (which would interleave partial frames and corrupt the stream).
+    if (has_pending_writes()) {
+        // Enforce the backpressure cap. A peer that stops reading under a
+        // chatty observer stream would otherwise balloon pending_ to OOM.
+        // Drop the session instead of the worker.
+        if (max_pending_ > 0 &&
+            pending_bytes() + frame.size() > max_pending_)
+        {
+            closed_ = true;
+            pending_.clear();
+            pending_pos_ = 0;
+            if (loop_ && conn_.fd() >= 0)
+                loop_->remove_io(conn_.fd());
+            return;
+        }
+        pending_.append(frame);
+        return;
+    }
+
     const char* ptr = frame.data();
     std::size_t rem = frame.size();
     while (rem > 0) {
         ssize_t n = conn_.write(ptr, rem);
-        if (n < 0) {
-            // TcpConnection::write returns -1 for any send() error.
-            // WebSocket framing does not allow partial frames, so any
-            // send failure — EAGAIN (buffer full) or fatal (EPIPE/EBADF/
-            // ECONNRESET) — forces us to drop the connection: retrying
-            // under EAGAIN without waiting for EPOLLOUT would busy-spin
-            // and block the event loop; continuing after a fatal error
-            // would spin forever on a dead peer. Mark the connection
-            // closed and bail; the next remove_session call finishes
-            // cleanup.
+        if (n == -2) {
+            // Fatal — EPIPE / ECONNRESET / EBADF. Peer is gone.
             closed_ = true;
             break;
+        }
+        if (n == -1) {
+            // EAGAIN — send buffer full. Buffer the remainder and resume
+            // on the next EPOLLOUT (bind_event_loop arms it automatically;
+            // otherwise the caller must handle it via on_writable).
+            // Defensive cap: a lone frame larger than max_pending_ would
+            // overflow on the next append; drop the session instead.
+            if (max_pending_ > 0 && rem > max_pending_) {
+                closed_ = true;
+                if (loop_ && conn_.fd() >= 0)
+                    loop_->remove_io(conn_.fd());
+                return;
+            }
+            pending_.assign(ptr, rem);
+            pending_pos_ = 0;
+            arm_write_interest();
+            return;
         }
         if (n == 0) break;
         ptr += n;
         rem -= static_cast<std::size_t>(n);
     }
+}
+
+bool WsConnection::on_writable()
+{
+    if (closed_) return true;
+
+    while (pending_pos_ < pending_.size()) {
+        ssize_t n = conn_.write(pending_.data() + pending_pos_,
+                                pending_.size() - pending_pos_);
+        if (n == -2) {
+            closed_ = true;
+            pending_.clear();
+            pending_pos_ = 0;
+            return true;   // nothing left to drain
+        }
+        if (n == -1)
+            return false;  // EAGAIN — retry on next EPOLLOUT
+        if (n == 0) {
+            closed_ = true;
+            return true;
+        }
+        pending_pos_ += static_cast<std::size_t>(n);
+    }
+
+    pending_.clear();
+    pending_pos_ = 0;
+
+    // Fully drained — drop EPOLLOUT interest.
+    if (loop_ && !closed_ && conn_.fd() >= 0)
+        loop_->modify_io(conn_.fd(), EPOLLIN);
+
+    return true;
 }
 
 void WsConnection::send_text(std::string_view text)    { send_raw(WS_OP_TEXT,   text); }
@@ -494,7 +571,8 @@ std::optional<WsConnection> ws_upgrade(HttpConnection& conn, const HttpRequest& 
     std::size_t rem = response.size();
     while (rem > 0) {
         ssize_t n = tcp.write(ptr, rem);
-        if (n < 0) continue;
+        if (n == -2) break;      // fatal — peer disappeared during handshake
+        if (n == -1) continue;   // EAGAIN — short spin during sync handshake
         if (n == 0) break;
         ptr += n;
         rem -= static_cast<std::size_t>(n);
