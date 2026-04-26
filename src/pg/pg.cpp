@@ -334,6 +334,11 @@ void PgPool::setup_notice_handler(PgConnection& conn)
 
 PgPool::~PgPool()
 {
+    if (reconnect_timer_ != EventLoop::kInvalidTimer) {
+        loop_.cancel_timer(reconnect_timer_);
+        reconnect_timer_ = EventLoop::kInvalidTimer;
+    }
+
     if (listener_ && listener_->fd() >= 0) {
         if (pg_logger_)
             pg_logger_->notice("{} Listener Disconnected.", conn_tag(*listener_));
@@ -357,12 +362,38 @@ void PgPool::start()
 
 void PgPool::new_connection()
 {
+    using namespace std::chrono;
+
+    // Exponential backoff: if the previous connect failed recently, defer
+    // this attempt via a one-shot timer instead of looping at event-loop
+    // speed.  Without this, an auth fail produces tens of attempts per
+    // second, flooding logs and PG's auth subsystem.
+    auto now = steady_clock::now();
+    if (now < next_connect_attempt_) {
+        if (reconnect_timer_ == EventLoop::kInvalidTimer) {
+            auto delay = duration_cast<milliseconds>(next_connect_attempt_ - now);
+            if (delay.count() < 1) delay = milliseconds(1);
+            if (pg_logger_)
+                pg_logger_->notice(
+                    "PgPool: reconnect throttled (consecutive fails={}) — next attempt in {}ms",
+                    consecutive_connect_fails_, delay.count());
+            reconnect_timer_ = loop_.add_timer(delay,
+                [this] {
+                    reconnect_timer_ = EventLoop::kInvalidTimer;
+                    ensure_min_connections();
+                },
+                /*repeat=*/false);
+        }
+        return;
+    }
+
     auto conn = std::make_unique<PgConnection>(conninfo_);
     setup_notice_handler(*conn);
 
     if (!conn->connect_start()) {
         if (pg_logger_)
             pg_logger_->error("[0] [-1] [] ConnectException: connect_start failed");
+        record_connect_failure();
         return;
     }
 
@@ -417,12 +448,14 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                     pg_logger_->notice("{} {}.",
                                       conn_tag(conn),
                                       conn.resetting() ? "Reconnected" : "Connected");
+                record_connect_success();
                 loop_.modify_io(conn.fd(), EPOLLIN);
                 dispatch_queue(conn);
             } else if (ps == PGRES_POLLING_FAILED) {
                 if (pg_logger_)
                     pg_logger_->error("{} Connect/Reset failed: {}",
                                      conn_tag(conn), conn.error_message());
+                record_connect_failure();
                 // Replace this dead connection
                 replace_connection(conn);
             } else {
@@ -802,6 +835,26 @@ void PgPool::ensure_min_connections()
         new_connection();
         healthy++;
     }
+}
+
+void PgPool::record_connect_success()
+{
+    consecutive_connect_fails_ = 0;
+    next_connect_attempt_      = {};
+}
+
+void PgPool::record_connect_failure()
+{
+    using namespace std::chrono;
+    // Already throttled: this failure is a fresh attempt that fired after a
+    // previous backoff expired.  Bump the counter, but cap at 6 so the
+    // window doesn't grow without bound.  Without the cap, repeated auth
+    // failures would push the next attempt centuries into the future.
+    if (consecutive_connect_fails_ < 6)
+        consecutive_connect_fails_++;
+    int delay_sec = 1 << (consecutive_connect_fails_ - 1);  // 1, 2, 4, 8, 16, 32, 64
+    if (delay_sec > 60) delay_sec = 60;
+    next_connect_attempt_ = steady_clock::now() + seconds(delay_sec);
 }
 
 std::size_t PgPool::healthy_count() const

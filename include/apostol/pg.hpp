@@ -287,6 +287,17 @@ private:
     std::vector<std::unique_ptr<PgQuery>>      inflight_;     // queries currently executing
     std::unordered_set<uint64_t>               canceled_ids_; // queued queries pending cancel
 
+    // Exponential backoff for connect failures: prevents auth-fail / unreachable-host
+    // tight loop from hammering PG with retries at full event-loop speed (and
+    // flooding logs).  Counter caps at 6 → max delay 60s.  Cleared on first
+    // successful connect.
+    std::chrono::steady_clock::time_point next_connect_attempt_{};
+    int                                    consecutive_connect_fails_{0};
+    EventLoop::TimerId                     reconnect_timer_{EventLoop::kInvalidTimer};
+
+    void record_connect_success();
+    void record_connect_failure();
+
     // Pointer set of connections currently registered with EventLoop.
     // Used by on_io to decide whether it's safe to rearm a conn after a
     // handler may have destroyed it via replace_connection (which erases
