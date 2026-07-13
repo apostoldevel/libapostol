@@ -140,9 +140,27 @@ void EventLoop::rearm_io(int fd, uint32_t events)
     ev.events  = (events ? events : it->second.events) | EPOLLET | EPOLLONESHOT;
     ev.data.fd = fd;
 
-    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0 && errno != ENOENT)
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0)
+    {
+        // The socket this fd names may have been closed (EBADF) or already
+        // dropped from this epoll instance (ENOENT/EPERM) by a re-entrant
+        // teardown that ran *inside* the handler we are rearming after —
+        // e.g. a peer half-close, a libpq connection reset/replace, or a
+        // WebSocket reconnect that closed this very socket. That is a
+        // routine, recoverable condition: there is simply nothing left to
+        // rearm. Drop the now-stale handler so a later event on a reused fd
+        // number cannot dispatch a dead handler (run() looks handlers up by
+        // fd), then return. This must NOT escalate to an exception: a single
+        // mistimed fd closure would otherwise unwind the whole worker and
+        // tear down every other healthy connection it serves.
+        if (errno == EBADF || errno == ENOENT || errno == EPERM)
+        {
+            io_handlers_.erase(it);
+            return;
+        }
         throw std::system_error(errno, std::system_category(),
             fmt::format("epoll_ctl MOD (rearm) fd={}", fd));
+    }
 
     if (events)
         it->second.events = events;
