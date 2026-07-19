@@ -298,6 +298,16 @@ private:
     void record_connect_success();
     void record_connect_failure();
 
+    /// Arm reconnect_timer_ (if not already armed) to fire once the current
+    /// backoff window elapses. The callback restores min_conns_ AND, if a
+    /// LISTEN/NOTIFY subscription exists but listener_ is down, restarts it —
+    /// shared so whichever side (pool or listener) hits the failure first
+    /// still recovers the other. Used by both new_connection() and the
+    /// listener connect-failure paths, so a dedicated LISTEN connection
+    /// failing during startup isn't abandoned forever (was: listener_.reset()
+    /// with no retry — see start_listener()/on_listener_io()).
+    void schedule_reconnect_timer();
+
     // Pointer set of connections currently registered with EventLoop.
     // Used by on_io to decide whether it's safe to rearm a conn after a
     // handler may have destroyed it via replace_connection (which erases

@@ -370,20 +370,7 @@ void PgPool::new_connection()
     // second, flooding logs and PG's auth subsystem.
     auto now = steady_clock::now();
     if (now < next_connect_attempt_) {
-        if (reconnect_timer_ == EventLoop::kInvalidTimer) {
-            auto delay = duration_cast<milliseconds>(next_connect_attempt_ - now);
-            if (delay.count() < 1) delay = milliseconds(1);
-            if (pg_logger_)
-                pg_logger_->notice(
-                    "PgPool: reconnect throttled (consecutive fails={}) — next attempt in {}ms",
-                    consecutive_connect_fails_, delay.count());
-            reconnect_timer_ = loop_.add_timer(delay,
-                [this] {
-                    reconnect_timer_ = EventLoop::kInvalidTimer;
-                    ensure_min_connections();
-                },
-                /*repeat=*/false);
-        }
+        schedule_reconnect_timer();
         return;
     }
 
@@ -857,6 +844,42 @@ void PgPool::record_connect_failure()
     next_connect_attempt_ = steady_clock::now() + seconds(delay_sec);
 }
 
+void PgPool::schedule_reconnect_timer()
+{
+    using namespace std::chrono;
+
+    if (reconnect_timer_ != EventLoop::kInvalidTimer)
+        return;  // already armed — its callback below covers both concerns
+
+    auto now = steady_clock::now();
+    // Floor to 1ms even when next_connect_attempt_ is still (barely) ahead of
+    // now: a computed 0ms duration disarms timerfd instead of firing it ASAP
+    // (POSIX itimerspec semantics — an all-zero it_value disarms regardless
+    // of it_interval), which would leave reconnect_timer_ permanently
+    // "armed" on a timer that never fires — silently stalling every future
+    // reconnect attempt (pool and listener alike) behind schedule_reconnect_
+    // timer()'s already-armed guard.
+    auto delay = duration_cast<milliseconds>(next_connect_attempt_ - now);
+    if (delay.count() < 1) delay = milliseconds(1);
+
+    if (pg_logger_)
+        pg_logger_->notice(
+            "PgPool: reconnect throttled (consecutive fails={}) — next attempt in {}ms",
+            consecutive_connect_fails_, delay.count());
+
+    reconnect_timer_ = loop_.add_timer(delay,
+        [this] {
+            reconnect_timer_ = EventLoop::kInvalidTimer;
+            ensure_min_connections();
+            // listener_ may have died on the same outage that triggered this
+            // timer (or failed independently at startup, see start_listener());
+            // restart it if there's still something to LISTEN for.
+            if (!listener_ && !notify_handlers_.empty())
+                start_listener();
+        },
+        /*repeat=*/false);
+}
+
 std::size_t PgPool::healthy_count() const
 {
     std::size_t count = 0;
@@ -930,6 +953,16 @@ void PgPool::unlisten(std::string_view channel)
 
 void PgPool::start_listener()
 {
+    using namespace std::chrono;
+
+    // Honour the same backoff window as the regular pool — an unreachable
+    // postgres/pgbouncer shouldn't be hammered by a second, independent
+    // retry loop running at full event-loop speed on top of the pool's own.
+    if (steady_clock::now() < next_connect_attempt_) {
+        schedule_reconnect_timer();
+        return;
+    }
+
     listener_ = std::make_unique<PgConnection>(conninfo_);
     setup_notice_handler(*listener_);
 
@@ -937,6 +970,13 @@ void PgPool::start_listener()
         if (pg_logger_)
             pg_logger_->error("[0] [-1] [] ConnectException: listener connect_start failed");
         listener_.reset();
+        // Without this, a listener that fails synchronously at startup (e.g.
+        // pgbouncer/postgres not yet accepting) is abandoned forever: nothing
+        // else ever calls start_listener() again for it, since the one-shot
+        // init_listen() caller only retries on ITS OWN query failing, not on
+        // the listener connection specifically.
+        record_connect_failure();
+        schedule_reconnect_timer();
         return;
     }
 
@@ -992,6 +1032,11 @@ void PgPool::on_listener_io(uint32_t events)
                     pg_logger_->error("{} Listener Error: {}", conn_tag(*listener_), listener_->error_message());
                 loop_.remove_io(listener_->fd());
                 listener_.reset();
+                // pending_listens_ already holds every channel (it's only
+                // cleared once send_pending_listens() actually ships a LISTEN,
+                // which never happened here) — just get a retry scheduled.
+                record_connect_failure();
+                schedule_reconnect_timer();
             } else {
                 // Adjust epoll for what poll needs next (same as worker connections)
                 uint32_t want = (ps == PGRES_POLLING_READING) ? EPOLLIN
@@ -1049,6 +1094,10 @@ void PgPool::on_listener_io(uint32_t events)
             // Re-populate pending channels so they get re-LISTENed on reconnect
             for (const auto& [ch, _] : notify_handlers_)
                 pending_listens_.insert(ch);
+            // Safe to call unconditionally (no hot-loop risk): start_listener()
+            // itself checks next_connect_attempt_ and defers via
+            // schedule_reconnect_timer() when a connect attempt would be
+            // premature or fails again.
             if (!notify_handlers_.empty())
                 start_listener();
             break;
