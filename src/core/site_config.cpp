@@ -42,6 +42,8 @@ void SiteConfigs::load(const std::filesystem::path& sites_dir)
                     site.oauth2.identifier = v->get<std::string>();
                 if (auto v = o.find("secret"); v != o.end() && v->is_string())
                     site.oauth2.secret = v->get<std::string>();
+                if (auto v = o.find("consent"); v != o.end() && v->is_string())
+                    site.oauth2.consent = v->get<std::string>();
                 if (auto v = o.find("callback"); v != o.end() && v->is_string())
                     site.oauth2.callback = v->get<std::string>();
                 if (auto v = o.find("error"); v != o.end() && v->is_string())
