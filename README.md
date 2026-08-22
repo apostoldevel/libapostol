@@ -96,7 +96,7 @@ See [Creating Modules](https://github.com/apostoldevel/libapostol/wiki/Creating-
 | Clients    | FetchClient (CurlClient/HttpClient), SmtpClient, TcpClient, UdpClient, HttpProxy              |
 | PostgreSQL | Async pool (libpq+epoll), LISTEN/NOTIFY, deferred dispatch (`exec_sql`), PG utils              |
 | REST API   | RoutedModule + RouteBuilder fluent API, path parameters, wildcard routes, OpenAPI 3.0 spec generation, built-in Swagger UI |
-| Security   | JWT verification (HS/RS/ES/PS via jwt-cpp), OAuth2 providers, BotSession, CORS                  |
+| Security   | JWT verification (HS/RS/ES/PS via jwt-cpp), OAuth2 providers, BotSession, ServiceToken, CORS                  |
 | Utilities  | Base64 (RFC 4648), File utils (SHA256, MIME), HTTP utils, RouteManager, SiteConfig              |
 
 ## Technology Stack
@@ -115,7 +115,7 @@ See [Creating Modules](https://github.com/apostoldevel/libapostol/wiki/Creating-
 
 | Flag              | Default | What it enables                                    |
 |-------------------|---------|----------------------------------------------------|
-| `WITH_POSTGRESQL` | `ON`    | PgPool, pg_utils, pg_exec, BotSession              |
+| `WITH_POSTGRESQL` | `ON`    | PgPool, pg_utils, pg_exec, BotSession, ServiceToken |
 | `WITH_SSL`        | `ON`    | TLS, JWT verification, SmtpClient                  |
 | `WITH_CURL`       | `ON`    | FetchClient uses CurlClient (async libcurl)        |
 

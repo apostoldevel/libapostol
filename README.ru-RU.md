@@ -96,7 +96,7 @@ void MyService::init_routes()
 | Клиенты    | FetchClient (CurlClient/HttpClient), SmtpClient, TcpClient, UdpClient, HttpProxy               |
 | PostgreSQL | Async pool (libpq+epoll), LISTEN/NOTIFY, deferred dispatch (`exec_sql`), PG utils               |
 | REST API   | RoutedModule + RouteBuilder fluent API, параметры в путях, wildcard-маршруты, генерация спецификации OpenAPI 3.0, встроенный Swagger UI |
-| Безопасность | JWT-верификация (HS/RS/ES/PS через jwt-cpp), OAuth2-провайдеры, BotSession, CORS               |
+| Безопасность | JWT-верификация (HS/RS/ES/PS через jwt-cpp), OAuth2-провайдеры, BotSession, ServiceToken, CORS               |
 | Утилиты    | Base64 (RFC 4648), File utils (SHA256, MIME), HTTP utils, RouteManager, SiteConfig              |
 
 ## Технологический стек
@@ -115,7 +115,7 @@ void MyService::init_routes()
 
 | Флаг              | По умолчанию | Что включает                                       |
 |-------------------|--------------|----------------------------------------------------|
-| `WITH_POSTGRESQL` | `ON`         | PgPool, pg_utils, pg_exec, BotSession              |
+| `WITH_POSTGRESQL` | `ON`         | PgPool, pg_utils, pg_exec, BotSession, ServiceToken |
 | `WITH_SSL`        | `ON`         | TLS, JWT-верификация, SmtpClient                   |
 | `WITH_CURL`       | `ON`         | FetchClient использует CurlClient (async libcurl)  |
 

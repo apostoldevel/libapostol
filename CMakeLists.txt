@@ -115,6 +115,7 @@ if(WITH_POSTGRESQL)
         src/pg/pg_utils.cpp
         src/pg/pg_exec.cpp
         src/core/bot_session.cpp
+        src/core/service_token.cpp
     )
 endif()
 
