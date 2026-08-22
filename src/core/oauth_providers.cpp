@@ -103,6 +103,20 @@ const OAuthApp* OAuthProviders::find_by_client_id(std::string_view client_id) co
     return nullptr;
 }
 
+const OAuthApp* OAuthProviders::find_by_client_id(std::string_view client_id,
+                                                 std::string_view provider) const
+{
+    for (const auto& app : apps_)
+        if (app.provider == provider && app.client_id == client_id)
+            return &app;
+    return nullptr;
+}
+
+const OAuthApp* OAuthProviders::find_default_by_client_id(std::string_view client_id) const
+{
+    return find_by_client_id(client_id, "default");
+}
+
 const OAuthApp* OAuthProviders::find(std::string_view provider, std::string_view app_name) const
 {
     for (const auto& app : apps_)

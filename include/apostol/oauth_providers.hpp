@@ -53,8 +53,23 @@ public:
     const std::vector<OAuthApp>& apps() const noexcept { return apps_; }
 
     /// Find an application by its client_id (used for JWT verification).
-    /// Returns nullptr if not found.
+    /// Searches every provider, so a hit says only that the client_id is
+    /// registered somewhere — not that it is a client of ours. Returns nullptr
+    /// if not found.
     const OAuthApp* find_by_client_id(std::string_view client_id) const;
+
+    /// Find an application by client_id, restricted to a single provider.
+    /// Returns nullptr if not found.
+    const OAuthApp* find_by_client_id(std::string_view client_id,
+                                      std::string_view provider) const;
+
+    /// Find an application by client_id among clients of the "default" provider —
+    /// the ones this installation itself issues credentials for. Companion to
+    /// find_default(app_name) above. Use this, not the unrestricted overload,
+    /// wherever the answer decides what a client may do on behalf of a local user:
+    /// an entry under google or yandex is registration for verifying that
+    /// provider's tokens, and gives its holder no standing here.
+    const OAuthApp* find_default_by_client_id(std::string_view client_id) const;
 
     /// Find app by provider name + app name (e.g. "google", "web").
     const OAuthApp* find(std::string_view provider, std::string_view app_name) const;
