@@ -76,6 +76,18 @@ void OAuthProviders::load(const std::filesystem::path& oauth2_dir)
                 if (auto it = section.find("token_uri"); it != section.end() && it->is_string())
                     app.token_uri = it->get<std::string>();
 
+                if (auto it = section.find("userinfo_uri"); it != section.end() && it->is_string())
+                    app.userinfo_uri = it->get<std::string>();
+
+                if (auto it = section.find("userinfo_audience"); it != section.end() && it->is_string())
+                    app.userinfo_audience = it->get<std::string>();
+
+                // Yandex answers to "Authorization: OAuth <token>", not Bearer.
+                if (auto it = section.find("userinfo_scheme"); it != section.end() && it->is_string())
+                    app.userinfo_scheme = it->get<std::string>();
+                else
+                    app.userinfo_scheme = "Bearer";
+
                 // cert_uri: check both "cert_uri" and Google's "auth_provider_x509_cert_url"
                 if (auto it = section.find("cert_uri"); it != section.end() && it->is_string())
                     app.cert_uri = it->get<std::string>();

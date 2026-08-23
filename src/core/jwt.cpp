@@ -202,6 +202,54 @@ std::string verify_and_resign_jwt(std::string_view token,
     return builder.sign(jwt::algorithm::hs256{app->client_secret});
 }
 
+// ─── sign_claims_jwt ─────────────────────────────────────────────────────────
+
+std::string sign_claims_jwt(const OAuthApp& app,
+                            std::string_view claims_json,
+                            std::string_view subject,
+                            int expires_in_secs)
+{
+    if (app.client_secret.empty())
+        throw JwtVerificationError("empty secret for audience: " + app.client_id);
+
+    if (app.issuers.empty())
+        throw JwtVerificationError("no issuer configured for provider: " + app.provider);
+
+    nlohmann::json claims;
+    try {
+        claims = nlohmann::json::parse(claims_json);
+    } catch (const std::exception& e) {
+        throw JwtVerificationError(std::string("claims are not JSON: ") + e.what());
+    }
+
+    if (!claims.is_object())
+        throw JwtVerificationError("claims are not a JSON object");
+
+    auto builder = jwt::create<jwt_traits>().set_algorithm("HS256");
+
+    // The provider's own claim names travel unchanged: which of them is the
+    // address and which the given name is written down in the database, per
+    // provider, and duplicating that map here would be two places to keep in
+    // step. The registered claims below are set afterwards so that a provider
+    // sending its own iss or aud cannot decide either.
+    for (const auto& [key, val] : claims.items()) {
+        if (key == "iss" || key == "aud" || key == "sub" ||
+            key == "iat" || key == "exp")
+            continue;
+        builder.set_payload_claim(key, jwt::basic_claim<jwt_traits>(val));
+    }
+
+    auto now = std::chrono::system_clock::now();
+
+    return builder
+        .set_issuer(app.issuers.front())
+        .set_audience(app.client_id)
+        .set_subject(std::string(subject))
+        .set_issued_at(now)
+        .set_expires_at(now + std::chrono::seconds(expires_in_secs))
+        .sign(jwt::algorithm::hs256{app.client_secret});
+}
+
 // ─── hmac_sha256_hex ─────────────────────────────────────────────────────────
 
 std::string hmac_sha256_hex(std::string_view key, std::string_view data)

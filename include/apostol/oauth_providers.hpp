@@ -25,6 +25,16 @@ struct OAuthApp
     std::string auth_uri;           // authorization endpoint
     std::string token_uri;          // token exchange endpoint
     std::string cert_uri;           // JWKS public key endpoint
+
+    // For a provider that issues no id_token, the profile is fetched from
+    // userinfo_uri instead. That answer also has to say which application the
+    // token was issued to — otherwise a token obtained by any other client of
+    // the same provider signs its bearer in as our user, which is precisely
+    // what the aud claim of an id_token prevents. userinfo_audience names the
+    // field carrying it; without both, the provider has no such branch.
+    std::string userinfo_uri;       // userinfo endpoint (providers without id_token)
+    std::string userinfo_audience;  // field in that answer holding the client_id
+    std::string userinfo_scheme;    // Authorization scheme for it (default "Bearer")
 };
 
 // ─── OAuthProviders ──────────────────────────────────────────────────────────

@@ -11,6 +11,7 @@ namespace apostol
 {
 
 class OAuthProviders; // forward declaration
+struct OAuthApp;      // forward declaration
 
 /// Thrown when a JWT token has expired.
 struct JwtExpiredError : std::runtime_error
@@ -65,6 +66,25 @@ std::string create_jwt(const OAuthProviders& providers,
 std::string verify_and_resign_jwt(std::string_view token,
                                   const OAuthProviders& providers,
                                   const JwtKeyResolver& key_resolver = {});
+
+/// Sign an arbitrary claim set as an HS256 JWT with @p app's own secret.
+///
+/// For a provider that issues no id_token: the profile arrives as plain JSON
+/// from a userinfo endpoint, and the SQL layer accepts only a JWT signed with
+/// the audience's secret. The claims are carried across unchanged, under the
+/// provider's own names — mapping them is the database's job, not this one's —
+/// with iss, aud, sub, iat and exp set here.
+///
+/// @param claims_json  Object to carry as the payload; its own iss/aud/sub/iat/
+///                     exp are overwritten.
+/// @param subject      The provider's identifier for the user (sub claim).
+///
+/// @throws JwtVerificationError if @p app has no secret, no issuer, or
+///         @p claims_json is not a JSON object.
+std::string sign_claims_jwt(const OAuthApp& app,
+                            std::string_view claims_json,
+                            std::string_view subject,
+                            int expires_in_secs = 300);
 
 /// Compute HMAC-SHA256 and return the result as a lowercase hex string.
 /// Uses OpenSSL HMAC(). Used by WebSocketAPI for signed_fetch.
