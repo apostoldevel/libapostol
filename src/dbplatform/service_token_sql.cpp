@@ -79,11 +79,22 @@ void close_session(PgPool& pool, std::string_view token, Logger* log, std::strin
 
             try {
                 auto j = nlohmann::json::parse(v);
-                if (j.contains("error")) {
-                    const auto& e = j["error"];
-                    log->warn("{} close session refused: {}", label,
-                              e.is_object() ? e.value("message", "") : std::string(v));
-                }
+                if (!j.contains("error"))
+                    return;
+
+                const auto& e = j["error"];
+                const int code = e.is_object() ? e.value("code", 0) : 0;
+
+                // ERR-403-001, "Token not FOUND or has expired". At shutdown this is
+                // not a refusal but a job already done: the session went with an
+                // expired token, a sweep, or a sign-out elsewhere. Warning about it
+                // would put a line per worker per restart into the log and teach
+                // whoever reads it to ignore the ones that matter.
+                if (code == 403)
+                    return;
+
+                log->warn("{} close session refused: {}", label,
+                          e.is_object() ? e.value("message", "") : std::string(v));
             } catch (...) {
                 // Not json: the claims came back as something else. Nothing to say.
             }
