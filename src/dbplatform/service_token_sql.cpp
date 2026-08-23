@@ -30,9 +30,25 @@ void sign_out(PgPool& pool, std::string_view session, Logger* log, std::string_v
             if (!log)
                 return;
 
-            // results[0] = api.authorize, results[1] = api.signout
+            // results[0] = api.authorize, results[1] = api.signout.
+            //
+            // Say which of the two ways this went wrong. A batch whose first
+            // statement errors comes back as one failed result and PostgreSQL never
+            // runs the second; an empty vector means the delivery carried nothing at
+            // all, which is a different problem in a different place.
             if (results.size() < 2 || !results[1].ok()) {
-                log->warn("{} sign out: no result", label);
+                if (results.empty()) {
+                    log->warn("{} sign out: empty delivery, no results at all", label);
+                } else if (!results[0].ok()) {
+                    log->warn("{} sign out: statement 1 of {} failed, batch aborted: {}",
+                              label, results.size(), results[0].error_message());
+                } else if (results.size() < 2) {
+                    log->warn("{} sign out: only {} result(s), expected 2",
+                              label, results.size());
+                } else {
+                    log->warn("{} sign out: statement 2 failed: {}",
+                              label, results[1].error_message());
+                }
                 return;
             }
 
