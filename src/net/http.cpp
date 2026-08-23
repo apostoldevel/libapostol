@@ -178,10 +178,60 @@ std::size_t HttpRequest::content_length() const
 
 // ─── HttpResponse ────────────────────────────────────────────────────────────
 
+// ─── header_safe / header_name_ok ────────────────────────────────────────────
+//
+// A response header ends at the first control byte, and a header whose name is not
+// a token is not written at all.
+//
+// Values reach the response from query strings, database rows and upstream replies.
+// A CR or LF in one of them ends the header early, and everything after it is read
+// by the client as a further header — or, past a blank line, as a further response
+// on the same connection. That is response splitting: a redirect built from a
+// request parameter becomes a way to set a cookie on this origin, or to serve a
+// body of the caller's choosing from it.
+//
+// Truncating rather than stripping is deliberate. Stripping the newlines out of
+// "x\r\nSet-Cookie: …" leaves "xSet-Cookie: …" — still the caller's text sitting in
+// our header, merely no longer on its own line. Truncating leaves "x", which is
+// what the value was before the injection began.
+//
+// Nothing legitimate is lost: obsolete line folding is the only construct that ever
+// put a CR LF inside a value, and RFC 9110 §5.5 forbids sending it.
+//
+namespace {
+
+std::string header_safe(std::string value)
+{
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        const auto c = static_cast<unsigned char>(value[i]);
+        if (c == 0x7f || (c < 0x20 && c != '\t')) {
+            value.resize(i);
+            break;
+        }
+    }
+    return value;
+}
+
+bool header_name_ok(const std::string& name)
+{
+    if (name.empty())
+        return false;
+    // RFC 9110 §5.1: a field name is a token. Anything else — a space, a colon, a
+    // control byte — makes the line unparsable, so the header is dropped rather
+    // than written and left for the peer to misread.
+    for (const unsigned char c : name)
+        if (c <= 0x20 || c >= 0x7f || c == ':')
+            return false;
+    return true;
+}
+
+} // namespace
+
 HttpResponse& HttpResponse::set_status(int code, std::string text)
 {
     status_code_ = code;
-    status_text_ = std::move(text);
+    // The reason phrase shares the status line with nothing that would contain it.
+    status_text_ = header_safe(std::move(text));
     return *this;
 }
 
@@ -194,6 +244,11 @@ HttpResponse& HttpResponse::set_status(HttpStatus status)
 
 HttpResponse& HttpResponse::set_header(std::string name, std::string value)
 {
+    if (!header_name_ok(name))
+        return *this;
+
+    value = header_safe(std::move(value));
+
     // Replace existing header if same name
     for (auto& [k, v] : headers_) {
         if (k == name) { v = std::move(value); return *this; }
@@ -204,7 +259,10 @@ HttpResponse& HttpResponse::set_header(std::string name, std::string value)
 
 HttpResponse& HttpResponse::add_header(std::string name, std::string value)
 {
-    headers_.emplace_back(std::move(name), std::move(value));
+    if (!header_name_ok(name))
+        return *this;
+
+    headers_.emplace_back(std::move(name), header_safe(std::move(value)));
     return *this;
 }
 
