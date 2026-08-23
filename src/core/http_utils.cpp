@@ -5,6 +5,7 @@
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 #include <unistd.h>
+#include <arpa/inet.h>
 
 namespace apostol
 {
@@ -71,14 +72,126 @@ void reply_error(HttpResponse& resp, int code, std::string_view message)
 
 // ─── HTTP header utilities ──────────────────────────────────────────────────
 
+namespace {
+
+// ─── ip_literal ──────────────────────────────────────────────────────────────
+//
+// Whether the text is an address and nothing else. Callers hand the result of
+// get_real_ip to PostgreSQL as inet, and a value that is not an address makes the
+// cast throw — losing the whole statement, not just the address, over a header the
+// client wrote. inet_pton is deliberately strict: it rejects "1.2.3.4 " and
+// "0x01020304", which the older inet_aton accepted.
+//
+bool ip_literal(const std::string& value)
+{
+    unsigned char buf[sizeof(struct in6_addr)];
+    return !value.empty()
+        && (::inet_pton(AF_INET,  value.c_str(), buf) == 1
+         || ::inet_pton(AF_INET6, value.c_str(), buf) == 1);
+}
+
+// ─── clean_element ───────────────────────────────────────────────────────────
+//
+// One element of a forwarded-for list, reduced to the address it names. Proxies
+// write the port, and bracket an IPv6 literal when they do, because the address is
+// all colons itself.
+//
+std::string clean_element(std::string_view value)
+{
+    const auto begin = value.find_first_not_of(" \t");
+    if (begin == std::string_view::npos)
+        return {};
+    const auto end = value.find_last_not_of(" \t");
+    value = value.substr(begin, end - begin + 1);
+
+    // "[::1]:8080" or "[::1]"
+    if (value.front() == '[') {
+        const auto close = value.find(']');
+        if (close == std::string_view::npos)
+            return {};
+        value = value.substr(1, close - 1);
+    } else {
+        // "1.2.3.4:80" — a single colon alongside dots is a port, not an address.
+        // A bare IPv6 literal has several colons and no dots, and is left alone.
+        const auto colon = value.find(':');
+        if (colon != std::string_view::npos
+            && value.find(':', colon + 1) == std::string_view::npos
+            && value.find('.') != std::string_view::npos)
+            value = value.substr(0, colon);
+    }
+
+    // "fe80::1%eth0" — a scope zone identifies an interface on this host, which
+    // means nothing to whoever reads the address later, and PostgreSQL inet does
+    // not accept one. The address itself is worth keeping.
+    const auto zone = value.find('%');
+    if (zone != std::string_view::npos)
+        value = value.substr(0, zone);
+
+    return std::string(value);
+}
+
+// ─── first_forwarded ─────────────────────────────────────────────────────────
+//
+// The leftmost address in a forwarded-for list — "client, proxy1, proxy2" (RFC 7239
+// §4 describes the same chain for Forwarded). The whole header never was an
+// address, so casting it was bound to fail wherever more than one hop existed.
+//
+// Elements that do not name an address are skipped rather than ending the search:
+// RFC 7239 §6.3 allows "unknown" and obfuscated identifiers such as "_hidden" in
+// place of one, and a chain that starts with those still carries real addresses
+// after them. Skipping widens nothing — whoever could put a forged address behind
+// an "unknown" could equally have put it first.
+//
+std::string first_forwarded(std::string_view value)
+{
+    while (!value.empty()) {
+        const auto comma = value.find(',');
+        auto element = clean_element(value.substr(0, comma));
+
+        if (ip_literal(element))
+            return element;
+
+        if (comma == std::string_view::npos)
+            break;
+        value = value.substr(comma + 1);
+    }
+
+    return {};
+}
+
+} // namespace
+
+// ─── get_real_ip ─────────────────────────────────────────────────────────────
+
 std::string get_real_ip(const HttpRequest& req)
 {
-    auto ip = req.header("X-Real-IP");
-    if (ip.empty())
-        ip = req.header("X-Forwarded-For");
-    if (ip.empty())
-        ip = req.peer_ip;
-    return ip;
+    // **Both headers are only as trustworthy as the proxy in front.**
+    //
+    // A reverse proxy normally writes them, but nothing stops a client from sending
+    // them too, and nginx's usual $proxy_add_x_forwarded_for *appends* to whatever
+    // arrived — so the leftmost element of X-Forwarded-For is text the client
+    // chose. Reading it is right for finding the caller behind a CDN and wrong for
+    // deciding anything: it names who the request says it is, not who it is.
+    //
+    // Deployments that record or gate on this must have the proxy overwrite the
+    // header — `proxy_set_header X-Real-IP $remote_addr` does, and X-Real-IP is read
+    // first here for that reason. Behind a proxy that only appends, the sole element
+    // no client can forge is the rightmost; selecting by hop count is a per-site
+    // policy and belongs in configuration rather than here.
+    //
+    // Each header is used only if it parses as an address; otherwise the peer, which
+    // is measured rather than told. The result can still be empty — a peer address
+    // is not always available — so a caller passing it to PostgreSQL as inet must
+    // send null for an empty string, not ''.
+    auto ip = first_forwarded(req.header("X-Real-IP"));
+    if (!ip.empty())
+        return ip;
+
+    ip = first_forwarded(req.header("X-Forwarded-For"));
+    if (!ip.empty())
+        return ip;
+
+    return req.peer_ip;
 }
 
 std::string get_origin(const HttpRequest& req)
