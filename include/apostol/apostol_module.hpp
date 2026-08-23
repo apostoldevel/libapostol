@@ -219,6 +219,11 @@ protected:
     /// Returns the error code (0 = no error).
     static int check_pg_error(std::string_view json, std::string& error_message);
 
+    /// As above, and also reports the error identifier ("ERR-401-008" and the like)
+    /// where the payload carries one. See apostol::check_pg_error.
+    static int check_pg_error(std::string_view json, std::string& error_message,
+                              std::string& error_id);
+
     /// Map a PG/application error code to an HTTP status.
     static HttpStatus error_code_to_status(int error_code);
 #endif // WITH_POSTGRESQL

@@ -67,6 +67,21 @@ std::string params_to_json(
 /// Mirrors v1 CFetchCommon::CheckError().
 int check_pg_error(std::string_view json, std::string& error_message);
 
+/// As above, and also reports the error identifier — "ERR-401-008" and the like.
+///
+/// The status alone does not say what happened: an expired token and a locked
+/// account both answer 401, and a caller that must decide whether to refresh a
+/// token or send its user to sign in cannot tell them apart from the number. The
+/// identifier is what db-platform's exception handlers put in the "error" field.
+///
+/// @p error_id is left empty when the payload carries no identifier. That is not
+/// an error: the OAuth 2.0 responses of daemon.token and daemon.authorization_code
+/// use the same field for an RFC 6749 §5.2 error code — "invalid_grant" and its
+/// kin — and this reports only what looks like an identifier, so an OAuth code
+/// never arrives disguised as one.
+int check_pg_error(std::string_view json, std::string& error_message,
+                   std::string& error_id);
+
 /// Map a PG/application error code to an HTTP status.
 /// Mirrors v1 ErrorCodeToStatus().
 ///   - code >= 10000: divide by 100 (e.g. 40100 → 401)

@@ -431,6 +431,12 @@ int ApostolModule::check_pg_error(std::string_view json, std::string& error_mess
     return apostol::check_pg_error(json, error_message);
 }
 
+int ApostolModule::check_pg_error(std::string_view json, std::string& error_message,
+                                  std::string& error_id)
+{
+    return apostol::check_pg_error(json, error_message, error_id);
+}
+
 HttpStatus ApostolModule::error_code_to_status(int error_code)
 {
     return apostol::error_code_to_status(error_code);

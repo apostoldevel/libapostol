@@ -215,6 +215,15 @@ std::string form_to_json(std::string_view form_body)
 
 int check_pg_error(std::string_view json, std::string& error_message)
 {
+    std::string ignored;
+    return check_pg_error(json, error_message, ignored);
+}
+
+// ─── check_pg_error (with identifier) ───────────────────────────────────────
+
+int check_pg_error(std::string_view json, std::string& error_message,
+                   std::string& error_id)
+{
     try {
         auto j = nlohmann::json::parse(json);
         if (!j.contains("error"))
@@ -226,6 +235,16 @@ int check_pg_error(std::string_view json, std::string& error_message)
             code = err["code"].get<int>();
         if (err.contains("message") && err["message"].is_string())
             error_message = err["message"].get<std::string>();
+
+        // Only what looks like an identifier. The same field carries an RFC 6749
+        // §5.2 error code in the OAuth 2.0 responses — "invalid_grant",
+        // "unauthorized_client" — and handing one of those back as an identifier
+        // would have callers matching on it as if it named a catalogue entry.
+        if (err.contains("error") && err["error"].is_string()) {
+            auto value = err["error"].get<std::string>();
+            if (value.rfind("ERR-", 0) == 0)
+                error_id = std::move(value);
+        }
 
         return code;
     } catch (...) {
