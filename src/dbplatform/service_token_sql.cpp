@@ -11,16 +11,45 @@ namespace apostol::db_platform
 
 // ─── sign_out ────────────────────────────────────────────────────────────────
 
-void sign_out(PgPool& pool, std::string_view session)
+void sign_out(PgPool& pool, std::string_view session, Logger* log, std::string_view tag)
 {
     if (session.empty())
         return;
 
-    pool.execute(fmt::format("SELECT * FROM api.signout({})",
+    std::string label(tag);
+
+    // api.authorize first, the way execute_action does it. SessionOut runs
+    // DoLogout and touches db.profile through the session context; a project is
+    // free to put real work in DoLogout, and a bare api.signout would run it with
+    // no session established.
+    pool.execute(fmt::format("SELECT * FROM api.authorize({});\n"
+                             "SELECT * FROM api.signout({})",
+                             pq_quote_literal(session),
                              pq_quote_literal(session)),
-                 [](std::vector<PgResult>) {},
-                 [](std::string_view) {},
-                 /*quiet=*/true);
+        [log, label](std::vector<PgResult> results) {
+            if (!log)
+                return;
+
+            // results[0] = api.authorize, results[1] = api.signout
+            if (results.size() < 2 || !results[1].ok()) {
+                log->warn("{} sign out: no result", label);
+                return;
+            }
+
+            // api.signout returns boolean. False means SignOut refused — most
+            // often the ACL check inside SessionOut — and the row stays.
+            if (results[1].rows() > 0 && results[1].columns() > 0) {
+                const char* v = results[1].value(0, 0);
+                if (v && (v[0] == 'f' || v[0] == 'F'))
+                    log->warn("{} sign out refused; the session row remains. "
+                              "Look for code 9001 in db.log", label);
+            }
+        },
+        [log, label](std::string_view error) {
+            if (log)
+                log->warn("{} sign out failed: {}", label, error);
+        },
+        /*quiet=*/true);
 }
 
 // ─── refresh_service_token ───────────────────────────────────────────────────

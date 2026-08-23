@@ -37,9 +37,14 @@ void refresh_service_token(PgPool& pool, ServiceToken& token, Logger& log,
                            std::string scope,
                            std::string agent, std::string host);
 
-/// api.signout(session). Fire and forget: nothing useful can be done with the
-/// result, and the caller is usually shutting down.
-void sign_out(PgPool& pool, std::string_view session);
+/// api.signout(session).
+///
+/// Nothing can be done with the result at the point this is called — the process is
+/// usually on its way out — but it must not be discarded either: api.signout returns
+/// false when SignOut refused, and a refusal that nobody notices leaves the session
+/// row behind for good. Pass a logger and the refusal is at least visible.
+void sign_out(PgPool& pool, std::string_view session,
+              Logger* log = nullptr, std::string_view tag = {});
 
 } // namespace apostol::db_platform
 

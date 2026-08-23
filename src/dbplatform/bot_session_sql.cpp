@@ -9,6 +9,7 @@
 // reference to that schema at all.
 
 #include "apostol/bot_session.hpp"
+#include "apostol/db_platform.hpp"
 #include "apostol/pg_utils.hpp"
 
 #include <fmt/format.h>
@@ -153,14 +154,8 @@ void BotSession::sign_out()
     if (session_.empty())
         return;
 
-    auto sql = fmt::format(
-        "SELECT * FROM api.signout({})",
-        pq_quote_literal(session_));
-
-    pool_.execute(sql,
-        [](std::vector<PgResult> /*r*/) {},
-        [](std::string_view /*error*/) {},
-        /*quiet=*/true);
+    // Через общий путь: он же сообщает об отказе, который иначе теряется.
+    db_platform::sign_out(pool_, session_);
 
     session_.clear();
     expiry_ = {};
