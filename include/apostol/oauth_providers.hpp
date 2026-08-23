@@ -34,6 +34,7 @@ struct OAuthApp
     // field carrying it; without both, the provider has no such branch.
     std::string userinfo_uri;       // userinfo endpoint (providers without id_token)
     std::string userinfo_audience;  // field in that answer holding the client_id
+    std::string userinfo_subject;   // field holding the user id (default "sub")
     std::string userinfo_scheme;    // Authorization scheme for it (default "Bearer")
 };
 

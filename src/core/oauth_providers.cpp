@@ -82,6 +82,12 @@ void OAuthProviders::load(const std::filesystem::path& oauth2_dir)
                 if (auto it = section.find("userinfo_audience"); it != section.end() && it->is_string())
                     app.userinfo_audience = it->get<std::string>();
 
+                // Yandex calls the user id "id"; OpenID Connect calls it "sub".
+                if (auto it = section.find("userinfo_subject"); it != section.end() && it->is_string())
+                    app.userinfo_subject = it->get<std::string>();
+                else
+                    app.userinfo_subject = "sub";
+
                 // Yandex answers to "Authorization: OAuth <token>", not Bearer.
                 if (auto it = section.find("userinfo_scheme"); it != section.end() && it->is_string())
                     app.userinfo_scheme = it->get<std::string>();
