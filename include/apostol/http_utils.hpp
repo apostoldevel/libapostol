@@ -29,6 +29,28 @@ void reply_error(HttpResponse& resp, HttpStatus status, std::string_view message
 /// Overload taking a numeric status code (for codes not in HttpStatus enum).
 void reply_error(HttpResponse& resp, int code, std::string_view message);
 
+/// Reply to a failed bearer token: the same JSON body as reply_error, plus the
+/// challenge RFC 6750 §3 requires of a resource server that refuses one.
+///
+/// Without the header a client is told only that it may not pass, not why or what
+/// to do: §3.1 separates invalid_token — expired, revoked, malformed, "invalid for
+/// any other reason" — which is worth obtaining a new token over, from
+/// insufficient_scope, which is not. A client that reads the challenge to decide
+/// whether to refresh finds nothing to read.
+///
+/// @p error is normalised to the three codes §3 defines; anything else becomes
+/// invalid_token, which is what a refused bearer token means when it means
+/// anything.
+void reply_bearer_error(HttpResponse& resp, HttpStatus status,
+                        std::string_view error, std::string_view description);
+
+/// Add that challenge to a response whose body is already written — a 401 being
+/// forwarded from the database, say, where the body is the answer and only the
+/// header is missing. RFC 6750 §3 wants the challenge on every 401 a resource
+/// server sends, not only the ones it composes itself.
+void set_bearer_challenge(HttpResponse& resp, std::string_view error,
+                          std::string_view description);
+
 // ─── HTTP header utilities ──────────────────────────────────────────────────
 
 /// Return X-Real-IP header value, or empty string if absent.

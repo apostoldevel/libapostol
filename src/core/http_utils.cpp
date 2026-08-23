@@ -52,6 +52,34 @@ std::string json_escape(std::string_view s)
 
 // ─── reply_error ─────────────────────────────────────────────────────────────
 
+void set_bearer_challenge(HttpResponse& resp, std::string_view error,
+                          std::string_view description)
+{
+    auto challenge_error = error;
+    if (challenge_error != "invalid_request" && challenge_error != "insufficient_scope")
+        challenge_error = "invalid_token";
+
+    resp.set_header("WWW-Authenticate",
+                    fmt::format(R"(Bearer error="{}", error_description="{}")",
+                                json_escape(challenge_error), json_escape(description)));
+}
+
+// ─── reply_bearer_error ──────────────────────────────────────────────────────
+
+void reply_bearer_error(HttpResponse& resp, HttpStatus status,
+                        std::string_view error, std::string_view description)
+{
+    set_bearer_challenge(resp, error, description);
+
+    resp.set_status(status)
+        .set_body(fmt::format(
+            R"({{"error":{{"code":{},"error":"{}","message":"{}"}}}})",
+            static_cast<int>(status), json_escape(error), json_escape(description)),
+            "application/json");
+}
+
+// ─── reply_error ─────────────────────────────────────────────────────────────
+
 void reply_error(HttpResponse& resp, HttpStatus status, std::string_view message)
 {
     resp.set_status(status)
