@@ -44,13 +44,24 @@ JwtClaims verify_jwt(std::string_view token,
     if (!app)
         throw JwtVerificationError("unknown audience: " + aud);
 
-    // 3. Check issuer if the provider has issuers configured
-    if (!app->issuers.empty() && !iss.empty()) {
+    // 3. Check issuer if the provider has issuers configured.
+    //
+    // A missing iss used to skip the check rather than fail it, which made the
+    // check optional at the discretion of whoever wrote the token: drop the
+    // claim and nothing is compared. Every token anyone actually issues carries
+    // one — ours from oauth2.issuer, an OpenID Connect id_token by
+    // specification — so requiring it costs a correctly issued token nothing.
+    //
+    // A provider with no issuers configured is still not checked. Making that
+    // one mandatory would reject every token in a deployment whose provider
+    // file omits the field, which is not a change to slip into a patch.
+    if (!app->issuers.empty()) {
         bool issuer_ok = false;
         for (const auto& allowed : app->issuers)
             if (allowed == iss) { issuer_ok = true; break; }
         if (!issuer_ok)
-            throw JwtVerificationError("issuer mismatch: " + iss);
+            throw JwtVerificationError(iss.empty() ? "missing issuer claim"
+                                                   : "issuer mismatch: " + iss);
     }
 
     // 4. Determine algorithm family
