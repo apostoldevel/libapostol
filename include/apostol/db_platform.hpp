@@ -37,7 +37,12 @@ void refresh_service_token(PgPool& pool, ServiceToken& token, Logger& log,
                            std::string scope,
                            std::string agent, std::string host);
 
-/// api.signout(session).
+/// api.signout(session) — closing a session by its code.
+///
+/// Only for a pool whose role has USAGE on the api schema. The worker role (daemon)
+/// does not: it reaches daemon.* and nothing else, so a worker calling this gets
+/// "permission denied for schema api" no matter what privileges it holds on the
+/// function itself. Use close_session() there.
 ///
 /// Nothing can be done with the result at the point this is called — the process is
 /// usually on its way out — but it must not be discarded either: api.signout returns
@@ -45,6 +50,16 @@ void refresh_service_token(PgPool& pool, ServiceToken& token, Logger& log,
 /// row behind for good. Pass a logger and the refusal is at least visible.
 void sign_out(PgPool& pool, std::string_view session,
               Logger* log = nullptr, std::string_view tag = {});
+
+/// daemon.session_close(token) — closing a session by the access token that names
+/// it. The same work as sign_out, reached through the daemon schema, which is what
+/// a worker's role can see.
+///
+/// This is the asymmetry that made service sessions immortal: the token was
+/// obtained through daemon.token and released through api.signout, and only the
+/// first of those two schemas is open to the role doing the work.
+void close_session(PgPool& pool, std::string_view token,
+                   Logger* log = nullptr, std::string_view tag = {});
 
 } // namespace apostol::db_platform
 

@@ -82,6 +82,12 @@ public:
     /// afterwards. Close it only after calling this.
     std::string take_previous_session() noexcept;
 
+    /// The token that issued() replaced, if any; empty afterwards. Needed because
+    /// a worker closes a session through daemon.session_close, which names it by
+    /// token rather than by code — the api schema its session code would go to is
+    /// not open to that role.
+    std::string take_previous_token() noexcept;
+
     /// Whether a request is in flight right now.
     bool refreshing() const noexcept { return refreshing_; }
 
@@ -96,6 +102,7 @@ private:
     std::string token_;
     std::string session_;
     std::string previous_session_;
+    std::string previous_token_;
 
     // Two marks, not one. hard_expiry_ is when the issuer stops accepting the
     // token; renew_at_ is when replacement starts. Collapsing them discards the

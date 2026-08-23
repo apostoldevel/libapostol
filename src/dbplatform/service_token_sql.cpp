@@ -18,44 +18,22 @@ void sign_out(PgPool& pool, std::string_view session, Logger* log, std::string_v
 
     std::string label(tag);
 
-    // api.authorize first, the way execute_action does it. SessionOut runs
-    // DoLogout and touches db.profile through the session context; a project is
-    // free to put real work in DoLogout, and a bare api.signout would run it with
-    // no session established.
-    pool.execute(fmt::format("SELECT * FROM api.authorize({});\n"
-                             "SELECT * FROM api.signout({})",
-                             pq_quote_literal(session),
+    pool.execute(fmt::format("SELECT * FROM api.signout({})",
                              pq_quote_literal(session)),
         [log, label](std::vector<PgResult> results) {
             if (!log)
                 return;
 
-            // results[0] = api.authorize, results[1] = api.signout.
-            //
-            // Say which of the two ways this went wrong. A batch whose first
-            // statement errors comes back as one failed result and PostgreSQL never
-            // runs the second; an empty vector means the delivery carried nothing at
-            // all, which is a different problem in a different place.
-            if (results.size() < 2 || !results[1].ok()) {
-                if (results.empty()) {
-                    log->warn("{} sign out: empty delivery, no results at all", label);
-                } else if (!results[0].ok()) {
-                    log->warn("{} sign out: statement 1 of {} failed, batch aborted: {}",
-                              label, results.size(), results[0].error_message());
-                } else if (results.size() < 2) {
-                    log->warn("{} sign out: only {} result(s), expected 2",
-                              label, results.size());
-                } else {
-                    log->warn("{} sign out: statement 2 failed: {}",
-                              label, results[1].error_message());
-                }
+            if (results.empty() || !results[0].ok()) {
+                log->warn("{} sign out failed: {}", label,
+                          results.empty() ? "no result" : results[0].error_message());
                 return;
             }
 
-            // api.signout returns boolean. False means SignOut refused — most
-            // often the ACL check inside SessionOut — and the row stays.
-            if (results[1].rows() > 0 && results[1].columns() > 0) {
-                const char* v = results[1].value(0, 0);
+            // api.signout returns boolean. False means SignOut refused — the ACL
+            // check inside SessionOut is one way — and the row stays.
+            if (results[0].rows() > 0 && results[0].columns() > 0) {
+                const char* v = results[0].value(0, 0);
                 if (v && (v[0] == 'f' || v[0] == 'F'))
                     log->warn("{} sign out refused; the session row remains. "
                               "Look for code 9001 in db.log", label);
@@ -64,6 +42,55 @@ void sign_out(PgPool& pool, std::string_view session, Logger* log, std::string_v
         [log, label](std::string_view error) {
             if (log)
                 log->warn("{} sign out failed: {}", label, error);
+        },
+        /*quiet=*/true);
+}
+
+// ─── close_session ───────────────────────────────────────────────────────────
+
+void close_session(PgPool& pool, std::string_view token, Logger* log, std::string_view tag)
+{
+    if (token.empty())
+        return;
+
+    std::string label(tag);
+
+    // daemon.session_close validates the token, takes the session code from its
+    // "sub" claim and calls SessionOut. Reported failures come back as a json
+    // object with an "error" member rather than as a failed statement.
+    pool.execute(fmt::format("SELECT * FROM daemon.session_close({})",
+                             pq_quote_literal(token)),
+        [log, label](std::vector<PgResult> results) {
+            if (!log)
+                return;
+
+            if (results.empty() || !results[0].ok()) {
+                log->warn("{} close session failed: {}", label,
+                          results.empty() ? "no result" : results[0].error_message());
+                return;
+            }
+
+            if (results[0].rows() == 0 || results[0].columns() == 0)
+                return;
+
+            const char* v = results[0].value(0, 0);
+            if (!v)
+                return;
+
+            try {
+                auto j = nlohmann::json::parse(v);
+                if (j.contains("error")) {
+                    const auto& e = j["error"];
+                    log->warn("{} close session refused: {}", label,
+                              e.is_object() ? e.value("message", "") : std::string(v));
+                }
+            } catch (...) {
+                // Not json: the claims came back as something else. Nothing to say.
+            }
+        },
+        [log, label](std::string_view error) {
+            if (log)
+                log->warn("{} close session failed: {}", label, error);
         },
         /*quiet=*/true);
 }
@@ -154,7 +181,10 @@ void refresh_service_token(PgPool& pool, ServiceToken& token, Logger& log,
 
             // The session behind the token just replaced — closed only now, because
             // closing it earlier would revoke the token still serving requests.
-            sign_out(pool, token.take_previous_session());
+            // By token, not by session code: this runs on the worker's pool, whose
+            // role cannot reach the api schema.
+            close_session(pool, token.take_previous_token(), &log, label);
+            token.take_previous_session();   // discard; closed above
         },
         [&token, &log, label, client_id](std::string_view error) {
             log.error("{} service token for \"{}\": {}", label, client_id, error);

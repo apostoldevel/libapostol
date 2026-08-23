@@ -77,6 +77,7 @@ void ServiceToken::issued(std::string token, std::string session,
     life = std::clamp(life, k_min_life, k_max_life);
 
     previous_session_ = std::move(session_);
+    previous_token_   = std::move(token_);
 
     token_   = std::move(token);
     session_ = std::move(session);
@@ -105,6 +106,13 @@ void ServiceToken::failed() noexcept
 std::string ServiceToken::take_previous_session() noexcept
 {
     return std::move(previous_session_);
+}
+
+// ─── take_previous_token ─────────────────────────────────────────────────────
+
+std::string ServiceToken::take_previous_token() noexcept
+{
+    return std::move(previous_token_);
 }
 
 } // namespace apostol
