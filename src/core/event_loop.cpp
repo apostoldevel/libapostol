@@ -3,6 +3,8 @@
 #include <cerrno>
 #include <fmt/format.h>
 #include <stdexcept>
+#include <algorithm>
+#include <limits>
 #include <system_error>
 
 #include <sys/timerfd.h>
@@ -43,16 +45,55 @@ EventLoop::~EventLoop()
 void EventLoop::run()
 {
     running_ = true;
-    epoll_event events[MAX_EVENTS];
+
+    while (running_)
+        poll_once(-1);
+}
+
+bool EventLoop::run_for(std::chrono::milliseconds duration,
+                        const std::function<bool()>& done)
+{
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+
+    // Saved and restored, not forced to false on the way out: this is a public
+    // method, and calling it from inside a callback of run() would otherwise stop
+    // the outer loop and take the process down with it.
+    const bool was_running = running_;
+
+    running_ = true;
 
     while (running_)
     {
-        int n = ::epoll_wait(epoll_fd_, events, MAX_EVENTS, -1);
+        if (done && done()) {
+            running_ = was_running;
+            return true;
+        }
+
+        auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+
+        if (left.count() <= 0)
+            break;
+
+        poll_once(static_cast<int>(
+            std::min<std::int64_t>(left.count(), std::numeric_limits<int>::max())));
+    }
+
+    running_ = was_running;
+    return done && done();
+}
+
+void EventLoop::poll_once(int timeout_ms)
+{
+    epoll_event events[MAX_EVENTS];
+
+    {
+        int n = ::epoll_wait(epoll_fd_, events, MAX_EVENTS, timeout_ms);
 
         if (n < 0)
         {
             if (errno == EINTR)
-                continue;
+                return;
             throw std::system_error(errno, std::system_category(), "epoll_wait");
         }
 

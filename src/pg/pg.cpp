@@ -807,10 +807,16 @@ void PgPool::fail_inflight_query(PgConnection& conn, std::string_view reason)
     if (it != inflight_.end()) {
         auto owned = std::move(*it);
         inflight_.erase(it);
-        // Re-queue the query for retry instead of failing it permanently
+        // Re-queue the query for retry instead of failing it permanently.
+        //
+        // The statement itself is not printed here. This runs at notice — the
+        // default level — and the first eighty characters of a query are quite
+        // enough to expose a secret: `api.login(E'service-…', E'<secret>'` fits
+        // easily. Quiet queries are quiet for a reason, and a connection error is
+        // exactly when they get re-queued.
         if (pg_logger_)
-            pg_logger_->notice("Re-queuing query after connection error: {}",
-                              owned->sql().substr(0, 80));
+            pg_logger_->notice("Re-queuing query {} after connection error: {}",
+                               owned->id(), reason);
         queue_.push(std::move(owned));
     }
 }
@@ -878,6 +884,17 @@ void PgPool::schedule_reconnect_timer()
                 start_listener();
         },
         /*repeat=*/false);
+}
+
+std::size_t PgPool::outstanding() const
+{
+    std::size_t n = queue_.size();
+
+    for (const auto& conn : conns_)
+        if (conn && conn->current_query())
+            ++n;
+
+    return n;
 }
 
 std::size_t PgPool::healthy_count() const

@@ -22,7 +22,7 @@ using PgResultHandler = std::function<void(
 ///
 /// Eliminates the duplicated on_exception lambda pattern across PGHTTP/FileServer.
 void exec_sql(PgPool& pool, const HttpRequest& req, HttpResponse& resp,
-              std::string sql, PgResultHandler on_result);
+              std::string sql, PgResultHandler on_result, bool quiet = false);
 
 } // namespace apostol
 

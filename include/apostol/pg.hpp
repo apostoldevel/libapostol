@@ -248,6 +248,11 @@ public:
     std::size_t connection_count() const { return conns_.size(); }
     std::size_t queue_size()       const { return queue_.size(); }
 
+    /// Queries queued or already sent and awaiting a result. Zero means nothing is
+    /// outstanding — used to end a shutdown drain as soon as it is done rather than
+    /// waiting out a timeout.
+    std::size_t outstanding() const;
+
 private:
     void new_connection();
     void on_io(PgConnection& conn, uint32_t events);

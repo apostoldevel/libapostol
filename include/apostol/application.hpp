@@ -19,6 +19,7 @@
 
 #include <filesystem>
 #include <functional>
+#include <chrono>
 #include <memory>
 #include <nlohmann/json_fwd.hpp>
 #include <string>
@@ -123,8 +124,17 @@ public:
         db_pool_.reset();
         named_pools_.clear();
     }
+
+    /// How long a shutdown waits for queries queued in on_stop() to finish.
+    static constexpr auto k_shutdown_drain = std::chrono::milliseconds(2000);
+
+    /// Pump @p loop briefly so that work queued by on_stop() actually runs.
+    /// on_stop() is called after run() has returned, so without this a query it
+    /// issues — closing a service session, say — is queued and then discarded.
+    void drain_db(EventLoop& loop);
 #else
     void stop_db() noexcept {} // no-op when built without PostgreSQL
+    void drain_db(EventLoop&) {}
 #endif // WITH_POSTGRESQL
 
     // ── WebSocket handler ─────────────────────────────────────────────────────

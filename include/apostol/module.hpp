@@ -72,13 +72,27 @@ public:
     const Module* module(std::size_t i) const { return modules_.at(i).get(); }
 
     void on_start();
+
+    /// Stop every enabled module, and latch: after this, execute() refuses and
+    /// heartbeat() does nothing.
+    ///
+    /// The latch matters because the event loop may still run afterwards — a
+    /// shutdown drains pending database work (Application::drain_db), and during
+    /// that window the one-second heartbeat timer keeps firing and the listening
+    /// socket keeps accepting. Without it a module that released its session in
+    /// on_stop() would be asked to work again: BotSession, finding itself invalid,
+    /// logs in anew and leaves behind exactly the session the drain exists to close.
     void on_stop();
+
+    /// True once on_stop() has run.
+    bool stopped() const noexcept { return stopped_; }
 
     /// Comma-separated names of enabled modules (for process title).
     std::string module_names() const;
 
 private:
     std::vector<std::unique_ptr<Module>> modules_;
+    bool stopped_{false};
 };
 
 } // namespace apostol

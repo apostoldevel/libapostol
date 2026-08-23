@@ -10,6 +10,9 @@ void ModuleManager::add_module(std::unique_ptr<Module> m)
 
 bool ModuleManager::execute(const HttpRequest& req, HttpResponse& resp)
 {
+    if (stopped_)
+        return false;
+
     for (auto& m : modules_) {
         if (!m->enabled())
             continue;
@@ -21,6 +24,9 @@ bool ModuleManager::execute(const HttpRequest& req, HttpResponse& resp)
 
 void ModuleManager::heartbeat(std::chrono::system_clock::time_point now)
 {
+    if (stopped_)
+        return;
+
     for (auto& m : modules_) {
         if (m->enabled())
             m->heartbeat(now);
@@ -39,6 +45,8 @@ void ModuleManager::on_stop()
     for (auto& m : modules_)
         if (m->enabled())
             m->on_stop();
+
+    stopped_ = true;
 }
 
 std::string ModuleManager::module_names() const

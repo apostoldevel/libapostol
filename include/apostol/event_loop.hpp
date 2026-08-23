@@ -41,6 +41,16 @@ public:
     // Run the event loop until stop() is called.
     void run();
 
+    /// Run the loop until @p duration elapses, or until stop() is called, or until
+    /// @p done returns true — whichever comes first. Returns true if @p done was
+    /// satisfied.
+    ///
+    /// For draining at shutdown. run() returns when the process is stopping, but
+    /// work queued after that — a session to close, a last write — would otherwise
+    /// sit in a queue nobody pumps again.
+    bool run_for(std::chrono::milliseconds duration,
+                 const std::function<bool()>& done = {});
+
     // Request loop termination (safe to call from within a callback).
     void stop() noexcept;
 
@@ -89,6 +99,9 @@ private:
 
     int epoll_fd_{-1};
     int signal_fd_{-1};
+    /// One epoll_wait plus dispatch. @p timeout_ms is passed through: -1 blocks.
+    void poll_once(int timeout_ms);
+
     bool running_{false};
 
     struct IOEntry

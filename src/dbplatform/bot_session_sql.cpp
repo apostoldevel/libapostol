@@ -53,6 +53,7 @@ void BotSession::refresh_if_needed()
         pq_quote_literal(agent_),
         pq_quote_literal(host_));
 
+    // quiet: the statement carries client_secret, and PgPool logs statement text.
     pool_.execute(sql,
         [this](std::vector<PgResult> results) {
             // results[0] = login, results[1] = get_session
@@ -118,7 +119,8 @@ void BotSession::refresh_if_needed()
         [this](std::string_view /*error*/) {
             refreshing_ = false;
             retry_at_ = std::chrono::steady_clock::now() + k_retry_interval;
-        });
+        },
+        /*quiet=*/true);
 }
 
 // ─── execute_action ──────────────────────────────────────────────────────────
@@ -140,7 +142,8 @@ void BotSession::execute_action(const std::string& id, std::string_view action,
         pq_quote_literal(id),
         pq_quote_literal(action));
 
-    pool_.execute(sql, std::move(on_result), std::move(on_error));
+    // quiet: the statement carries the bot's session code.
+    pool_.execute(sql, std::move(on_result), std::move(on_error), /*quiet=*/true);
 }
 
 // ─── sign_out ────────────────────────────────────────────────────────────────

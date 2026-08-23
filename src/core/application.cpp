@@ -39,6 +39,22 @@
 namespace apostol
 {
 
+// ─── safe_log_level ──────────────────────────────────────────────────────────
+//
+// level_from_string throws on an unknown or empty value, and AppSettings::validate()
+// reports a bad log.level without correcting it. A typo there must not take down a
+// worker that the master will then respawn forever.
+
+static LogLevel safe_log_level(const std::string& name)
+{
+    try {
+        return level_from_string(name);
+    } catch (const std::exception&) {
+        return LogLevel::notice;
+    }
+}
+
+
 // ─── Construction ────────────────────────────────────────────────────────────
 
 Application::Application(std::string_view name) : name_(name), logger_(std::make_unique<Logger>())
@@ -452,6 +468,13 @@ void Application::load_config()
     try
     {
         logger_->set_level(level_from_string(settings_.log_level));
+
+        // The service loggers are created once, so a reload has to reach them too;
+        // otherwise raising log.level and sending SIGHUP silently does nothing for
+        // PostgreSQL and stream diagnostics. A dedicated postgres.log stays at
+        // debug by design — see setup_db().
+        if (stream_logger_)
+            stream_logger_->set_level(safe_log_level(settings_.log_level));
     }
     catch (const std::invalid_argument&)
     {
@@ -717,6 +740,53 @@ void Application::master_run()
 
 // ─── Single process loop ─────────────────────────────────────────────────────
 
+#ifdef WITH_POSTGRESQL
+
+// ─── drain_db ────────────────────────────────────────────────────────────────
+//
+// on_stop() runs after loop.run() has returned, so anything a module queues there —
+// a service session to close, a last write — sits in a queue nobody pumps again.
+// Give those queries a bounded chance to finish before the pool is destroyed.
+//
+// Bounded on purpose: a database that has stopped answering must not hold the
+// process from exiting. The drain ends as soon as nothing is outstanding, so a
+// healthy shutdown costs one round trip rather than the timeout.
+
+void Application::drain_db(EventLoop& loop)
+{
+    // Every pool, not just the default one: a module may have been handed a named
+    // pool (FileServer runs on "helper"), and its session closes through that.
+    auto outstanding = [this] {
+        std::size_t n = db_pool_ ? db_pool_->outstanding() : 0;
+        for (const auto& [name, pool] : named_pools_)
+            if (pool)
+                n += pool->outstanding();
+        return n;
+    };
+
+    if (outstanding() == 0)
+        return;
+
+    bool drained = false;
+
+    try {
+        drained = loop.run_for(k_shutdown_drain,
+                               [&outstanding] { return outstanding() == 0; });
+    } catch (const std::exception& e) {
+        // Best effort by definition. An exception here must not skip stop_db().
+        if (logger_)
+            logger_->warn("{} shutdown drain failed: {}", name_, e.what());
+        return;
+    }
+
+    if (!drained && logger_)
+        logger_->warn("{} shutdown: {} database queries did not complete in {} ms",
+                      name_, outstanding(),
+                      static_cast<long long>(k_shutdown_drain.count()));
+}
+
+#endif // WITH_POSTGRESQL
+
 void Application::single_run()
 {
     // Re-arm the alternate signal stack: POSIX does not inherit sigaltstack across fork().
@@ -769,6 +839,7 @@ void Application::single_run()
     loop.run();
 
     module_manager_.on_stop();
+    drain_db(loop);
     stop_db();
     logger_->notice("{} single process exiting (pid={})", name_, ::getpid());
 }
@@ -826,6 +897,7 @@ void Application::worker_run()
     loop.run();
 
     module_manager_.on_stop();
+    drain_db(loop);
     stop_db();
     logger_->notice("{} worker process exiting (pid={})", name_, ::getpid());
 }
@@ -898,6 +970,7 @@ void Application::helper_run()
     loop.run();
 
     module_manager_.on_stop();
+    drain_db(loop);
     stop_db();
     logger_->notice("{} helper process exiting (pid={})", name_, ::getpid());
 }
@@ -959,8 +1032,12 @@ void Application::custom_process_run(CustomProcess& proc)
         ? fmt::format("{}: {} process", name_, proc.title())
         : fmt::format("{}: {} process ({})", name_, proc.title(), names));
 
-    // 7. Heartbeat timer (1s)
-    loop.add_timer(std::chrono::seconds(1),
+    // 7. Heartbeat timer (1s). The id is kept because the drain below runs the loop
+    // again after on_stop(): a process whose session was released there would be
+    // asked to beat once more and would log back in, leaving behind the very
+    // session the drain exists to close. Modules are latched by ModuleManager;
+    // a custom process has no manager, so its timer is cancelled by hand.
+    const auto heartbeat_timer = loop.add_timer(std::chrono::seconds(1),
         [&proc] {
             proc.heartbeat(std::chrono::system_clock::now());
         });
@@ -970,6 +1047,8 @@ void Application::custom_process_run(CustomProcess& proc)
 
     // 9. Cleanup: on_stop() first, then stop_db() while EventLoop is still alive
     proc.on_stop();
+    loop.cancel_timer(heartbeat_timer);
+    drain_db(loop);
     stop_db();
     logger_->notice("{} process '{}' exiting (pid={})",
                     name_, proc.name(), ::getpid());
@@ -1406,18 +1485,34 @@ PgPool& Application::setup_db(EventLoop& loop, std::string conninfo,
     // Create dedicated postgres logger (writes to stderr + separate postgres.log)
     {
         pg_logger_ = std::make_unique<Logger>();
-        pg_logger_->set_level(LogLevel::debug);
-        pg_logger_->add_target(std::make_unique<StderrTarget>());
+
+        bool have_file = false;
 
         if (!settings_.postgres_log.empty()) {
             try {
                 std::filesystem::create_directories(settings_.postgres_log.parent_path());
                 pg_logger_->set_file_target(settings_.postgres_log.string(), settings_.log_max_size,
                                              settings_.log_keep_rotated, settings_.log_compress);
+                have_file = true;
             } catch (const std::exception& e) {
                 logger_->warn("cannot open postgres log '{}': {}",
                     settings_.postgres_log.string(), e.what());
             }
+        }
+
+        // Where the PostgreSQL traffic goes decides how loud it may be.
+        //
+        // A dedicated postgres.log is asked for on purpose and protected by file
+        // permissions, so it keeps the full statement journal that makes "what
+        // exactly went to the database" answerable. Without one the only outlet is
+        // stderr — which on a container deployment means `docker logs`, readable by
+        // anyone with the daemon socket — so it follows log.level like everything
+        // else instead of always printing every statement at debug.
+        if (have_file) {
+            pg_logger_->set_level(LogLevel::debug);
+        } else {
+            pg_logger_->add_target(std::make_unique<StderrTarget>());
+            pg_logger_->set_level(safe_log_level(settings_.log_level));
         }
     }
 
@@ -1482,7 +1577,7 @@ Logger& Application::stream_logger()
 {
     if (!stream_logger_) {
         stream_logger_ = std::make_unique<Logger>();
-        stream_logger_->set_level(LogLevel::debug);
+        stream_logger_->set_level(safe_log_level(settings_.log_level));
         stream_logger_->add_target(std::make_unique<StderrTarget>());
 
         auto stream_log = settings_.resolve(APP_STREAM_LOG_FILE);

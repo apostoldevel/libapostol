@@ -10,7 +10,7 @@ namespace apostol
 {
 
 void exec_sql(PgPool& pool, const HttpRequest& req, HttpResponse& resp,
-              std::string sql, PgResultHandler on_result)
+              std::string sql, PgResultHandler on_result, bool quiet)
 {
     resp.set_deferred(true);
 
@@ -26,7 +26,8 @@ void exec_sql(PgPool& pool, const HttpRequest& req, HttpResponse& resp,
             HttpResponse r;
             reply_error(r, HttpStatus::internal_server_error, error);
             conn->send_response(r);
-        });
+        },
+        quiet);
 }
 
 } // namespace apostol
