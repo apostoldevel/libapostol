@@ -17,8 +17,14 @@ BotSession::BotSession(PgPool& pool, std::string agent, std::string host)
 
 bool BotSession::valid() const noexcept
 {
-    return !session_.empty()
+    return !sessions_.empty()
         && std::chrono::steady_clock::now() < expiry_;
+}
+
+const std::string& BotSession::session() const noexcept
+{
+    static const std::string empty;
+    return sessions_.empty() ? empty : sessions_.front();
 }
 
 // ─── set_credentials ─────────────────────────────────────────────────────────

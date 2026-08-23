@@ -7,6 +7,7 @@
 #include <chrono>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace apostol
 {
@@ -41,8 +42,16 @@ class BotSession
 public:
     BotSession(PgPool& pool, std::string agent, std::string host);
 
-    /// Current session string (empty if not authenticated).
-    const std::string& session() const noexcept { return session_; }
+    /// First session, or empty. Convenience for callers that act on one object and
+    /// do not enumerate — the scope is decided by the object, not by the caller.
+    ///
+    /// Anything that *enumerates* work must iterate sessions() instead: there is one
+    /// session per scope, and a caller looking only at the first sees only that
+    /// scope's share of the world.
+    const std::string& session() const noexcept;
+
+    /// One session per scope, in scope order. Empty when not authenticated.
+    const std::vector<std::string>& sessions() const noexcept { return sessions_; }
 
     /// True if session is non-empty and not expired.
     bool valid() const noexcept;
@@ -57,12 +66,26 @@ public:
     /// Mirrors v1: login → get_session → signout(login_session).
     void refresh_if_needed();
 
-    /// Sign out the current session. Call from on_stop().
+    /// Sign out the session obtained by the *login* step. The bot's own sessions are
+    /// deliberately left alone: they belong to the donor user, which holds no logout
+    /// right, and api.get_sessions hands the same rows back on the next start rather
+    /// than making new ones. Attempting to close them only writes "Access denied"
+    /// into db.log, once per process per restart, and closes nothing.
+    ///
+    /// Kept as a no-op so callers need not change; there is nothing left to do here.
     void sign_out();
 
-    /// Execute api.authorize(session) + api.execute_object_action(id, action).
-    /// Calls on_result on success, on_error on failure.
-    /// If session is not valid, calls on_error immediately.
+    /// Execute api.authorize(session) + api.execute_object_action(id, action) under
+    /// an explicit session. Use this whenever the object was found by enumerating:
+    /// act in the scope you found it in, not in whichever one happens to be first.
+    void execute_action(std::string_view session,
+                        const std::string& id, std::string_view action,
+                        PgQuery::ResultHandler    on_result,
+                        PgQuery::ExceptionHandler on_error);
+
+    /// The same under the first session. Only correct when the caller has one scope
+    /// or the object is known to live in it — otherwise api.authorize succeeds in
+    /// the wrong scope and the action fails on an object it cannot see.
     void execute_action(const std::string& id, std::string_view action,
                         PgQuery::ResultHandler    on_result,
                         PgQuery::ExceptionHandler on_error);
@@ -76,7 +99,7 @@ private:
     std::string client_id_;
     std::string client_secret_;
     std::string username_{"apibot"};
-    std::string session_;
+    std::vector<std::string> sessions_;
 
     std::chrono::steady_clock::time_point expiry_{};
     std::chrono::steady_clock::time_point retry_at_{};

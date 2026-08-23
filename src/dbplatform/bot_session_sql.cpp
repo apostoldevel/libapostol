@@ -41,11 +41,17 @@ void BotSession::refresh_if_needed()
     refreshing_ = true;
 
     // Steps 1+2 in one SQL batch (same connection):
-    //   api.login()       → establishes session context
-    //   api.get_session() → uses that context to create bot session
+    //   api.login()        → establishes session context
+    //   api.get_sessions() → the donor's session in every scope
+    //
+    // Plural, deliberately. api.get_sessions walks db.scope and answers one session
+    // per scope; api.get_session answers one, whichever scope the profile resolves
+    // to. A process that enumerates work — jobs, reports, an outbox — sees only that
+    // one scope's share if it asks for the singular, and in a multi-scope
+    // installation the rest is simply never done.
     auto sql = fmt::format(
         "SELECT * FROM api.login({}, {}, {}, {});\n"
-        "SELECT * FROM api.get_session({}, {}, {})",
+        "SELECT * FROM api.get_sessions({}, {}, {})",
         pq_quote_literal(client_id_),
         pq_quote_literal(client_secret_),
         pq_quote_literal(agent_),
@@ -81,19 +87,27 @@ void BotSession::refresh_if_needed()
                 }
             }
 
-            // Extract bot session from get_session result
-            if (results[1].ok() && results[1].rows() > 0 && results[1].columns() > 0) {
-                const char* val2 = results[1].value(0, 0);
-                if (val2 && val2[0] != '\0') {
+            // Extract the bot sessions — one row per scope.
+            if (results[1].ok() && results[1].columns() > 0) {
+                std::vector<std::string> found;
+
+                for (int row = 0; row < results[1].rows(); ++row) {
+                    const char* v = results[1].value(row, 0);
+                    if (!v || v[0] == '\0')
+                        continue;
+
                     try {
-                        auto j2 = nlohmann::json::parse(val2);
-                        if (j2.contains("session"))
-                            session_ = j2["session"].get<std::string>();
-                        else
-                            session_ = val2;
+                        auto j = nlohmann::json::parse(v);
+                        found.push_back(j.contains("session")
+                                            ? j["session"].get<std::string>()
+                                            : std::string(v));
                     } catch (...) {
-                        session_ = val2;
+                        found.emplace_back(v);
                     }
+                }
+
+                if (!found.empty()) {
+                    sessions_ = std::move(found);
                     expiry_ = std::chrono::steady_clock::now() + k_refresh_interval;
                 }
             }
@@ -130,7 +144,15 @@ void BotSession::execute_action(const std::string& id, std::string_view action,
                                 PgQuery::ResultHandler    on_result,
                                 PgQuery::ExceptionHandler on_error)
 {
-    if (!valid()) {
+    execute_action(session(), id, action, std::move(on_result), std::move(on_error));
+}
+
+void BotSession::execute_action(std::string_view session,
+                                const std::string& id, std::string_view action,
+                                PgQuery::ResultHandler    on_result,
+                                PgQuery::ExceptionHandler on_error)
+{
+    if (session.empty() || !valid()) {
         if (on_error)
             on_error("BotSession: not authenticated");
         return;
@@ -139,7 +161,7 @@ void BotSession::execute_action(const std::string& id, std::string_view action,
     auto sql = fmt::format(
         "SELECT * FROM api.authorize({});\n"
         "SELECT * FROM api.execute_object_action({}::uuid, {})",
-        pq_quote_literal(session_),
+        pq_quote_literal(session),
         pq_quote_literal(id),
         pq_quote_literal(action));
 
@@ -151,13 +173,23 @@ void BotSession::execute_action(const std::string& id, std::string_view action,
 
 void BotSession::sign_out()
 {
-    if (session_.empty())
-        return;
-
-    // Через общий путь: он же сообщает об отказе, который иначе теряется.
-    db_platform::sign_out(pool_, session_);
-
-    session_.clear();
+    // Nothing to do, and that is the point.
+    //
+    // The bot's sessions belong to the donor user (api.get_sessions leaves suid
+    // equal to userid), and that user holds no logout right — deliberately: it is
+    // a donor of the system session, never a party to a login. SessionOut checks
+    // the logout bit of the session's current user and refuses, then records
+    // "Access denied" under code 9001. Ten of those per stack restart, in a log
+    // kept for ten years.
+    //
+    // Nor is there anything to reclaim: api.get_sessions matches on
+    // (suid, scope, agent) and hands the same rows back on the next start. The
+    // session outliving the process is how this has always worked — the v1
+    // processes closed only the login session and left these alone.
+    //
+    // The login session *is* closed, in refresh_if_needed, by the client that
+    // opened it and may close it.
+    sessions_.clear();
     expiry_ = {};
 }
 
