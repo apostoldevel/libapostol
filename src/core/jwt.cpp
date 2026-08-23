@@ -3,6 +3,9 @@
 #include "apostol/jwt.hpp"
 #include "apostol/oauth_providers.hpp"
 
+#include <algorithm>
+#include <array>
+
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 
@@ -230,11 +233,17 @@ std::string sign_claims_jwt(const OAuthApp& app,
     // The provider's own claim names travel unchanged: which of them is the
     // address and which the given name is written down in the database, per
     // provider, and duplicating that map here would be two places to keep in
-    // step. The registered claims below are set afterwards so that a provider
-    // sending its own iss or aud cannot decide either.
+    // step.
+    //
+    // The registered claims are the exception, and are dropped rather than
+    // carried: they are set below, from what we know, and a claim of the same
+    // name in the answer would otherwise decide which of our audiences the
+    // token is signed for -- or how long it lives.
+    static const std::array<std::string_view, 7> registered{
+        "iss", "sub", "aud", "exp", "nbf", "iat", "jti"};
+
     for (const auto& [key, val] : claims.items()) {
-        if (key == "iss" || key == "aud" || key == "sub" ||
-            key == "iat" || key == "exp")
+        if (std::find(registered.begin(), registered.end(), key) != registered.end())
             continue;
         builder.set_payload_claim(key, jwt::basic_claim<jwt_traits>(val));
     }
