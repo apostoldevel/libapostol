@@ -86,9 +86,13 @@ JwtClaims verify_jwt(std::string_view token,
             try { kid = decoded.get_key_id(); }
             catch (...) { throw JwtVerificationError("missing kid for asymmetric algorithm"); }
 
-            auto key = key_resolver(kid);
+            // Within this provider, not across all of them: a kid names a key
+            // its own issuer chose, and another provider publishing the same
+            // one would otherwise get to verify this token.
+            auto key = key_resolver(kid, app->provider);
             if (key.empty())
-                throw JwtVerificationError("no public key for kid: " + kid);
+                throw JwtVerificationError("no public key for kid: " + kid
+                                           + " (provider: " + app->provider + ")");
 
             if (alg == "RS256") {
                 jwt::verify<jwt_traits>().allow_algorithm(jwt::algorithm::rs256{key}).verify(decoded);

@@ -33,9 +33,15 @@ struct JwtClaims
     std::string iss;   // issuer
 };
 
-/// Optional callback to resolve public key by kid (for RS/ES/PS algorithms).
-/// Returns PEM-encoded public key string.
-using JwtKeyResolver = std::function<std::string(std::string_view kid)>;
+/// Optional callback to resolve a public key for RS/ES/PS algorithms.
+/// Returns a PEM-encoded public key, or an empty string when there is none.
+///
+/// Takes the provider as well as the kid, and is expected to look only within
+/// that provider's keys. A kid is unique to whoever minted it and to nobody
+/// else: searching every provider's key set means one provider's key can verify
+/// a token claiming another's audience, which is the audience check undone.
+using JwtKeyResolver =
+    std::function<std::string(std::string_view kid, std::string_view provider)>;
 
 /// Verify a JWT token against the centralized OAuth2 provider cache.
 ///
@@ -47,6 +53,9 @@ using JwtKeyResolver = std::function<std::string(std::string_view kid)>;
 ///
 /// Also checks issuer: if the provider has issuers configured, the token's
 /// iss claim must match one of them.
+///
+/// The key resolver is called with the provider the audience selected, so a
+/// key is only ever accepted from the provider the token claims to come from.
 ///
 /// @throws JwtExpiredError        if the token has expired
 /// @throws JwtVerificationError   if signature is invalid, audience unknown, etc.
