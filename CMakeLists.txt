@@ -95,6 +95,7 @@ add_library(apostol STATIC
     src/net/tcp_client.cpp
     src/net/udp_client.cpp
     src/core/base64.cpp
+    src/core/service_token.cpp
     src/core/file_utils.cpp
     src/core/http_utils.cpp
     src/core/http_client.cpp
@@ -115,7 +116,6 @@ if(WITH_POSTGRESQL)
         src/pg/pg_utils.cpp
         src/pg/pg_exec.cpp
         src/core/bot_session.cpp
-        src/core/service_token.cpp
     )
 endif()
 
