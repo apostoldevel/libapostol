@@ -85,12 +85,33 @@ void close_session(PgPool& pool, std::string_view token, Logger* log, std::strin
                 const auto& e = j["error"];
                 const int code = e.is_object() ? e.value("code", 0) : 0;
 
-                // ERR-403-001, "Token not FOUND or has expired". At shutdown this is
-                // not a refusal but a job already done: the session went with an
-                // expired token, a sweep, or a sign-out elsewhere. Warning about it
-                // would put a line per worker per restart into the log and teach
-                // whoever reads it to ignore the ones that matter.
-                if (code == 403)
+                // "Token not FOUND or has expired". At shutdown this is not a
+                // refusal but a job already done: the session went with an expired
+                // token, a sweep, or a sign-out elsewhere. Warning about it would
+                // put a line per worker per restart into the log and teach whoever
+                // reads it to ignore the ones that matter.
+                //
+                // Both numbers, and not out of caution. db-platform 1.2.13 moved
+                // this from ERR-403-001 to ERR-401-008, because RFC 6750 §3.1 puts
+                // an expired token at 401. The status travels inside the identifier,
+                // so correcting it meant a new one — and a binary from master will
+                // meet databases on either side of that patch for as long as the
+                // rollout takes. Accepting only the new number would bring the noise
+                // back everywhere the patch has not landed yet.
+                //
+                // The error object daemon.* returns carries a status and a
+                // message, and no identifier — api.* does return one, but this path
+                // does not go through api.* — so this cannot be narrowed to the one
+                // code: 401 here also covers the rest of that group. On the way in
+                // to daemon.session_close only TokenExpired answers 401 at all; the
+                // rest of that path (IssuerNotFound, AudienceNotFound, TokenError,
+                // TokenBelong, AccessDenied) is group 400. At a shutdown close the
+                // cost of being wrong is a warning not written, which is the same
+                // thing this branch is for.
+                //
+                // The 403 half stops being needed once every database is on 1.2.13
+                // or later; until someone can say that, it stays.
+                if (code == 401 || code == 403)
                     return;
 
                 log->warn("{} close session refused: {}", label,
