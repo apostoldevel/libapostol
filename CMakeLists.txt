@@ -10,6 +10,14 @@ option(WITH_POSTGRESQL "Build with PostgreSQL (libpq)" ON)
 option(WITH_SSL        "Build with OpenSSL"            ON)
 option(WITH_CURL       "Build with libcurl"            ON)
 
+# db-platform integration. libapostol is a transport framework and knows no schema
+# of its own; this flag admits the one contract it does integrate with — the
+# PL/pgSQL API of https://github.com/apostoldevel/db-platform (api.login,
+# api.get_session, api.signout, api.authorize, api.execute_object_action,
+# daemon.token). With it OFF the library contains no reference to that schema, and
+# BotSession / the db_platform helpers are simply absent.
+option(WITH_DB_PLATFORM "Build the db-platform integration layer" ON)
+
 # Edge-triggered + one-shot epoll — defense-in-depth against the class of
 # "forgotten remove_io" bugs that spin the event loop at 100% CPU on a
 # closed socket (see a3660c2 / 23347f6 production fixes).
@@ -117,6 +125,13 @@ if(WITH_POSTGRESQL)
         src/pg/pg_exec.cpp
         src/core/bot_session.cpp
     )
+
+    if(WITH_DB_PLATFORM)
+        target_sources(apostol PRIVATE
+            src/dbplatform/bot_session_sql.cpp
+            src/dbplatform/service_token_sql.cpp
+        )
+    endif()
 endif()
 
 if(WITH_SSL)
@@ -144,6 +159,7 @@ target_compile_definitions(apostol PUBLIC
     $<$<BOOL:${WITH_POSTGRESQL}>:WITH_POSTGRESQL>
     $<$<BOOL:${WITH_SSL}>:WITH_SSL>
     $<$<BOOL:${WITH_CURL}>:WITH_CURL>
+    $<$<AND:$<BOOL:${WITH_POSTGRESQL}>,$<BOOL:${WITH_DB_PLATFORM}>>:WITH_DB_PLATFORM>
     $<$<BOOL:${APOSTOL_EPOLL_ET}>:APOSTOL_EPOLL_ET>
 )
 

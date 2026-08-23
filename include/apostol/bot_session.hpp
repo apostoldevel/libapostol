@@ -13,12 +13,21 @@ namespace apostol
 
 // ─── BotSession ──────────────────────────────────────────────────────────────
 //
-// Manages an OAuth2 "apibot" session via PostgreSQL.
+// Holds a service session obtained from db-platform and keeps it fresh.
 //
-// Mirrors v1 CFileCommon::Authentication() pattern:
+// The class is split along the line between what the framework owns and what it
+// borrows. The lifecycle — whether a session is still good, when to renew, how long
+// to back off — is transport-agnostic and always built. The three methods that
+// speak to db-platform (refresh_if_needed, sign_out, execute_action) exist only
+// under WITH_DB_PLATFORM, because the statements they issue are that project's
+// contract, not libapostol's:
+//
 //   1. api.login(client_id, secret, agent, host) → token_session
 //   2. api.get_session(username, agent, host)     → bot_session
 //   3. api.signout(token_session)                 → discard login session
+//
+// Build with WITH_DB_PLATFORM=OFF and this integration is absent, along with every
+// other reference to that schema in the library.
 //
 // Usage:
 //   BotSession bot(pool, "FileServer/1.0", "localhost");
@@ -42,6 +51,8 @@ public:
     void set_credentials(std::string client_id, std::string client_secret,
                          std::string username = "apibot");
 
+#ifdef WITH_DB_PLATFORM
+
     /// Call from heartbeat(). Refreshes session if expired or not yet obtained.
     /// Mirrors v1: login → get_session → signout(login_session).
     void refresh_if_needed();
@@ -55,6 +66,8 @@ public:
     void execute_action(const std::string& id, std::string_view action,
                         PgQuery::ResultHandler    on_result,
                         PgQuery::ExceptionHandler on_error);
+
+#endif // WITH_DB_PLATFORM
 
 private:
     PgPool&     pool_;
