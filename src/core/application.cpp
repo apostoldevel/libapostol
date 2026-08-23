@@ -276,10 +276,12 @@ void Application::start_process()
         // Workers inherit fd and only call accept().
         if (settings_.server_port != 0) {
             master_listener_ = std::make_unique<TcpListener>(
-                settings_.server_port, settings_.server_backlog);
+                settings_.server_port, settings_.server_backlog, settings_.server_listen);
             listen_fd_ = master_listener_->fd();
             http_port_ = master_listener_->local_port();
-            logger_->notice("master: bound listening socket on port {}", http_port_);
+            logger_->notice("master: bound listening socket on {}:{}",
+                            settings_.server_listen.empty() ? "*" : settings_.server_listen,
+                            http_port_);
         }
 
         if (cfg_helper()) spawn_helper();
@@ -1614,11 +1616,12 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
         listener = std::make_shared<TcpListener>(TcpListener::borrow_fd(listen_fd_));
     } else {
         // Single-process mode: create own listener
-        listener = std::make_shared<TcpListener>(port, settings_.server_backlog);
+        listener = std::make_shared<TcpListener>(port, settings_.server_backlog,
+                                                 settings_.server_listen);
     }
     http_port_ = listener->local_port();
 
-    logger_->notice("HTTP server listening on port {}", http_port_);
+    logger_->notice("HTTP server listening on {}:{}", settings_.server_listen.empty() ? "*" : settings_.server_listen, http_port_);
 
     // Accept loop — under APOSTOL_EPOLL_ET the listener fires one event per
     // readable transition, so we must drain the accept queue each time.

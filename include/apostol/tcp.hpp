@@ -7,6 +7,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace apostol
 {
@@ -73,7 +74,13 @@ class TcpListener
 public:
     /// @param port  Local port to bind; 0 = let the OS pick a free port.
     /// @param backlog  listen() backlog (default = APP_DEFAULT_LISTEN_BACKLOG from CMake).
-    explicit TcpListener(uint16_t port = 0, int backlog = APP_DEFAULT_LISTEN_BACKLOG);
+    /// @param address  Interface to bind. Empty, "*", "0.0.0.0" or "::" mean every
+    ///        interface, which is what a dual-stack socket does by default; anything
+    ///        else is parsed and bound literally, so a server told to listen on
+    ///        127.0.0.1 is reachable only from the host. An address that cannot be
+    ///        parsed throws rather than quietly widening to every interface.
+    explicit TcpListener(uint16_t port = 0, int backlog = APP_DEFAULT_LISTEN_BACKLOG,
+                         std::string_view address = {});
 
     /// Wrap an existing bound+listening fd without taking ownership.
     /// The fd will NOT be closed by the destructor — caller (master) manages lifetime.

@@ -2,13 +2,17 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstring>
 #include <stdexcept>
 #include <system_error>
+
+#include <fmt/format.h>
 
 namespace apostol
 {
@@ -122,9 +126,43 @@ TcpListener TcpListener::borrow_fd(int fd)
     return TcpListener(fd, false);
 }
 
-TcpListener::TcpListener(uint16_t port, int backlog)
+// Resolve a configured listen address into the sockaddr_in6 a dual-stack socket
+// binds. "Every interface" has four spellings in the wild and all four have to keep
+// meaning the same thing — APP_DEFAULT_LISTEN is "0.0.0.0", and binding that
+// literally as an IPv4-mapped address would cut off IPv6 clients on a socket that
+// was deliberately made dual-stack.
+static in6_addr resolve_listen_address(std::string_view address)
+{
+    if (address.empty() || address == "*" || address == "0.0.0.0" || address == "::")
+        return in6addr_any;
+
+    const std::string text(address);
+    in6_addr out{};
+
+    if (::inet_pton(AF_INET6, text.c_str(), &out) == 1)
+        return out;
+
+    in_addr v4{};
+    if (::inet_pton(AF_INET, text.c_str(), &v4) == 1) {
+        // IPv4-mapped form ::ffff:a.b.c.d — the only way to name an IPv4 interface
+        // on an AF_INET6 socket.
+        out = in6_addr{};
+        out.s6_addr[10] = 0xff;
+        out.s6_addr[11] = 0xff;
+        std::memcpy(&out.s6_addr[12], &v4.s_addr, sizeof(v4.s_addr));
+        return out;
+    }
+
+    throw std::invalid_argument(fmt::format("invalid bind address: {}", text));
+}
+
+TcpListener::TcpListener(uint16_t port, int backlog, std::string_view address)
     : backlog_(backlog)
 {
+    // Resolved before the socket exists, so a bad address cannot leave a descriptor
+    // behind on the way out.
+    const in6_addr bind_addr = resolve_listen_address(address);
+
     fd_ = ::socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd_ < 0)
         throw std::system_error(errno, std::system_category(), "socket");
@@ -137,23 +175,32 @@ TcpListener::TcpListener(uint16_t port, int backlog)
     ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     ::setsockopt(fd_, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
 
+    // Bind to an address the machine has not been given yet — a DHCP lease, a
+    // keepalived VIP, a tunnel that comes up later. Without this the process dies
+    // with EADDRNOTAVAIL and, under restart: unless-stopped, keeps dying; on a
+    // vessel nobody is reading that log.
+    ::setsockopt(fd_, IPPROTO_IP, IP_FREEBIND, &one, sizeof(one));
+
     sockaddr_in6 addr{};
     addr.sin6_family = AF_INET6;
-    addr.sin6_addr   = in6addr_any;
     addr.sin6_port   = htons(port);
+    addr.sin6_addr   = bind_addr;
 
     if (::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         int err = errno;
         ::close(fd_);
         fd_ = -1;
         throw std::system_error(err, std::system_category(),
-            "bind(port=" + std::to_string(port) + ")");
+            fmt::format("bind({}:{})", address.empty() ? "*" : address, port));
     }
 
     if (::listen(fd_, backlog_) < 0) {
+        // errno first: close() may overwrite it, and then the diagnostic names the
+        // wrong failure. The bind branch above already got this right.
+        int err = errno;
         ::close(fd_);
         fd_ = -1;
-        throw std::system_error(errno, std::system_category(), "listen");
+        throw std::system_error(err, std::system_category(), "listen");
     }
 }
 
