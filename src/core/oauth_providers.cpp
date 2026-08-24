@@ -94,6 +94,21 @@ void OAuthProviders::load(const std::filesystem::path& oauth2_dir)
                 else
                     app.userinfo_scheme = "Bearer";
 
+                // Sign-in-list fields. Read by names of their own; a file that sets
+                // none of them describes no external provider and is simply absent
+                // from the list (external defaults to false).
+                if (auto it = section.find("login_scope"); it != section.end() && it->is_string())
+                    app.login_scope = it->get<std::string>();
+
+                if (auto it = section.find("display_name"); it != section.end() && it->is_string())
+                    app.display_name = it->get<std::string>();
+
+                if (auto it = section.find("icon"); it != section.end() && it->is_string())
+                    app.icon = it->get<std::string>();
+
+                if (auto it = section.find("external"); it != section.end() && it->is_boolean())
+                    app.external = it->get<bool>();
+
                 // cert_uri: check both "cert_uri" and Google's "auth_provider_x509_cert_url"
                 if (auto it = section.find("cert_uri"); it != section.end() && it->is_string())
                     app.cert_uri = it->get<std::string>();

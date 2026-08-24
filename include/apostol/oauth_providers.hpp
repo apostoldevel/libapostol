@@ -36,6 +36,19 @@ struct OAuthApp
     std::string userinfo_audience;  // field in that answer holding the client_id
     std::string userinfo_subject;   // field holding the user id (default "sub")
     std::string userinfo_scheme;    // Authorization scheme for it (default "Bearer")
+
+    // Fields for the sign-in provider list an unauthenticated login screen fetches.
+    // They describe how to *start* a sign-in at this provider and how to label it —
+    // none of them is a secret, and none overlaps with the credentials above. A
+    // provider that does not set `external` is not one of these: `default` and
+    // `bridge` are this installation's own applications, whose auth_uri points back
+    // at us, and "sign in through ourselves" is not a button. login_scope is the
+    // provider's OAuth scope string (e.g. Yandex "login:email login:info"), which is
+    // unrelated to `scopes` above — those are our own db.scope codes.
+    std::string login_scope;        // OAuth scope to request at the provider
+    std::string display_name;       // label for the button ("Yandex", "Google")
+    std::string icon;               // icon hint for the button (name or data URI)
+    bool        external = false;    // true = an external sign-in provider, listed
 };
 
 // ─── OAuthProviders ──────────────────────────────────────────────────────────
