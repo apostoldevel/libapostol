@@ -339,6 +339,11 @@ private:
     // Respawn rate limiting: prevent tight crash loops
     std::chrono::steady_clock::time_point last_respawn_time_{};
     int rapid_respawn_count_{0};
+
+    // The master's own EventLoop while master_run() is running, else nullptr. Lets
+    // reap_children() schedule a throttled respawn on a timer instead of ::sleep()ing
+    // inside the SIGCHLD handler, which would stall the master for the whole backoff.
+    EventLoop*               master_loop_{nullptr};
 };
 
 } // namespace apostol

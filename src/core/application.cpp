@@ -639,6 +639,11 @@ void Application::master_run()
 
     EventLoop loop;
 
+    // Visible to reap_children() so a throttled respawn is scheduled on this loop
+    // rather than run under a blocking ::sleep(). Cleared before the loop is
+    // destroyed at the end of this function.
+    master_loop_ = &loop;
+
     // Timer ID for the SIGKILL escalation one-shot timer (armed on SIGTERM).
     EventLoop::TimerId kill_timer_id = EventLoop::kInvalidTimer;
 
@@ -736,6 +741,8 @@ void Application::master_run()
     reap_children();
 
     loop.run();
+
+    master_loop_ = nullptr;
 
     logger_->notice("{} master process exiting", name_);
 }
@@ -1140,16 +1147,12 @@ void Application::reap_children()
             // the respawn with exponential backoff (1s → 2s → 4s, max 30s).
             // Resets after 60s of stable running.
             auto now = std::chrono::steady_clock::now();
+            int delay = 0;
             if (now - last_respawn_time_ < std::chrono::seconds(2))
             {
                 ++rapid_respawn_count_;
                 if (rapid_respawn_count_ > 3)
-                {
-                    auto delay = std::min(1 << (rapid_respawn_count_ - 3), 30);
-                    logger_->warn("rapid respawn detected ({} in a row) — delaying {} '{}' by {}s",
-                                  rapid_respawn_count_, role_name(respawn_role), respawn_name, delay);
-                    ::sleep(static_cast<unsigned>(delay));
-                }
+                    delay = std::min(1 << (rapid_respawn_count_ - 3), 30);
             }
             else if (now - last_respawn_time_ > std::chrono::seconds(60))
             {
@@ -1157,40 +1160,65 @@ void Application::reap_children()
             }
             last_respawn_time_ = now;
 
-            logger_->notice("respawning {} '{}'", role_name(respawn_role), respawn_name);
+            // The fork itself. It used to run right here, and the backoff above was a
+            // ::sleep() right before it — but reap_children() runs inside the master's
+            // SIGCHLD handler, so that sleep stalled the master's entire event loop:
+            // for up to 30s it reaped no other dead children and answered no signals,
+            // SIGTERM included, so a shutdown could hang half a minute. Now the fork is
+            // packaged and, when throttled, scheduled on the master loop by a one-shot
+            // timer; the master keeps turning through the delay. The rate limit itself
+            // is unchanged — a crash loop is still spaced out, just not by freezing the
+            // master to do it.
+            auto do_respawn = [this, respawn_role, respawn_name]() mutable {
+                logger_->notice("respawning {} '{}'", role_name(respawn_role), respawn_name);
 
-            if (respawn_role == ProcessRole::custom)
-            {
-                // Find the CustomProcessEntry by name and re-create the lambda
-                // so that custom_process_run() is called in the child.
-                bool found = false;
-                for (auto& cp : custom_processes_) {
-                    if (cp.name == respawn_name) {
+                if (respawn_role == ProcessRole::custom)
+                {
+                    // Find the CustomProcessEntry by name and re-create the lambda
+                    // so that custom_process_run() is called in the child.
+                    bool found = false;
+                    for (auto& cp : custom_processes_) {
+                        if (cp.name == respawn_name) {
 #ifdef WITH_POSTGRESQL
-                        fork_child(respawn_role, std::move(respawn_name),
-                            [this, &cp] { custom_process_run(*cp.process); });
+                            fork_child(respawn_role, std::move(respawn_name),
+                                [this, &cp] { custom_process_run(*cp.process); });
 #else
-                        auto fn = cp.fn;
-                        fork_child(respawn_role, std::move(respawn_name),
-                            [this, fn] {
-                                EventLoop loop;
-                                loop.add_signal(SIGTERM, [&loop](const signalfd_siginfo&) { loop.stop(); });
-                                loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
-                                fn(loop);
-                                loop.run();
-                            });
+                            auto fn = cp.fn;
+                            fork_child(respawn_role, std::move(respawn_name),
+                                [this, fn] {
+                                    EventLoop loop;
+                                    loop.add_signal(SIGTERM, [&loop](const signalfd_siginfo&) { loop.stop(); });
+                                    loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
+                                    fn(loop);
+                                    loop.run();
+                                });
 #endif
-                        found = true;
-                        break;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        logger_->error("cannot respawn custom '{}': entry not found", respawn_name);
                     }
                 }
-                if (!found) {
-                    logger_->error("cannot respawn custom '{}': entry not found", respawn_name);
+                else
+                {
+                    fork_child(respawn_role, std::move(respawn_name));
                 }
+            };
+
+            if (delay > 0 && master_loop_)
+            {
+                logger_->warn("rapid respawn detected ({} in a row) — delaying {} '{}' by {}s",
+                              rapid_respawn_count_, role_name(respawn_role), respawn_name, delay);
+                // One-shot (repeat=false): fire once after the backoff, then drop.
+                master_loop_->add_timer(std::chrono::seconds(delay),
+                    [do_respawn = std::move(do_respawn)]() mutable { do_respawn(); },
+                    /*repeat=*/false);
             }
             else
             {
-                fork_child(respawn_role, std::move(respawn_name));
+                do_respawn();
             }
         }
     }
