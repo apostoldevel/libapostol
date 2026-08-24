@@ -21,7 +21,6 @@ struct SiteOAuth2
     std::string consent;     // consent screen URL (prompt=consent)
     std::string callback;    // success redirect URL
     std::string error;       // error redirect URL
-    std::string debug;       // debug redirect URL
 };
 
 struct SiteConfig

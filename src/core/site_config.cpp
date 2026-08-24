@@ -48,8 +48,6 @@ void SiteConfigs::load(const std::filesystem::path& sites_dir)
                     site.oauth2.callback = v->get<std::string>();
                 if (auto v = o.find("error"); v != o.end() && v->is_string())
                     site.oauth2.error = v->get<std::string>();
-                if (auto v = o.find("debug"); v != o.end() && v->is_string())
-                    site.oauth2.debug = v->get<std::string>();
             }
 
             sites_.push_back(std::move(site));
