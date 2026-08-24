@@ -1088,7 +1088,12 @@ pid_t Application::fork_child(ProcessRole role, std::string child_name,
         else if (role == ProcessRole::custom && custom_fn)
             custom_fn();
 
-        std::exit(0);
+        // exit_code_, not a literal 0: a child whose startup threw sets exit_code_
+        // to 1 and returns here, and exiting 0 anyway reported a failed start to the
+        // master — and to anyone watching exit codes, the first thing a human or a
+        // monitor checks — as a clean exit. The master then logs "exited with code 0"
+        // for what was a failure.
+        std::exit(exit_code_);
     }
 
     // ── Parent (master) ────────────────────────────────────────────────────
@@ -1127,38 +1132,109 @@ void Application::reap_children()
             continue;
         }
 
-        if (WIFEXITED(status))
-            logger_->notice("{} '{}' (pid={}) exited with code {}",
-                role_name(it->role), it->name, pid, WEXITSTATUS(status));
-        else if (WIFSIGNALED(status))
-            logger_->warn("{} '{}' (pid={}) killed by signal {}",
-                role_name(it->role), it->name, pid, WTERMSIG(status));
-
         bool respawn = !it->shutting_down && !shutting_down_;
         ProcessRole respawn_role = it->role;
         std::string respawn_name = it->name;
+
+        const auto now = std::chrono::steady_clock::now();
+
+        // A crash-looping child, once its backoff has latched at the ceiling, would
+        // otherwise repeat its per-event lines below — this exit notice, the backoff
+        // warning, the respawn notice — every few seconds for as long as it lasts:
+        // thousands of lines a day on a shipboard server nobody restarts before port.
+        // We never stop retrying (a process that gives up for good is worse at sea),
+        // but past the ceiling we stop narrating each attempt and print one summary
+        // line every few minutes instead. The ramp up to the ceiling still logs each
+        // step. The storm is latched and read per child name, so one child's flood
+        // never hides another's. Recovery is decided HERE, before the exit notice: the
+        // death that ends a storm (a child up over a minute, then dead) clears the
+        // latch first, so its own exit line — the one carrying new information — still
+        // prints. Only while respawning: during shutdown these exits are expected and
+        // stay quiet on their own.
+        // The decision and the narration are split on purpose. The latch must be
+        // cleared HERE, before `storm` is read below, or the exit line of the death
+        // that ends a storm is swallowed (the latch would still read set). But the
+        // recovery NOTICE is deferred to a local and printed after the exit line, so
+        // the log reads forward: first the death, then the line saying it ended the
+        // storm — not "recovered" ahead of the exit that triggered it.
+        bool storm_ended = false;
+        int  ended_attempts = 0;
+        RespawnState* rsp = nullptr;
+        if (respawn)
+        {
+            rsp = &respawn_state_[respawn_name];
+            if (now - rsp->last_time > std::chrono::seconds(60))
+            {
+                // Stable for over a minute, then died. Clear the latch and remember
+                // whether we were in a storm — the notice comes after the exit line.
+                storm_ended    = rsp->storm;
+                ended_attempts = rsp->storm_attempts;
+                rsp->rapid_count    = 0;
+                rsp->storm          = false;
+                rsp->storm_attempts = 0;
+                rsp->last_storm_log = {};
+            }
+        }
+        const bool storm = rsp && rsp->storm;
+
+        const std::string exit_desc = WIFEXITED(status)
+            ? fmt::format("code {}", WEXITSTATUS(status))
+            : WIFSIGNALED(status) ? fmt::format("signal {}", WTERMSIG(status))
+                                  : std::string("unknown status");
+
+        if (!storm)
+        {
+            if (WIFEXITED(status))
+                logger_->notice("{} '{}' (pid={}) exited with {}",
+                    role_name(it->role), it->name, pid, exit_desc);
+            else if (WIFSIGNALED(status))
+                logger_->warn("{} '{}' (pid={}) killed by {}",
+                    role_name(it->role), it->name, pid, exit_desc);
+        }
+
+        // After the exit line: the quiet summaries stop here and silence should not be
+        // the only sign the storm ended. "since its previous exit", not "was up":
+        // last_time is stamped at reaping, so the interval is death-to-death and
+        // includes the backoff itself.
+        if (storm_ended)
+            logger_->notice("{} '{}' recovered: over a minute since its previous exit "
+                            "— storm ended after {} respawn attempts",
+                            role_name(respawn_role), respawn_name, ended_attempts);
 
         children_.erase(it);
 
         if (respawn)
         {
             // ── Respawn rate limiting ────────────────────────────────────────
-            // Prevent tight crash loops: if a child exits too quickly, delay
-            // the respawn with exponential backoff (1s → 2s → 4s, max 30s).
-            // Resets after 60s of stable running.
-            auto now = std::chrono::steady_clock::now();
+            // Prevent tight crash loops: if a child exits too quickly, delay the
+            // respawn with exponential backoff (1s → 2s → 4s, max 30s). Recovery
+            // (60s stable) is handled above, before the exit notice. All state is
+            // this child's own.
+            RespawnState& rs = *rsp;
             int delay = 0;
-            if (now - last_respawn_time_ < std::chrono::seconds(2))
+            if (now - rs.last_time < std::chrono::seconds(2))
             {
-                ++rapid_respawn_count_;
-                if (rapid_respawn_count_ > 3)
-                    delay = std::min(1 << (rapid_respawn_count_ - 3), 30);
+                ++rs.rapid_count;
+                if (rs.rapid_count > 3)
+                    // Cap the shift exponent: with no timer loop (master_loop_ null)
+                    // respawns are immediate, rapid_count can run away, and 1<<n is UB
+                    // past the width of int. 1<<5 = 32 already exceeds the 30s ceiling.
+                    delay = std::min(1 << std::min(rs.rapid_count - 3, 5), 30);
             }
-            else if (now - last_respawn_time_ > std::chrono::seconds(60))
-            {
-                rapid_respawn_count_ = 0;
-            }
-            last_respawn_time_ = now;
+            rs.last_time = now;
+
+            // Latch the storm the first time the backoff reaches its ceiling, and hold
+            // the ceiling while latched. Without the hold the delay oscillates 30→0 —
+            // after a delayed respawn the child no longer dies "fast", rapid_count stops
+            // growing and delay falls back to 0 — so the master would fork twice per
+            // ceiling window while the summary still claims "backoff at its 30s ceiling".
+            // Latched, the ceiling is real and the fork rate in a storm halves. Recovery
+            // above clears the latch.
+            if (delay >= 30)
+                rs.storm = true;
+            else if (rs.storm)
+                delay = 30;
+            const bool storm_now = rs.storm;
 
             // The fork itself. It used to run right here, and the backoff above was a
             // ::sleep() right before it — but reap_children() runs inside the master's
@@ -1169,8 +1245,17 @@ void Application::reap_children()
             // timer; the master keeps turning through the delay. The rate limit itself
             // is unchanged — a crash loop is still spaced out, just not by freezing the
             // master to do it.
-            auto do_respawn = [this, respawn_role, respawn_name]() mutable {
-                logger_->notice("respawning {} '{}'", role_name(respawn_role), respawn_name);
+            auto do_respawn = [this, respawn_role, respawn_name, quiet = storm_now]() mutable {
+                // Re-check at fire time, not only when this was scheduled: a delayed
+                // respawn could otherwise fork a new child into a master that began
+                // shutting down during the backoff. Shutdown wins that race by two
+                // orders of magnitude and the SIGKILL escalation would reap the stray
+                // anyway, but the guard removes the reasoning entirely.
+                if (shutting_down_)
+                    return;
+
+                if (!quiet)
+                    logger_->notice("respawning {} '{}'", role_name(respawn_role), respawn_name);
 
                 if (respawn_role == ProcessRole::custom)
                 {
@@ -1207,10 +1292,39 @@ void Application::reap_children()
                 }
             };
 
-            if (delay > 0 && master_loop_)
+            // Backoff logging. Up the ramp (delay 2→4→8→16s) each step is announced —
+            // there are only a few, and they show the escalation. Once the storm is
+            // latched (delay reached the 30s ceiling, and held there above) the
+            // per-attempt warning is replaced by one summary line at most every few
+            // minutes, carrying the running attempt tally and the last exit status so
+            // the operator sees the process is failing and how — without a line every
+            // few seconds. The retry never stops, only the narration does.
+            if (storm_now)
+            {
+                ++rs.storm_attempts;
+                if (rs.last_storm_log.time_since_epoch().count() == 0 ||
+                    now - rs.last_storm_log >= kStormLogInterval)
+                {
+                    logger_->warn("{} '{}' keeps failing to stay up — {} respawn attempts "
+                                  "so far, last exit {}, backoff at its 30s ceiling; still "
+                                  "retrying, this line at most every {} min",
+                                  role_name(respawn_role), respawn_name, rs.storm_attempts,
+                                  exit_desc,
+                                  std::chrono::duration_cast<std::chrono::minutes>(
+                                      kStormLogInterval).count());
+                    rs.last_storm_log = now;
+                    // storm_attempts is the running tally since the storm latched; it is
+                    // reset only on recovery, so the count only grows across summaries.
+                }
+            }
+            else if (delay > 0)
             {
                 logger_->warn("rapid respawn detected ({} in a row) — delaying {} '{}' by {}s",
-                              rapid_respawn_count_, role_name(respawn_role), respawn_name, delay);
+                              rs.rapid_count, role_name(respawn_role), respawn_name, delay);
+            }
+
+            if (delay > 0 && master_loop_)
+            {
                 // One-shot (repeat=false): fire once after the backoff, then drop.
                 master_loop_->add_timer(std::chrono::seconds(delay),
                     [do_respawn = std::move(do_respawn)]() mutable { do_respawn(); },

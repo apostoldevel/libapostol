@@ -336,9 +336,31 @@ private:
     // Can be changed by subclass before run() if needed.
     int kill_timeout_secs_{5};
 
-    // Respawn rate limiting: prevent tight crash loops
-    std::chrono::steady_clock::time_point last_respawn_time_{};
-    int rapid_respawn_count_{0};
+    // Respawn state, per child name. It has to be per child, not per application:
+    // once it gates log suppression (below), a global storm would hide a second
+    // child's crashes behind the first child's summary — the very failure the
+    // throttling exists to prevent on a ship. Keying by name also stops one child's
+    // crash frequency from setting another's backoff.
+    //
+    //   rapid_count  — consecutive rapid respawns; drives the exponential backoff
+    //                  (1→2→4…→30s), resets after 60s of staying up.
+    //   storm        — latched once the backoff first reaches its 30s ceiling, held
+    //                  through the oscillation (a delayed respawn's child dies long
+    //                  after the last respawn, so the next respawn is not "rapid" and
+    //                  its delay drops to 0; keying suppression on the delay alone
+    //                  would let those quiet halves narrate themselves). Cleared on
+    //                  recovery. While set, per-attempt lines give way to one summary
+    //                  every kStormLogInterval.
+    struct RespawnState
+    {
+        std::chrono::steady_clock::time_point last_time{};
+        int  rapid_count{0};
+        bool storm{false};
+        std::chrono::steady_clock::time_point last_storm_log{};
+        int  storm_attempts{0};
+    };
+    std::map<std::string, RespawnState> respawn_state_;
+    static constexpr auto kStormLogInterval = std::chrono::minutes(5);
 
     // The master's own EventLoop while master_run() is running, else nullptr. Lets
     // reap_children() schedule a throttled respawn on a timer instead of ::sleep()ing
