@@ -230,10 +230,24 @@ int CurlClient::socket_callback(CURL* /*easy*/, curl_socket_t s, int what,
                 curl_multi_socket_action(self->multi_, s, action, &still_running);
                 self->check_multi_info();
 
-                if (still_running <= 0 && self->timer_id_ != EventLoop::kInvalidTimer) {
-                    self->loop_.cancel_timer(self->timer_id_);
-                    self->timer_id_ = EventLoop::kInvalidTimer;
-                }
+                // Do NOT cancel the multi timer here from `still_running`. That count
+                // was read by curl_multi_socket_action ABOVE, before check_multi_info()
+                // ran the completion callbacks — and a completion callback may start a
+                // new request. AuthServer does exactly that: the token-exchange reply
+                // issues the userinfo fetch from inside its own on_done, on this same
+                // client. That new easy handle makes curl schedule a fresh kick-off
+                // timer via timer_callback, but `still_running` still reads 0 from
+                // before the handle existed. Cancelling on it killed the new transfer's
+                // only kick, and it hung until the gateway timed out — a 504 with no log
+                // line, because the userinfo callback (its first log_) was never reached.
+                // curl owns this timer: it calls timer_callback(-1) when no timer is
+                // wanted and a positive timeout when one is, so there is nothing to
+                // cancel by hand here. And removing the cancel is safe, not a leak: at
+                // worst a now-stale one-shot timer fires once, its socket_action finds
+                // no work and check_multi_info no messages — repeat=false, so no loop
+                // and nothing left armed. Do NOT restore the cancel "just in case": on
+                // the stale count it is exactly the hang this commit removes.
+                (void)still_running;
 
                 // Under APOSTOL_EPOLL_ET the fd was armed with EPOLLONESHOT
                 // and the kernel disabled further delivery. Rearm so libcurl
@@ -269,6 +283,15 @@ int CurlClient::timer_callback(CURLM* /*multi*/, long timeout_ms, void* clientp)
 
     self->timer_id_ = self->loop_.add_timer(interval,
         [self]() {
+            // Order is load-bearing: clear timer_id_ HERE, before the calls below —
+            // never after them. check_multi_info() runs completion callbacks, and a
+            // callback may start a new request (AuthServer's nested userinfo fetch),
+            // which schedules a fresh timer via timer_callback and stores its new
+            // timer_id_. Clearing to kInvalidTimer after these calls would clobber that
+            // id: the new timer would stay armed while we believe we hold none, and
+            // timer_callback would never cancel it — the same trap the socket handler
+            // above was fixed for. Clear our own (now-firing) one-shot id first, then
+            // let curl drive whatever comes next.
             self->timer_id_ = EventLoop::kInvalidTimer;
             int still_running = 0;
             curl_multi_socket_action(self->multi_, CURL_SOCKET_TIMEOUT, 0, &still_running);
