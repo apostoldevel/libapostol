@@ -1051,12 +1051,31 @@ void Application::custom_process_run(CustomProcess& proc)
             proc.heartbeat(std::chrono::system_clock::now());
         });
 
+    // 7b. PgPool heartbeat — every 60 seconds, mirroring worker_run() and
+    // helper_run(). A custom process is its own OS process with its own pool
+    // and its own LISTEN connection, and this timer was simply absent here:
+    // nothing in the process ever checked connection health. MessageServer
+    // ("outbox") and ReportServer ("report") therefore had no way at all to
+    // notice a lost subscription — the recovery path in PgPool existed but
+    // had nothing to drive it. Cancelled next to the one above, and for the
+    // same reason: the drain re-runs the loop after on_stop().
+    const auto pool_heartbeat_timer = db_pool_
+        ? loop.add_timer(std::chrono::seconds(60),
+            [this] {
+                db_pool_->heartbeat();
+                for (auto& [_, pool] : named_pools_)
+                    pool->heartbeat();
+            })
+        : EventLoop::kInvalidTimer;
+
     // 8. Event loop
     loop.run();
 
     // 9. Cleanup: on_stop() first, then stop_db() while EventLoop is still alive
     proc.on_stop();
     loop.cancel_timer(heartbeat_timer);
+    if (pool_heartbeat_timer != EventLoop::kInvalidTimer)
+        loop.cancel_timer(pool_heartbeat_timer);
     drain_db(loop);
     stop_db();
     logger_->notice("{} process '{}' exiting (pid={})",

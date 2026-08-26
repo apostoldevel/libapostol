@@ -137,7 +137,7 @@ bool PgConnection::connect_start()
     if (notice_cb_)
         PQsetNoticeProcessor(raw, &PgConnection::notice_processor, this);
 
-    fd_ = PQsocket(raw);
+    last_fd_ = PQsocket(raw);  // remembered for the log; fd() asks libpq itself
     resetting_ = false;
     return true;
 }
@@ -145,7 +145,7 @@ bool PgConnection::connect_start()
 PostgresPollingStatusType PgConnection::connect_poll()
 {
     auto ps = PQconnectPoll(conn_.get());
-    fd_ = PQsocket(conn_.get());  // docs: re-determine socket after each poll
+    last_fd_ = PQsocket(conn_.get());  // docs: re-determine socket after each poll
 
     if (ps == PGRES_POLLING_OK)
         state_ = PgConnState::Ready;
@@ -165,14 +165,14 @@ bool PgConnection::reset_start()
     PQsetnonblocking(conn_.get(), 1);  // restore nonblocking after reset
     state_ = PgConnState::Connecting;
     resetting_ = true;
-    fd_    = PQsocket(conn_.get());
+    last_fd_ = PQsocket(conn_.get());
     return true;
 }
 
 PostgresPollingStatusType PgConnection::reset_poll()
 {
     auto ps = PQresetPoll(conn_.get());
-    fd_ = PQsocket(conn_.get());  // docs: re-determine socket after each poll
+    last_fd_ = PQsocket(conn_.get());  // docs: re-determine socket after each poll
 
     if (ps == PGRES_POLLING_OK)
         state_ = PgConnState::Ready;
@@ -228,7 +228,7 @@ bool PgConnection::send_query(const std::string& sql)
 std::vector<PgResult> PgConnection::collect_results()
 {
     if (PQconsumeInput(conn_.get()) == 0) {
-        state_ = PgConnState::Error;  // connection is dead
+        state_ = PgConnState::Error;  // connection is dead; fd() now reports -1
         pending_results_.clear();
         return {};
     }
@@ -272,16 +272,37 @@ bool PgConnection::flush()
 int PgConnection::consume_notify(
     const std::function<void(const char* channel, const char* payload)>& cb)
 {
-    PQconsumeInput(conn_.get());
+    // PQconsumeInput returns 0 on failure, and by then libpq has already
+    // closed the socket (PQsocket -> -1) while keeping the PGconn object
+    // alive. Discarding that result is how an established LISTEN died for
+    // good: the connection stayed Ready, PgPool::listen() only creates a
+    // listener when listener_ is empty, and no epoll event can ever arrive
+    // on a closed fd. collect_results() above has always checked this — the
+    // check was simply missing here, which is why the failure hit the
+    // listener (idle in Ready) and not the worker connections (Busy).
+    bool alive = (PQconsumeInput(conn_.get()) != 0);
+
     int count = 0;
     PGnotify* notify;
+    // Drain what libpq already parsed even when the read failed: those
+    // notifications did arrive, and dropping them would turn one dead socket
+    // into lost work.
     while ((notify = PQnotifies(conn_.get())) != nullptr) {
         if (cb)
             cb(notify->relname, notify->extra);
         PQfreemem(notify);
         ++count;
-        PQconsumeInput(conn_.get());
+        if (alive)
+            alive = (PQconsumeInput(conn_.get()) != 0);
     }
+
+    if (!alive) {
+        // libpq has closed the socket by now; fd() reports -1 from here on,
+        // so every caller downstream sees the truth without being told.
+        state_ = PgConnState::Error;
+        return -1;
+    }
+
     return count;
 }
 
@@ -461,7 +482,23 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
             // NoticeResponse, etc.) so level-triggered EPOLLIN doesn't
             // spin.  Worker connections have no LISTEN subscriptions —
             // NOTIFY is handled by the dedicated listener_ connection.
-            conn.consume_notify(nullptr);
+            if (conn.consume_notify(nullptr) < 0) {
+                // The socket is gone and fd() is already -1, so the Error
+                // case below can never be reached for this connection:
+                // nothing will fire on an fd that no longer exists. Handle
+                // it on the spot, the same way that case does.
+                //
+                // For worker connections this is an acceleration, not a
+                // cure — heartbeat() already picks them up by PQstatus
+                // within a minute. It is the listener that had no other
+                // detector at all.
+                if (pg_logger_)
+                    pg_logger_->error("{} Connection lost while idle: {}",
+                                     conn_tag(conn), conn.error_message());
+                fail_inflight_query(conn, "connection lost");
+                if (!try_reconnect(conn))
+                    replace_connection(conn);
+            }
             break;
 
         case PgConnState::Busy: {
@@ -935,6 +972,27 @@ void PgPool::heartbeat()
         if (c->state() == PgConnState::Ready && !queue_.empty())
             dispatch_queue(*c);
     }
+
+    // The listener lives outside conns_, so the loop above never saw it — and
+    // everything else that could notice its death is event-driven. When
+    // PQconsumeInput fails libpq closes the socket itself, after which NO
+    // epoll event can arrive, ever. A timer is therefore the only thing that
+    // can observe the loss: this is the guarantee, and the return-value check
+    // in consume_notify() is only the fast path to it.
+    //
+    // It matters most where nobody is watching. A channel that is quiet by
+    // design (a vessel at sea) produces no events to ride on, and "no
+    // notifications" is indistinguishable from "no subscription".
+    if (listener_) {
+        if (listener_is_dead())
+            restart_listener("heartbeat found the listener dead");
+    } else if (!notify_handlers_.empty()) {
+        // Subscriptions outstanding and no listener object at all.
+        if (pg_logger_)
+            pg_logger_->error("PgPool: {} LISTEN channel(s) with no listener — restarting",
+                             notify_handlers_.size());
+        start_listener();
+    }
 }
 
 // ── PgPool — LISTEN / NOTIFY ──────────────────────────────────────────────────
@@ -949,6 +1007,19 @@ void PgPool::listen(const std::string& channel, NotifyHandler cb)
 
     if (!listener_) {
         start_listener();
+    } else if (listener_is_dead()) {
+        // A listener object outlives its socket: libpq closes the fd and keeps
+        // the PGconn. Without this branch the pair below was a lock — the
+        // first test saw a non-null listener_ and said nothing, the second
+        // shipped LISTEN into a corpse — and listen() is only ever called
+        // from on_start(), so the subscription was lost until the process was
+        // restarted by hand.
+        //
+        // Liveness is asked of PQstatus (connected()), never of fd(): fd() is
+        // cached at connect time and still reports the old number after libpq
+        // closes the socket. Connecting is excluded — a handshake in flight is
+        // not yet connected() and must not be torn down.
+        restart_listener("listen() found the listener dead");
     } else if (listener_->state() == PgConnState::Ready && !pending_listens_.empty()) {
         send_pending_listens();
     }
@@ -1006,17 +1077,105 @@ void PgPool::start_listener()
     });
 }
 
+bool PgPool::listener_is_dead() const
+{
+    if (!listener_)
+        return false;
+    if (listener_->state() == PgConnState::Error)
+        return true;
+    // A handshake in flight is not connected() yet and must not be torn down.
+    if (listener_->state() == PgConnState::Connecting)
+        return false;
+    return listener_->fd() < 0 || !listener_->connected();
+}
+
+void PgPool::restart_listener(std::string_view reason)
+{
+    // Copy first: `reason` is usually PQerrorMessage() pointing into the
+    // PGconn we are about to destroy.
+    const std::string why(reason);
+    const std::size_t channels = notify_handlers_.size();
+
+    if (listener_) {
+        // conn_tag() carries the fd, so a dead listener logs fd=-1 — the
+        // visible proof that libpq closed the socket under us and that no
+        // epoll event could have followed.
+        if (pg_logger_) {
+            // conn_tag() prints the CURRENT fd, which is -1 once the socket is
+            // gone. "-1" is true and unusable: this very defect was caught
+            // because a real number turned up in a log line. Print both — the
+            // number that was, and the fact that it no longer is.
+            const int fd_now = listener_->fd();
+            pg_logger_->error("{} LISTEN subscription lost ({}) — socket {} — restoring {} channel(s)",
+                             conn_tag(*listener_), why,
+                             fd_now >= 0 ? fmt::format("fd={}", fd_now)
+                                         : fmt::format("fd={} gone", listener_->last_fd()),
+                             channels);
+        }
+        // fd() is trustworthy here only because collect_results() and
+        // consume_notify() now re-read PQsocket the moment they find the
+        // socket gone. Before that it was a stale cache — measured: the loss
+        // line logged fd=22 for a socket libpq had already closed — and
+        // deregistering a stale number removes whichever connection has since
+        // been handed that fd. The pools share one EventLoop, so the victim
+        // would be some other connection going quietly deaf, nowhere near
+        // here. Fixing the cache at the source keeps every `fd() >= 0` test
+        // in this file honest, including the two outside this function.
+        if (listener_->fd() >= 0)
+            loop_.remove_io(listener_->fd());
+        listener_.reset();
+    } else if (pg_logger_) {
+        pg_logger_->error("PgPool: LISTEN subscription lost ({}) — restoring {} channel(s)",
+                         why, channels);
+    }
+
+    // Re-arm from the REGISTRY, never from a literal list of channels.
+    // WebSocketAPI subscribes to channels it reads from the database at
+    // runtime (daemon.publisher_list()); enumerating channels statically here
+    // would silently drop every one of them and take the whole dashboard
+    // publication with it, while a test on the compiled-in channels still
+    // passed.
+    for (const auto& [ch, _] : notify_handlers_)
+        pending_listens_.insert(ch);
+
+    // Safe to call unconditionally (no hot-loop risk): start_listener() itself
+    // checks next_connect_attempt_ and defers via schedule_reconnect_timer()
+    // when a connect attempt would be premature or fails again.
+    if (!notify_handlers_.empty())
+        start_listener();
+}
+
 void PgPool::send_pending_listens()
 {
     if (pending_listens_.empty() || !listener_)
         return;
 
     std::string sql;
-    for (const auto& ch : pending_listens_)
+    std::string names;
+    for (const auto& ch : pending_listens_) {
         sql += "LISTEN \"" + ch + "\";";
+        if (!names.empty())
+            names += ", ";
+        names += ch;
+    }
+
+    // Until now the word LISTEN never appeared in the log at all. The only
+    // external sign of a live subscription was the ASYNC NOTIFY line, and
+    // that says notifications ARRIVE — not that the subscription EXISTS.
+    // The two differ precisely when it matters: on a quiet channel.
+    if (pg_logger_)
+        pg_logger_->notice("{} LISTEN {}", conn_tag(*listener_), names);
+
+    auto sent = std::move(pending_listens_);
     pending_listens_.clear();
 
-    listener_->send_query(sql);  // listener → Busy
+    if (!listener_->send_query(sql)) {  // listener → Busy
+        // The channels were cleared above. Losing them here would leave a
+        // healthy listener subscribed to nothing — the same silent outcome
+        // by a different route.
+        pending_listens_ = std::move(sent);
+        restart_listener("send_query failed while shipping LISTEN");
+    }
 }
 
 void PgPool::on_listener_io(uint32_t events)
@@ -1068,35 +1227,79 @@ void PgPool::on_listener_io(uint32_t events)
         case PgConnState::Busy: {
             // Waiting for LISTEN/UNLISTEN command response
             auto results = listener_->collect_results();
-            if (results.empty())
-                break;  // still in progress
-
-            if (pg_logger_) {
-                for (const auto& r : results) {
-                    if (r.ok())
-                        pg_logger_->debug("{} Listener ResultStatus: {}", conn_tag(*listener_), r.status_string());
-                    else
-                        pg_logger_->error("{} Listener {}", conn_tag(*listener_), r.error_message());
+            if (results.empty()) {
+                // collect_results() may have found the socket dead and moved
+                // the listener to Error before returning nothing. Plain
+                // `break` dropped that discovery on the floor: the rearm at
+                // the bottom is gated on state != Error, so nothing was left
+                // to drive the Error case — the failure was detected and
+                // thrown away.
+                if (listener_->state() == PgConnState::Error) {
+                    restart_listener("PQconsumeInput failed while awaiting LISTEN");
+                    return;
                 }
+                break;  // still in progress
+            }
+
+            bool all_ok = true;
+            for (const auto& r : results) {
+                if (!r.ok())
+                    all_ok = false;
+                if (!pg_logger_)
+                    continue;
+                if (r.ok())
+                    pg_logger_->debug("{} Listener ResultStatus: {}", conn_tag(*listener_), r.status_string());
+                else
+                    pg_logger_->error("{} Listener {}", conn_tag(*listener_), r.error_message());
             }
 
             // Command completed (LISTEN/UNLISTEN returned PGRES_COMMAND_OK)
             // Send any further pending listens, or transition to Ready
             if (!pending_listens_.empty()) {
+                // send_pending_listens() can fail its send_query, call
+                // restart_listener(), and leave listener_ EMPTY: start_listener()
+                // returns without creating one inside the backoff window, and
+                // resets it when connect_start() fails. Comparing identity
+                // rather than testing for null covers the other half too — on a
+                // successful restart listener_ is a DIFFERENT connection, still
+                // in Connecting, and calling consume_notify on it would at best
+                // do nothing and at worst tear down the replacement we just made.
+                auto* before = listener_.get();
                 send_pending_listens();   // → Busy again
+                if (listener_.get() != before)
+                    return;               // listener replaced or gone — the tail is not ours
+            } else if (all_ok && pg_logger_) {
+                // The confirmation half of the pair: the command was shipped
+                // AND the server acknowledged it. This line is what tells an
+                // operator that a silent channel is subscribed rather than
+                // orphaned. Worded for both commands that land here — after an
+                // UNLISTEN "established" would name the wrong event, while the
+                // count stays right either way.
+                pg_logger_->notice("{} LISTEN active on {} channel(s)",
+                                  conn_tag(*listener_), notify_handlers_.size());
             }
             // In either case, check for notifications that arrived simultaneously
-            listener_->consume_notify([this](const char* ch, const char* payload) {
-                dispatch_notify(ch, payload);
-            });
+            if (listener_->consume_notify([this](const char* ch, const char* payload) {
+                    dispatch_notify(ch, payload);
+                }) < 0)
+            {
+                restart_listener("PQconsumeInput failed right after LISTEN");
+                return;
+            }
             break;
         }
 
         case PgConnState::Ready: {
-            // EPOLLIN: incoming notification
-            listener_->consume_notify([this](const char* ch, const char* payload) {
-                dispatch_notify(ch, payload);
-            });
+            // EPOLLIN: incoming notification — or the FIN that kills the
+            // subscription. This is the one moment the death is observable:
+            // the fd dies INSIDE this call, and there is no second event.
+            if (listener_->consume_notify([this](const char* ch, const char* payload) {
+                    dispatch_notify(ch, payload);
+                }) < 0)
+            {
+                restart_listener("PQconsumeInput failed on an idle listener");
+                return;
+            }
             // Send any pending listens accumulated while we were processing
             if (!pending_listens_.empty())
                 send_pending_listens();
@@ -1104,20 +1307,11 @@ void PgPool::on_listener_io(uint32_t events)
         }
 
         case PgConnState::Error:
-            if (pg_logger_)
-                pg_logger_->error("{} Listener Error: {}", conn_tag(*listener_), listener_->error_message());
-            loop_.remove_io(listener_->fd());
-            listener_.reset();
-            // Re-populate pending channels so they get re-LISTENed on reconnect
-            for (const auto& [ch, _] : notify_handlers_)
-                pending_listens_.insert(ch);
-            // Safe to call unconditionally (no hot-loop risk): start_listener()
-            // itself checks next_connect_attempt_ and defers via
-            // schedule_reconnect_timer() when a connect attempt would be
-            // premature or fails again.
-            if (!notify_handlers_.empty())
-                start_listener();
-            break;
+            restart_listener(listener_->error_message());
+            // start_listener() registered the replacement fd via add_io,
+            // which arms it; the old fd is gone. Skip the rearm below rather
+            // than touch a connection this handler just replaced.
+            return;
     }
 
     // Under APOSTOL_EPOLL_ET every fd is armed with EPOLLONESHOT and must be

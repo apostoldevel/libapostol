@@ -142,10 +142,31 @@ public:
     /// Flush the output buffer. Returns true when fully flushed.
     bool flush();
 
-    /// Check for NOTIFY messages. Calls cb for each one; returns count.
+    /// Check for NOTIFY messages. Calls cb for each one; returns the count,
+    /// or -1 when PQconsumeInput failed. On -1 libpq has already closed the
+    /// socket and the connection has been moved to Error — the caller MUST
+    /// react here, because no epoll event can follow a closed socket.
+    /// fd() reports -1 from that moment on — it asks libpq every time — while
+    /// last_fd() still names the number the socket had.
     int consume_notify(const std::function<void(const char* channel, const char* payload)>& cb);
 
-    int          fd()        const { return fd_; }
+    /// The connection's socket, asked of libpq every time — NOT a cached copy.
+    /// It was a cache until 2026-08-26, refreshed only by connect/reset polling,
+    /// and that is a defect generator rather than an optimisation: libpq closes
+    /// the socket by itself on any failed read, and every one of the dozen
+    /// places that set Error would have had to remember to refresh it. Miss one
+    /// and a stale number reaches loop_.remove_io(), which then deregisters
+    /// whichever connection the kernel has since handed that number — the pools
+    /// share one EventLoop, so the victim is some other connection going quietly
+    /// deaf, nowhere near the mistake. PQsocket is a struct field read, not a
+    /// syscall, and returns -1 for a null handle on its own.
+    int          fd()        const { return conn_ ? PQsocket(conn_.get()) : -1; }
+
+    /// The last socket number this connection was SEEN to have. fd() reports -1
+    /// once the socket is gone, which is honest and useless to a reader: "-1"
+    /// matches nothing in a log. Print the pair — "fd=22 gone" — so the next
+    /// defect of this shape stays catchable by its number, the way this one was.
+    int          last_fd()   const { return last_fd_; }
     bool         connected() const;
     PgConnState  state()     const { return state_; }
     void         set_state(PgConnState s) { state_ = s; }
@@ -175,7 +196,7 @@ private:
     std::string      conninfo_;
     PgConnState      state_{PgConnState::Connecting};
     PgQuery*         current_query_{nullptr};
-    int              fd_{-1};
+    int              last_fd_{-1};
     bool             resetting_{false};
     bool             needs_flush_{false};
     NoticeCallback   notice_cb_;
@@ -321,6 +342,21 @@ private:
 
     // ── Listener (dedicated connection for LISTEN/NOTIFY) ─────────────────────
     void start_listener();
+
+    /// Drop a dead listener and start a fresh one, re-arming every channel
+    /// from notify_handlers_. Re-arming reads the REGISTRY, never a literal
+    /// list of channels: WebSocketAPI subscribes to channels read from the
+    /// database at runtime, so anything enumerating channels statically would
+    /// silently drop all of them and take the whole dashboard publication
+    /// with it. `reason` is logged.
+    void restart_listener(std::string_view reason);
+
+    /// True when the listener object has outlived its connection — libpq
+    /// dropped the socket, or PQstatus says the connection is gone. False
+    /// while a handshake is still in flight, and false when there is no
+    /// listener at all (nothing to restart; see the callers).
+    bool listener_is_dead() const;
+
     void on_listener_io(uint32_t events);
     void send_pending_listens();
     void dispatch_notify(const char* channel, const char* payload);
