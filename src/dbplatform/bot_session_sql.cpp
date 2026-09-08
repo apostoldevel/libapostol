@@ -162,20 +162,29 @@ void BotSession::execute_action(std::string_view session,
     // and the search went into OAuth2 and the apibot account, where nothing was
     // broken. In that incident the bot held a session the whole time; the caller had
     // handed over an empty one, for an object it no longer tracked. One string turned
-    // a one-layer defect into a three-layer search (card T217).
+    // a one-layer defect into a three-layer search (cards T192, T217).
     //
-    // That is the incident, not a general rule: not every caller keeps a valid() gate
-    // of its own, and those that do check it before an asynchronous callback rather
-    // than inside one. The first branch below is genuinely reachable — a session does
-    // expire — so its text has to stand on its own, not merely be the one nobody
-    // reaches.
+    // That is the incident, not a general rule. Some callers keep no valid() gate of
+    // their own (MessageServer::do_send, ReportServer::do_complete and do_abort), and
+    // a gate that is kept may have been passed before an asynchronous callback rather
+    // than inside one, in which case it is stale by the time the call lands. The first
+    // branch below is genuinely reachable — a session does expire — so its text has to
+    // stand on its own, not merely be the one nobody reaches.
     //
-    // The object's own state is checked first on purpose. The convenience overload
-    // above delegates with session(), which is empty exactly when sessions_ is empty,
-    // which is exactly when valid() is already false. Test the argument first and that
-    // overload would forever blame the caller for the object's own missing session —
-    // the same misdirection, mirrored. Behaviour is unchanged either way: both are a
-    // refusal taken before the database is touched.
+    // The object's own state is tested first on purpose. Whenever the object holds no
+    // session at all, session() is empty and valid() is false together, so the
+    // convenience overload above — which delegates with session() — would, under the
+    // opposite order, blame the caller for the object's own missing session, every
+    // time. That is the same misdirection, mirrored.
+    //
+    // Neither implication is an equivalence, and one exception matters here: a session
+    // string that is itself empty leaves sessions_ non-empty, so valid() stays true
+    // while session() is empty, and the second branch does fire for what the bot
+    // produced. Its root is the emptiness filter in refresh_if_needed, which tests the
+    // raw value before the JSON is parsed — not this order of tests (card T217).
+    //
+    // Behaviour is unchanged either way: both branches refuse before the database is
+    // touched.
     if (!valid()) {
         if (on_error)
             on_error("BotSession: not authenticated:"
