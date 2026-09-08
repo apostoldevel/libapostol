@@ -152,9 +152,41 @@ void BotSession::execute_action(std::string_view session,
                                 PgQuery::ResultHandler    on_result,
                                 PgQuery::ExceptionHandler on_error)
 {
-    if (session.empty() || !valid()) {
+    // Two refusals, two texts — deliberately, and in this order.
+    //
+    // They shared one text ("not authenticated") until 08.09.2026, and it named the
+    // wrong layer. A production stack spent a day writing
+    //
+    //   TaskScheduler: action 'cancel' failed for <uuid>: BotSession: not authenticated
+    //
+    // and the search went into OAuth2 and the apibot account, where nothing was
+    // broken. In that incident the bot held a session the whole time; the caller had
+    // handed over an empty one, for an object it no longer tracked. One string turned
+    // a one-layer defect into a three-layer search (card T217).
+    //
+    // That is the incident, not a general rule: not every caller keeps a valid() gate
+    // of its own, and those that do check it before an asynchronous callback rather
+    // than inside one. The first branch below is genuinely reachable — a session does
+    // expire — so its text has to stand on its own, not merely be the one nobody
+    // reaches.
+    //
+    // The object's own state is checked first on purpose. The convenience overload
+    // above delegates with session(), which is empty exactly when sessions_ is empty,
+    // which is exactly when valid() is already false. Test the argument first and that
+    // overload would forever blame the caller for the object's own missing session —
+    // the same misdirection, mirrored. Behaviour is unchanged either way: both are a
+    // refusal taken before the database is touched.
+    if (!valid()) {
         if (on_error)
-            on_error("BotSession: not authenticated");
+            on_error("BotSession: not authenticated:"
+                     " no session obtained, or it expired");
+        return;
+    }
+
+    if (session.empty()) {
+        if (on_error)
+            on_error("BotSession: empty session passed by the caller"
+                     " (not an authentication failure)");
         return;
     }
 
