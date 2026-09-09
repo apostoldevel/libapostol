@@ -8,6 +8,31 @@
 namespace apostol
 {
 
+namespace
+{
+
+// The text a failed statement is reported with.
+//
+// PQresultErrorMessage ends in a newline, and for a status that carries no
+// message of its own it is empty — so trim, and fall back to the status name
+// rather than handing the caller an empty string it can neither log nor test.
+std::string result_error_text(const PgResult& r)
+{
+    const char* raw = r.error_message();
+    std::string msg = raw ? raw : "";
+
+    while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r' || msg.back() == ' '))
+        msg.pop_back();
+
+    if (msg.empty()) {
+        const char* st = r.status_string();
+        msg = st ? st : "query failed";
+    }
+    return msg;
+}
+
+} // namespace
+
 // ── PgResult ──────────────────────────────────────────────────────────────────
 
 PgResult::PgResult(PGresult* res)
@@ -580,7 +605,33 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                         if (pg_logger_)
                             pg_logger_->debug("Discarding results of canceled query {}", owned->id());
                     } else {
-                        owned->deliver(std::move(results));
+                        // A failed statement goes to the error handler — which until
+                        // 08.09.2026 it never did. deliver() ran whatever came back,
+                        // so every on_exception in the ecosystem was unreachable code
+                        // and an SQL error arrived dressed as a result. Callers that
+                        // did not test ok() — nearly all of them — then recorded the
+                        // failure as a success: a scheduled job whose body threw came
+                        // back 'enabled' with its next run time advanced, and nothing
+                        // was written anywhere a person would look (card T224).
+                        auto bad = std::find_if(results.begin(), results.end(),
+                            [](const PgResult& r) { return !r.ok(); });
+
+                        if (bad == results.end()) {
+                            owned->deliver(std::move(results));
+                        } else if (owned->has_exception_handler()) {
+                            owned->fail(result_error_text(*bad));
+                        } else {
+                            // Nobody to tell, so say it here rather than nowhere —
+                            // and still hand the results over. A caller without an
+                            // error handler is one that reads ok() itself, that being
+                            // the only way an error was ever visible; dropping its
+                            // call would leave a deferred HTTP response unsent and
+                            // the client waiting out its timeout.
+                            if (pg_logger_)
+                                pg_logger_->error("Query {} failed with no error handler: {}",
+                                                  owned->id(), result_error_text(*bad));
+                            owned->deliver(std::move(results));
+                        }
                     }
                 }
             }

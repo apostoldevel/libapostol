@@ -85,6 +85,17 @@ public:
     void deliver(std::vector<PgResult> results);
     void fail   (std::string_view error);
 
+    /// True if on_exception() was given a handler.
+    ///
+    /// The pool asks before routing a failed statement to fail(): a caller that
+    /// installed no error handler still has to be called, or a deferred HTTP
+    /// response is simply never sent and the client waits out its timeout. Such a
+    /// caller keeps receiving the failed results in on_result — which is what it
+    /// already inspected, since that was the only way to see an error at all —
+    /// and the pool logs the failure loudly instead of leaving it to it.
+    bool has_exception_handler() const noexcept
+    { return static_cast<bool>(exception_handler_); }
+
 private:
     static inline uint64_t next_id_{0};
 
