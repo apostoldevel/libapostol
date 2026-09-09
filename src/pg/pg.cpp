@@ -11,24 +11,51 @@ namespace apostol
 namespace
 {
 
-// The text a failed statement is reported with.
+// The text a failed statement is reported with, on one line.
 //
 // PQresultErrorMessage ends in a newline, and for a status that carries no
-// message of its own it is empty — so trim, and fall back to the status name
-// rather than handing the caller an empty string it can neither log nor test.
+// message of its own it is empty — so fall back to the status name rather than
+// handing the caller an empty string it can neither log nor test.
+//
+// The interior is folded onto one line too, which matters more than it looks: a
+// PL/pgSQL failure carries CONTEXT lines,
+//
+//     ERROR:  division by zero
+//     CONTEXT:  SQL statement "SELECT 1/0"
+//     PL/pgSQL function inline_code_block line 1 at PERFORM
+//
+// and this text does not only go to a log. TaskScheduler, ReportServer and
+// MessageServer pass it to api.set_object_label as the object's label, where a
+// three-line value is read back by people and by screens that expect one line.
 std::string result_error_text(const PgResult& r)
 {
     const char* raw = r.error_message();
     std::string msg = raw ? raw : "";
 
-    while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r' || msg.back() == ' '))
-        msg.pop_back();
+    auto is_space = [](unsigned char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+    };
 
-    if (msg.empty()) {
-        const char* st = r.status_string();
-        msg = st ? st : "query failed";
+    std::string one_line;
+    one_line.reserve(msg.size());
+    bool pending_space = false;
+    for (unsigned char c : msg) {
+        if (is_space(c)) {
+            pending_space = !one_line.empty();
+            continue;
+        }
+        if (pending_space) {
+            one_line.push_back(' ');
+            pending_space = false;
+        }
+        one_line.push_back(static_cast<char>(c));
     }
-    return msg;
+
+    if (one_line.empty()) {
+        const char* st = r.status_string();
+        one_line = st ? st : "query failed";
+    }
+    return one_line;
 }
 
 } // namespace
@@ -627,9 +654,17 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                             // the only way an error was ever visible; dropping its
                             // call would leave a deferred HTTP response unsent and
                             // the client waiting out its timeout.
+                            // The connection tag leads every other error line in
+                            // this file, and the query id appears in none of them:
+                            // the loop above prints the same text without saying
+                            // which query it belonged to. So this line repeats the
+                            // text on purpose — it is the only place the two are
+                            // joined, and a log line that cannot be read on its own
+                            // is read by nobody.
                             if (pg_logger_)
-                                pg_logger_->error("Query {} failed with no error handler: {}",
-                                                  owned->id(), result_error_text(*bad));
+                                pg_logger_->error(
+                                    "{} query {} failed and had no error handler: {}",
+                                    conn_tag(conn), owned->id(), result_error_text(*bad));
                             owned->deliver(std::move(results));
                         }
                     }
