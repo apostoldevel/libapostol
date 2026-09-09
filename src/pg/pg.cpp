@@ -55,6 +55,31 @@ std::string result_error_text(const PgResult& r)
         const char* st = r.status_string();
         one_line = st ? st : "query failed";
     }
+
+    // And capped, because this text is stored, not only printed.
+    //
+    // The LINE excerpt PostgreSQL adds is trimmed by the server, but the CONTEXT
+    // line is not: it quotes the failing statement whole, so the message grows
+    // with the statement, and db-platform builds long dynamic ones. The consumers
+    // above put this into db.object_text.label, which carries two btree indexes —
+    // an index row over roughly 2.7 KB is rejected, api.set_object_label swallows
+    // that in its EXCEPTION block and returns false, and the C++ side discards the
+    // result. The label would simply not be set, and nothing would say so: the
+    // very shape this card exists to remove, one floor down.
+    //
+    // Cut on a character boundary — messages are UTF-8 and some of this system's
+    // are Russian, raised by db-platform itself rather than by PostgreSQL, so
+    // lc_messages does not keep them ASCII.
+    constexpr std::size_t k_max_error_text = 1024;
+
+    if (one_line.size() > k_max_error_text) {
+        std::size_t cut = k_max_error_text;
+        while (cut > 0 && (static_cast<unsigned char>(one_line[cut]) & 0xC0) == 0x80)
+            --cut;
+        one_line.resize(cut);
+        one_line += "...";
+    }
+
     return one_line;
 }
 
@@ -654,16 +679,22 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                             // the only way an error was ever visible; dropping its
                             // call would leave a deferred HTTP response unsent and
                             // the client waiting out its timeout.
-                            // The connection tag leads every other error line in
-                            // this file, and the query id appears in none of them:
-                            // the loop above prints the same text without saying
-                            // which query it belonged to. So this line repeats the
-                            // text on purpose — it is the only place the two are
-                            // joined, and a log line that cannot be read on its own
-                            // is read by nobody.
+                            // Tagged and numbered, and it repeats the text on
+                            // purpose: the query id and the statement it ran are
+                            // joined nowhere else in this file. The loop above
+                            // prints the error without saying which query produced
+                            // it, and the two lines that do print a statement
+                            // ("{} Query: {}") carry no id. A log line that cannot
+                            // be read on its own is read by nobody.
+                            //
+                            // Note the text here is folded to one line while the
+                            // loop above prints libpq's raw multi-line message, so
+                            // the two are the same error in two shapes. Making that
+                            // loop fold as well would change every error line in
+                            // this file and is a decision of its own.
                             if (pg_logger_)
                                 pg_logger_->error(
-                                    "{} query {} failed and had no error handler: {}",
+                                    "{} Query {} failed and had no error handler: {}",
                                     conn_tag(conn), owned->id(), result_error_text(*bad));
                             owned->deliver(std::move(results));
                         }
