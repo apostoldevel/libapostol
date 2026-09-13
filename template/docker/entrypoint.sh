@@ -23,9 +23,18 @@ if [ -n "$PGPORT" ]; then
   PG_PARAMS+=(-p "$PGPORT")
 fi
 
-if [[ -d /var/log/$PROJECT_NAME ]]; then
-  find /var/log/"$PROJECT_NAME" -name '*.log' -delete
-fi
+# Logs are NOT cleared on start. The first version of this file deleted
+# /var/log/$PROJECT_NAME/*.log here, so a log directory kept on a volume lost
+# its history on every restart. libapostol appends (O_APPEND) and rotates by
+# size — there is nothing to protect.
+
+# Stale pid file from a run that ended in SIGKILL or a crash (a SIGTERM stop
+# removes it itself). The path is "daemon.pid" from docker/conf/default.json.
+# /run survives `docker restart`, and after the exec below the master is PID 1,
+# so the file always holds 1: check_running() (src/core/application.cpp) has no
+# "is this my own pid" guard and would refuse to start. Safe here: this script
+# is PID 1 of a fresh pid namespace, nothing from the previous run exists.
+rm -f /run/$APP_NAME.pid
 
 display_message() {
   echo "$@"
@@ -80,4 +89,7 @@ until pg_isready --timeout=1 "${PG_PARAMS[@]}" >/dev/null 2>&1; do
   fi
 done
 
-/usr/sbin/"$PROJECT_NAME" -w "$WORKER_PROCESSES"
+# exec: the application must be PID 1, or docker's SIGTERM stops a bash that
+# never forwards it and everything gets SIGKILLed after 10 s — no remove_pid_file,
+# no fast shutdown of the workers.
+exec /usr/sbin/"$PROJECT_NAME" -w "$WORKER_PROCESSES"
