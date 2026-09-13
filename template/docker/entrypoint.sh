@@ -86,7 +86,9 @@ display_message "Waiting for the database to be ready..."
 retries=10
 until pg_isready --timeout=1 "${PG_PARAMS[@]}" >/dev/null 2>&1; do
   sleep 1
-  ((retries=retries-1))
+  # not ((retries=retries-1)): under set -e that exits the script when the
+  # value reaches 0, before the message below.
+  retries=$((retries-1))
   if [ $retries -eq 0 ]; then
     display_error "Can't connect to database $PGDATABASE on $PGHOST:$PGPORT as user $PGUSER."
     exit 1
