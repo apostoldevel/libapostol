@@ -147,9 +147,10 @@ install(DIRECTORY DESTINATION ${INSTALL_PATH}/conf)
 install(DIRECTORY DESTINATION ${INSTALL_PATH}/logs)
 install(DIRECTORY DESTINATION ${INSTALL_PATH}/cache)
 
-# Install default config if present
+# Install default config if present — next to the prefix, not under conf/:
+# the binary resolves APP_PREFIX + APP_CONF_FILE (settings.cpp).
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/conf/${APP_NAME}.json")
-    install(FILES conf/${APP_NAME}.json DESTINATION ${INSTALL_PATH}/conf)
+    install(FILES conf/${APP_NAME}.json DESTINATION ${INSTALL_PATH})
 endif()
 
 # systemd unit

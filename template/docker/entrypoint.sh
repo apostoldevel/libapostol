@@ -55,10 +55,14 @@ display_configuration() {
   display_message "--------------------------------------------------------------------"
 }
 
+# The binary reads /etc/$PROJECT_NAME/$PROJECT_NAME.json — APP_PREFIX +
+# APP_CONF_FILE (settings.cpp; not conf/, since 30789c7). The first version of
+# this file put the config under conf/, where nothing looks: every container
+# ran on the compiled-in defaults ("config file ... not found, using defaults").
 init_app() {
-  mkdir -p /etc/"$PROJECT_NAME"/conf
+  mkdir -p /etc/"$PROJECT_NAME"
   push_directory /opt/"$PROJECT_NAME"
-  cp -p conf/default.json /etc/"$PROJECT_NAME"/conf/"$PROJECT_NAME".json
+  cp -p conf/default.json /etc/"$PROJECT_NAME"/"$PROJECT_NAME".json
   pop_directory
 }
 
@@ -73,7 +77,7 @@ push_directory() {
 
 display_configuration
 
-if [[ ! -f /etc/$PROJECT_NAME/conf/$PROJECT_NAME.json ]]; then
+if [[ ! -f /etc/$PROJECT_NAME/$PROJECT_NAME.json ]]; then
   init_app
 fi
 

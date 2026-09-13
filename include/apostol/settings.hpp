@@ -42,7 +42,7 @@ struct AppSettings
     std::string prefix      {APP_PREFIX};       // e.g. /etc/apostol/
     std::string conf_prefix {APP_CONF_PREFIX};  // e.g. conf/
 
-    std::filesystem::path conf_file;   // resolved: prefix + conf_prefix + APP_CONF_FILE
+    std::filesystem::path conf_file;   // resolved: prefix + APP_CONF_FILE (conf_prefix is NOT applied — 30789c7)
     std::filesystem::path pid_file;    // resolved: prefix + APP_PID_FILE
     std::filesystem::path lock_file;   // resolved: prefix + APP_LOCK_FILE
     std::filesystem::path error_log;    // resolved: prefix + APP_ERROR_LOG_FILE
