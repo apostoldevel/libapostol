@@ -161,18 +161,37 @@ void HttpProxy::forward_impl(const HttpRequest& req, SendResponse send_response,
         HttpResponse resp;
         resp.set_status(upstream_resp.status_code, upstream_resp.status_text);
 
+        // Content-Length is serialize()'s: it always writes its own from the
+        // body, so a copied one went out twice. Content-Type goes through
+        // set_body(), whose default would otherwise overwrite the copied one
+        // with text/plain — and set_header() matches the name case-sensitively,
+        // so a lowercase "content-type" from the upstream would have survived
+        // next to it. Both taken out of the loop, the type handed to set_body.
+        std::string content_type;
+        bool has_content_type = false;
         for (const auto& [k, v] : upstream_resp.headers) {
             // Skip hop-by-hop headers
             std::string lower_k = k;
             std::transform(lower_k.begin(), lower_k.end(), lower_k.begin(),
                            [](unsigned char c) { return std::tolower(c); });
-            if (lower_k == "transfer-encoding" || lower_k == "connection")
+            if (lower_k == "transfer-encoding" || lower_k == "connection"
+                || lower_k == "content-length")
                 continue;
+            if (lower_k == "content-type") {
+                content_type = v;
+                has_content_type = true;
+                continue;
+            }
             resp.add_header(k, v);
         }
 
-        if (!upstream_resp.body.empty())
-            resp.set_body(std::move(upstream_resp.body));
+        if (!upstream_resp.body.empty()) {
+            resp.set_body(std::move(upstream_resp.body), content_type);
+            if (!has_content_type)
+                resp.del_header("Content-Type");   // relay what came, invent nothing
+        } else if (has_content_type) {
+            resp.set_header("Content-Type", content_type);
+        }
 
         // Close and schedule the sweep before handing the response over: the
         // recipient may destroy this proxy, and we are inside TcpClient's
