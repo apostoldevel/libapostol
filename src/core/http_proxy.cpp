@@ -18,10 +18,12 @@ struct HttpProxy::ForwardCtx
     bool                done{false};
     bool                request_sent{false};
     EventLoop::TimerId  response_timer{EventLoop::kInvalidTimer};
+    // Life token for the response timer's callback (see HttpProxy::alive_):
+    // the destructor does not cancel the timer — the loop may be gone — the
+    // callback checks the token instead.
+    std::shared_ptr<int> alive{std::make_shared<int>(0)};
 
     explicit ForwardCtx(EventLoop& l) : loop(l), tcp(l) {}
-
-    ~ForwardCtx() { cancel_response_timer(); }
 
     void cancel_response_timer()
     {
@@ -40,11 +42,10 @@ HttpProxy::HttpProxy(EventLoop& loop, std::string_view upstream_host, uint16_t u
     , upstream_port_(upstream_port)
 {}
 
-HttpProxy::~HttpProxy()
-{
-    if (cleanup_timer_ != EventLoop::kInvalidTimer)
-        loop_.cancel_timer(cleanup_timer_);
-}
+// No loop access here on purpose: a proxy held by a module dies in
+// ~Application, after the EventLoop — a local of the run loop — is gone.
+// Pending callbacks hold weak tokens and find them expired.
+HttpProxy::~HttpProxy() = default;
 
 void HttpProxy::forward(const HttpRequest& req, SendResponse send_response,
                          std::function<void(std::string_view)> on_error)
@@ -125,9 +126,9 @@ void HttpProxy::forward_impl(const HttpRequest& req, SendResponse send_response,
 
     // Reporting a failure is the LAST thing done with ptr and this: the
     // caller's callback may destroy the proxy (a gateway dropping an upstream
-    // it just found dead), and the sweep is scheduled before it so that the
-    // destructor can cancel it. The report itself does not check `done` —
-    // the callers below do, each in its own way.
+    // it just found dead). The sweep is scheduled before it; if the proxy is
+    // gone by the time it fires, it finds its token expired. The report itself
+    // does not check `done` — the callers below do, each in its own way.
     auto report = [ptr, this](Reason reason, std::string_view msg) {
         ptr->cancel_response_timer();
         schedule_cleanup();
@@ -212,7 +213,9 @@ void HttpProxy::forward_impl(const HttpRequest& req, SendResponse send_response,
 
         // The idle timer restarts on every byte; this one does not.
         if (response_timeout.count() > 0)
-            ptr->response_timer = ptr->loop.add_timer(response_timeout, [ptr, report] {
+            ptr->response_timer = ptr->loop.add_timer(response_timeout,
+                                                      [ptr, report, alive = std::weak_ptr<int>(ptr->alive)] {
+                if (alive.expired()) return;   // context gone (proxy destroyed mid-flight)
                 ptr->response_timer = EventLoop::kInvalidTimer;
                 if (ptr->done) return;
                 ptr->done = true;
@@ -253,7 +256,9 @@ void HttpProxy::schedule_cleanup()
 {
     if (cleanup_timer_ != EventLoop::kInvalidTimer)
         return;   // one sweep pending already covers every settled context
-    cleanup_timer_ = loop_.add_timer(std::chrono::milliseconds(0), [this] {
+    cleanup_timer_ = loop_.add_timer(std::chrono::milliseconds(0),
+                                     [this, alive = std::weak_ptr<int>(alive_)] {
+        if (alive.expired()) return;   // proxy destroyed before the sweep ran
         cleanup_timer_ = EventLoop::kInvalidTimer;
         cleanup_done();
     }, /*repeat=*/false);

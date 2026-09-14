@@ -107,9 +107,13 @@ private:
     void forward_impl(const HttpRequest& req, SendResponse send_response, OnFailure on_failure);
 
     std::vector<std::unique_ptr<ForwardCtx>> contexts_;
-    // The deferred sweep of settled contexts. One pending at a time, cancelled
-    // by the destructor: it captures this, and a proxy may be destroyed in the
-    // same loop tick its last forward settles.
+    // The deferred sweep of settled contexts: one pending at a time. Its timer
+    // callback holds a weak_ptr to this token, not this — the proxy may be
+    // destroyed in the same tick its last forward settles, or as a module
+    // member in ~Application, after the EventLoop it was armed on is gone;
+    // so the destructor never touches the loop, the stale callback just
+    // finds the token expired.
+    std::shared_ptr<int> alive_{std::make_shared<int>(0)};
     EventLoop::TimerId cleanup_timer_{EventLoop::kInvalidTimer};
     void schedule_cleanup();
     void cleanup_done();
