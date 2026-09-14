@@ -248,6 +248,11 @@ public:
 
     void set_handler(Handler h) { handler_ = std::move(h); }
 
+    /// The response answers a HEAD (or is otherwise known to carry no body):
+    /// complete it at the end of the headers, whatever Content-Length says.
+    /// A parser cannot tell this from the bytes — only the requester knows.
+    void expect_no_body(bool v = true) noexcept { no_body_ = v; }
+
     /// Feed raw bytes. Returns false on parse error.
     bool feed(const char* data, std::size_t len);
 
@@ -262,6 +267,7 @@ private:
     std::string        current_field_;
     std::string        current_value_;
     bool               error_{false};
+    bool               no_body_{false};
     std::string        error_msg_;
 
     Handler handler_;

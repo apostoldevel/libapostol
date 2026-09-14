@@ -10,6 +10,7 @@
 #include <fmt/format.h>
 #include <stdexcept>
 #include <string>
+#include <strings.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -338,8 +339,19 @@ std::string HttpResponse::serialize() const
     for (const auto& [k, v] : headers_)
         out += fmt::format("{}: {}\r\n", k, v);
 
-    // Always include Content-Length
-    out += fmt::format("Content-Length: {}\r\n", body_.size());
+    // Always include Content-Length — from the body, which is what goes out.
+    // The one exception is a suppressed body carrying its own header: a HEAD
+    // answer relayed from an upstream names the size of the resource, and the
+    // body here is empty by definition, so the caller's header is the truth.
+    bool has_content_length = false;
+    if (suppress_body_)
+        for (const auto& [k, v] : headers_)
+            if (k.size() == 14 && strncasecmp(k.c_str(), "Content-Length", 14) == 0) {
+                has_content_length = true;
+                break;
+            }
+    if (!has_content_length)
+        out += fmt::format("Content-Length: {}\r\n", body_.size());
 
     out += "\r\n";
     if (!suppress_body_)
@@ -417,7 +429,9 @@ int HttpResponseParser::cb_on_headers_complete(llhttp_t* p)
     rp->current_.version = fmt::format("HTTP/{}.{}",
         llhttp_get_http_major(p), llhttp_get_http_minor(p));
 
-    return 0;
+    // 1 tells llhttp there is no body to wait for (a HEAD answer announces
+    // the resource's length and then sends nothing).
+    return rp->no_body_ ? 1 : 0;
 }
 
 int HttpResponseParser::cb_on_body(llhttp_t* p, const char* at, std::size_t len)
@@ -473,6 +487,7 @@ HttpResponseParser::HttpResponseParser(HttpResponseParser&& o) noexcept
     , current_(std::move(o.current_))
     , current_field_(std::move(o.current_field_))
     , current_value_(std::move(o.current_value_))
+    , no_body_(o.no_body_)
     , handler_(std::move(o.handler_))
 {
     if (parser_)
@@ -487,6 +502,7 @@ HttpResponseParser& HttpResponseParser::operator=(HttpResponseParser&& o) noexce
         current_       = std::move(o.current_);
         current_field_ = std::move(o.current_field_);
         current_value_ = std::move(o.current_value_);
+        no_body_       = o.no_body_;
         handler_       = std::move(o.handler_);
         if (parser_)
             parser_->data = this;

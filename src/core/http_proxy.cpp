@@ -17,6 +17,7 @@ struct HttpProxy::ForwardCtx
     OnFailure           on_failure;
     bool                done{false};
     bool                request_sent{false};
+    std::string         request_method;   // HEAD answers keep the upstream's Content-Length
     EventLoop::TimerId  response_timer{EventLoop::kInvalidTimer};
     // Life token for the response timer's callback (see HttpProxy::alive_):
     // the destructor does not cancel the timer — the loop may be gone — the
@@ -71,8 +72,11 @@ void HttpProxy::forward_impl(const HttpRequest& req, SendResponse send_response,
     auto ctx = std::make_unique<ForwardCtx>(loop_);
     auto* ptr = ctx.get();
 
-    ptr->send_response = std::move(send_response);
-    ptr->on_failure    = std::move(on_failure);
+    ptr->send_response  = std::move(send_response);
+    ptr->on_failure     = std::move(on_failure);
+    ptr->request_method = req.method;
+    if (req.method == "HEAD")
+        ptr->parser.expect_no_body();   // the upstream announces a length and sends nothing
 
     // The idle timer must not cut a response deadline short: a silent upstream
     // is reported at whichever of the two is earlier.
@@ -168,6 +172,13 @@ void HttpProxy::forward_impl(const HttpRequest& req, SendResponse send_response,
         // with text/plain — and set_header() matches the name case-sensitively,
         // so a lowercase "content-type" from the upstream would have survived
         // next to it. Both taken out of the loop, the type handed to set_body.
+        // A HEAD answer is the exception: its body is empty by definition and
+        // the upstream's Content-Length names the resource, so that one is
+        // kept and the body suppressed — serialize() then leaves it alone.
+        const bool head = (ptr->request_method == "HEAD");
+        if (head)
+            resp.suppress_body();
+
         std::string content_type;
         bool has_content_type = false;
         for (const auto& [k, v] : upstream_resp.headers) {
@@ -175,8 +186,9 @@ void HttpProxy::forward_impl(const HttpRequest& req, SendResponse send_response,
             std::string lower_k = k;
             std::transform(lower_k.begin(), lower_k.end(), lower_k.begin(),
                            [](unsigned char c) { return std::tolower(c); });
-            if (lower_k == "transfer-encoding" || lower_k == "connection"
-                || lower_k == "content-length")
+            if (lower_k == "transfer-encoding" || lower_k == "connection")
+                continue;
+            if (lower_k == "content-length" && !head)
                 continue;
             if (lower_k == "content-type") {
                 content_type = v;
