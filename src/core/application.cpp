@@ -832,6 +832,12 @@ void Application::single_run()
     catch (const std::exception& e)
     {
         logger_->error("{} startup failed: {}", name_, e.what());
+        // Same order as the normal exit below: the pool goes while the loop is
+        // alive and before ~Application. Left to ~Application it logged
+        // "Disconnected" into pg_logger_, already destroyed by then, and the
+        // process sat on the dead logger's mutex with every signal blocked
+        // for signalfd — only kill -9 ended it (T281).
+        stop_db();
         exit_code_ = 1;
         return;
     }
@@ -890,6 +896,7 @@ void Application::worker_run()
     catch (const std::exception& e)
     {
         logger_->error("{} worker startup failed: {}", name_, e.what());
+        stop_db();   // while the loop is alive, before ~Application — see single_run
         exit_code_ = 1;
         return;
     }
@@ -943,6 +950,7 @@ void Application::helper_run()
     catch (const std::exception& e)
     {
         logger_->error("{} helper startup failed: {}", name_, e.what());
+        stop_db();   // while the loop is alive, before ~Application — see single_run
         exit_code_ = 1;
         return;
     }

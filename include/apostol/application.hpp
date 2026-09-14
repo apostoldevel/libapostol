@@ -328,8 +328,13 @@ private:
     uint16_t                 http_port_{0};
 
 #ifdef WITH_POSTGRESQL
-    std::unique_ptr<PgPool>   db_pool_;
+    // The logger before the pools on purpose: members die in reverse order,
+    // and ~PgPool logs "Disconnected" into pg_logger_. Declared the other way
+    // round, a pool that outlived stop_db() logged into a destroyed Logger and
+    // hung on its dead mutex (T281). stop_db() is still the rule — ~PgPool
+    // also needs the EventLoop alive — this only removes the second trap.
     std::unique_ptr<Logger>   pg_logger_;
+    std::unique_ptr<PgPool>   db_pool_;
     std::map<std::string, std::unique_ptr<PgPool>> named_pools_;
 #endif
     WsHandler                ws_handler_;
