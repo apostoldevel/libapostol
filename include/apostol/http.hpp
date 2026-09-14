@@ -105,6 +105,12 @@ public:
 
     int status_code() const noexcept { return status_code_; }
 
+    /// Headers as they will be written, in order, duplicates included.
+    const std::vector<std::pair<std::string, std::string>>& headers() const noexcept
+    {
+        return headers_;
+    }
+
     /// Replace existing header with the same name (case-sensitive).
     HttpResponse& set_header(std::string name, std::string value);
 

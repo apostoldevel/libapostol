@@ -34,14 +34,48 @@ public:
     HttpProxy(const HttpProxy&)            = delete;
     HttpProxy& operator=(const HttpProxy&) = delete;
 
+    /// Why a forward produced no upstream response.
+    struct ForwardFailure
+    {
+        enum class Reason
+        {
+            connect,           // nothing reached the upstream: refused, unreachable, connect timeout, TLS
+            idle_timeout,      // set_timeout() elapsed with no byte from the upstream
+            response_timeout,  // set_response_timeout() elapsed before the last byte
+            closed,            // upstream closed the connection before a full response
+            other,             // any other socket error after the request went out
+        };
+        Reason           reason;
+        std::string_view message;   // TcpClient's text, for the log — classify by reason, not by it
+        /// True once the request was handed to the connected socket. A caller
+        /// that retries on another upstream must not do so after this point:
+        /// the first upstream may have executed the request. Equivalent to
+        /// reason != Reason::connect.
+        bool request_sent;
+    };
+    using OnFailure = std::function<void(const ForwardFailure&)>;
+
     /// Forward an incoming request to the upstream and call send_response with the result.
+    /// Without on_error a failure is answered 502 through send_response.
     void forward(const HttpRequest& req, SendResponse send_response,
                  std::function<void(std::string_view)> on_error = {});
+
+    /// Same, with the failure reported as a ForwardFailure — for a caller
+    /// that has to know whether a retry is still safe.
+    void forward(const HttpRequest& req, SendResponse send_response, OnFailure on_failure);
 
     /// Idle timeout of the upstream connection — TcpClient's idle timer, re-armed
     /// by every byte received, not a limit on the whole exchange. Unless
     /// set_connect_timeout() was called it bounds the connect as well.
     void set_timeout(std::chrono::milliseconds ms) { timeout_ = ms; }
+
+    /// Deadline on the whole answer: from the request being handed to the
+    /// socket to the last byte of the response. The idle timer above never
+    /// fires on an upstream that keeps trickling bytes; this one does. Zero —
+    /// the default — disables it. While it is set the idle timer is armed with
+    /// max(set_timeout(), this), so a silent upstream is reported at whichever
+    /// is earlier and a deadline longer than the idle default (30 s) is reachable.
+    void set_response_timeout(std::chrono::milliseconds ms) { response_timeout_ = ms; }
 
     /// Connect timeout on its own. A proxy that may retry elsewhere wants a
     /// short connect (nothing has been sent yet, so a retry is safe) and a long
@@ -67,9 +101,17 @@ private:
     uint16_t    upstream_port_;
     std::chrono::milliseconds timeout_{30000};
     std::chrono::milliseconds connect_timeout_{0};
+    std::chrono::milliseconds response_timeout_{0};
     bool append_forwarded_for_{true};
 
+    void forward_impl(const HttpRequest& req, SendResponse send_response, OnFailure on_failure);
+
     std::vector<std::unique_ptr<ForwardCtx>> contexts_;
+    // The deferred sweep of settled contexts. One pending at a time, cancelled
+    // by the destructor: it captures this, and a proxy may be destroyed in the
+    // same loop tick its last forward settles.
+    EventLoop::TimerId cleanup_timer_{EventLoop::kInvalidTimer};
+    void schedule_cleanup();
     void cleanup_done();
 
 #ifdef WITH_SSL
