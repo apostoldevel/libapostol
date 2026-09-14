@@ -38,10 +38,12 @@ void HttpProxy::forward(const HttpRequest& req, SendResponse send_response,
     ptr->send_response = std::move(send_response);
     ptr->on_error      = std::move(on_error);
 
-    if (timeout_.count() > 0) {
-        ptr->tcp.set_connect_timeout(timeout_);
+    if (timeout_.count() > 0)
         ptr->tcp.set_idle_timeout(timeout_);
-    }
+
+    const auto connect_timeout = connect_timeout_.count() > 0 ? connect_timeout_ : timeout_;
+    if (connect_timeout.count() > 0)
+        ptr->tcp.set_connect_timeout(connect_timeout);
 
 #ifdef WITH_SSL
     if (tls_enabled_)
@@ -74,8 +76,10 @@ void HttpProxy::forward(const HttpRequest& req, SendResponse send_response,
     if (!has_content_length && !req.body.empty())
         serialized += fmt::format("Content-Length: {}\r\n", req.body.size());
 
-    // Add X-Forwarded-For
-    if (!req.peer_ip.empty())
+    // Add X-Forwarded-For — appended to whatever the request already carries,
+    // so a caller behind an outer proxy turns this off and keeps the one header
+    // that names the client (set_append_forwarded_for).
+    if (append_forwarded_for_ && !req.peer_ip.empty())
         serialized += fmt::format("X-Forwarded-For: {}\r\n", req.peer_ip);
 
     serialized += "Connection: close\r\n\r\n";

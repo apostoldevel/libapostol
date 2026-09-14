@@ -148,6 +148,19 @@ public:
     /// If no handler is registered, upgrade requests receive 404.
     void set_ws_handler(WsHandler h);
 
+    /// Consulted before the handshake for every upgrade request, once a
+    /// ws_handler is registered. Return true to proceed to ws_upgrade(); return
+    /// false to refuse — fill @p resp (status, body) and it goes out as an
+    /// ordinary HTTP response: no 101, the connection follows the usual
+    /// keep-alive rules. A refusal left at a 2xx status is sent as 403.
+    /// Without this a module could refuse only AFTER the 101, with a close
+    /// frame: ws_upgrade() writes the handshake before ws_handler runs.
+    /// One filter per Application — it sees every upgrade path.
+    using WsUpgradeFilter =
+        std::function<bool(const HttpRequest&, HttpResponse&)>;
+
+    void set_ws_upgrade_filter(WsUpgradeFilter f);
+
     /// Read "module.<name>.enable" from config (default: true).
     /// Mirrors v1 CApostolModule::Enabled() / [module/<Name>] enable=true pattern.
     /// Public so create_workers() / create_helpers() / create_processes() in
@@ -320,6 +333,7 @@ private:
     std::map<std::string, std::unique_ptr<PgPool>> named_pools_;
 #endif
     WsHandler                ws_handler_;
+    WsUpgradeFilter          ws_upgrade_filter_;
     EventLoop*               worker_loop_{nullptr};
     std::unique_ptr<Logger>  stream_logger_;
 

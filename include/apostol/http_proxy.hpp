@@ -38,7 +38,22 @@ public:
     void forward(const HttpRequest& req, SendResponse send_response,
                  std::function<void(std::string_view)> on_error = {});
 
+    /// Idle timeout of the upstream connection — TcpClient's idle timer, re-armed
+    /// by every byte received, not a limit on the whole exchange. Unless
+    /// set_connect_timeout() was called it bounds the connect as well.
     void set_timeout(std::chrono::milliseconds ms) { timeout_ = ms; }
+
+    /// Connect timeout on its own. A proxy that may retry elsewhere wants a
+    /// short connect (nothing has been sent yet, so a retry is safe) and a long
+    /// response wait; one knob for both left one of them wrong. Zero — the
+    /// default — keeps the old behaviour: connect is bounded by set_timeout().
+    void set_connect_timeout(std::chrono::milliseconds ms) { connect_timeout_ = ms; }
+
+    /// Whether forward() appends "X-Forwarded-For: <peer_ip>" to the upstream
+    /// request (on by default). A caller sitting behind an outer proxy already
+    /// carries the client's address in that header and wants exactly one:
+    /// the address this proxy would add is the inner hop, not the client.
+    void set_append_forwarded_for(bool on) { append_forwarded_for_ = on; }
 
 #ifdef WITH_SSL
     void set_tls(bool enable = true) { tls_enabled_ = enable; }
@@ -51,6 +66,8 @@ private:
     std::string upstream_host_;
     uint16_t    upstream_port_;
     std::chrono::milliseconds timeout_{30000};
+    std::chrono::milliseconds connect_timeout_{0};
+    bool append_forwarded_for_{true};
 
     std::vector<std::unique_ptr<ForwardCtx>> contexts_;
     void cleanup_done();

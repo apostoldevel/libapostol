@@ -103,6 +103,8 @@ public:
     /// Overload that takes a typed enum and fills in the standard reason phrase.
     HttpResponse& set_status(HttpStatus status);
 
+    int status_code() const noexcept { return status_code_; }
+
     /// Replace existing header with the same name (case-sensitive).
     HttpResponse& set_header(std::string name, std::string value);
 

@@ -1765,6 +1765,11 @@ void Application::set_ws_handler(WsHandler h)
     ws_handler_ = std::move(h);
 }
 
+void Application::set_ws_upgrade_filter(WsUpgradeFilter f)
+{
+    ws_upgrade_filter_ = std::move(f);
+}
+
 // ─── HTTP server ─────────────────────────────────────────────────────────────
 
 void Application::start_http_server(EventLoop& loop, uint16_t port)
@@ -1831,6 +1836,19 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
 
                                             if (ws_handler_ && is_ws_upgrade(req))
                                             {
+                                                // Refusal BEFORE the handshake: resp goes out below
+                                                // as ordinary HTTP. A filter that refused and left
+                                                // the status at 2xx forgot to set it — an upgrade
+                                                // request answered 200 without Upgrade is a client
+                                                // stuck waiting, so make it a plain refusal.
+                                                if (ws_upgrade_filter_ && !ws_upgrade_filter_(req, resp))
+                                                {
+                                                    if (resp.status_code() < 300)
+                                                        resp.set_status(403, "Forbidden")
+                                                            .set_body("WebSocket upgrade refused");
+                                                    return;
+                                                }
+
                                                 auto ws_opt = ws_upgrade(*http_conn, req);
                                                 if (ws_opt)
                                                 {
