@@ -1,8 +1,11 @@
 #include "apostol/config.hpp"
 
+#include <cctype>
+#include <charconv>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <fstream>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -121,6 +124,86 @@ std::string Config::get_string(std::string_view key_path, std::string_view defau
     return node->get<std::string>();
 }
 
+// ─── Values taken from the environment ───────────────────────────────────────
+//
+// expand_all substitutes "${VAR}" inside string nodes only, so a flag or a
+// number written as "${VAR}" reaches the accessor as a string: get_bool and
+// get_int read it. An unset variable expands to "" — an empty or blank string
+// is an absent key to the defaulted forms and an error to the required ones.
+
+namespace
+{
+
+std::string_view trim(std::string_view s)
+{
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())))
+        s.remove_prefix(1);
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
+        s.remove_suffix(1);
+    return s;
+}
+
+// true|false|1|0|yes|no|on|off, any case, surrounding blanks ignored.
+std::optional<bool> parse_bool(std::string_view s)
+{
+    std::string w;
+    for (char c : trim(s))
+        w += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (w == "true" || w == "1" || w == "yes" || w == "on")
+        return true;
+    if (w == "false" || w == "0" || w == "no" || w == "off")
+        return false;
+    return std::nullopt;
+}
+
+// A whole decimal integer with an optional sign; nothing else. Sets
+// @p out_of_range when it is an integer but does not fit in 64 bits.
+std::optional<std::int64_t> parse_int(std::string_view s, bool& out_of_range)
+{
+    out_of_range = false;
+    s = trim(s);
+    if (s.size() > 1 && s.front() == '+' && std::isdigit(static_cast<unsigned char>(s[1])))
+        s.remove_prefix(1);
+    if (s.empty())
+        return std::nullopt;
+    std::int64_t v{};
+    auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (end != s.data() + s.size())
+        return std::nullopt;
+    if (ec == std::errc::result_out_of_range)
+    {
+        out_of_range = true;
+        return std::nullopt;
+    }
+    if (ec != std::errc{})
+        return std::nullopt;
+    return v;
+}
+
+// The offending value as an error message shows it: trimmed, one line,
+// no longer than a glance — it came from the environment, and a stray
+// newline or a paste of the wrong variable must not break the log.
+std::string shown(std::string_view s)
+{
+    std::string out;
+    for (char c : trim(s).substr(0, 64))
+        out += (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
+    if (trim(s).size() > 64)
+        out += "...";
+    return out;
+}
+
+[[noreturn]] void throw_not_int(std::string_view key_path, const std::string& s, bool out_of_range)
+{
+    if (out_of_range)
+        throw ConfigError(fmt::format("config key '{}' is out of range for a 64-bit integer: '{}'",
+                                      key_path, shown(s)));
+    throw ConfigError(
+        fmt::format("config key '{}' must be an integer, got string '{}'", key_path, shown(s)));
+}
+
+} // namespace
+
 // ─── Integer accessors ───────────────────────────────────────────────────────
 
 std::int64_t Config::get_int(std::string_view key_path) const
@@ -128,6 +211,17 @@ std::int64_t Config::get_int(std::string_view key_path) const
     const auto* node = navigate(key_path);
     if (!node)
         throw ConfigError(fmt::format("required config key '{}' not found", key_path));
+    if (node->is_string())
+    {
+        const auto& s = node->get_ref<const std::string&>();
+        if (trim(s).empty())
+            throw ConfigError(fmt::format(
+                "required config key '{}' is empty (an unset environment variable?)", key_path));
+        bool out_of_range = false;
+        if (auto v = parse_int(s, out_of_range))
+            return *v;
+        throw_not_int(key_path, s, out_of_range);
+    }
     if (!node->is_number_integer())
         throw ConfigError(
             fmt::format("config key '{}' must be an integer, got {}", key_path, node->type_name()));
@@ -139,6 +233,16 @@ std::int64_t Config::get_int(std::string_view key_path, std::int64_t default_val
     const auto* node = navigate(key_path);
     if (!node || node->is_null())
         return default_value;
+    if (node->is_string())
+    {
+        const auto& s = node->get_ref<const std::string&>();
+        if (trim(s).empty())
+            return default_value;
+        bool out_of_range = false;
+        if (auto v = parse_int(s, out_of_range))
+            return *v;
+        throw_not_int(key_path, s, out_of_range);
+    }
     if (!node->is_number_integer())
         throw ConfigError(
             fmt::format("config key '{}' must be an integer, got {}", key_path, node->type_name()));
@@ -152,6 +256,18 @@ bool Config::get_bool(std::string_view key_path) const
     const auto* node = navigate(key_path);
     if (!node)
         throw ConfigError(fmt::format("required config key '{}' not found", key_path));
+    if (node->is_string())
+    {
+        const auto& s = node->get_ref<const std::string&>();
+        if (trim(s).empty())
+            throw ConfigError(fmt::format(
+                "required config key '{}' is empty (an unset environment variable?)", key_path));
+        if (auto v = parse_bool(s))
+            return *v;
+        throw ConfigError(fmt::format(
+            "config key '{}' must be a bool (true|false|1|0|yes|no|on|off), got string '{}'",
+            key_path, shown(s)));
+    }
     if (!node->is_boolean())
         throw ConfigError(fmt::format("config key '{}' must be a bool, got {}", key_path, node->type_name()));
     return node->get<bool>();
@@ -162,6 +278,17 @@ bool Config::get_bool(std::string_view key_path, bool default_value) const
     const auto* node = navigate(key_path);
     if (!node || node->is_null())
         return default_value;
+    if (node->is_string())
+    {
+        const auto& s = node->get_ref<const std::string&>();
+        if (trim(s).empty())
+            return default_value;
+        if (auto v = parse_bool(s))
+            return *v;
+        throw ConfigError(fmt::format(
+            "config key '{}' must be a bool (true|false|1|0|yes|no|on|off), got string '{}'",
+            key_path, shown(s)));
+    }
     if (!node->is_boolean())
         throw ConfigError(fmt::format("config key '{}' must be a bool, got {}", key_path, node->type_name()));
     return node->get<bool>();

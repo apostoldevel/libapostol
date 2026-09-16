@@ -227,6 +227,32 @@ target_link_libraries(my_app PRIVATE apostol)
 Feature flags (`WITH_POSTGRESQL`, `WITH_SSL`, `WITH_CURL`) are propagated as
 `PUBLIC` compile definitions, so consuming targets get them automatically.
 
+### Configuration from the environment
+
+Every string value in the JSON config may reference an environment variable —
+`"${VAR}"` or `"$VAR"` — expanded every time the file is loaded, the SIGHUP
+reload included. An unset variable expands to an empty string. Since expansion works on strings
+only, a flag or a number that the deployment decides is written as a string,
+and `Config::get_bool` / `Config::get_int` read it:
+
+```json
+{
+  "module":   { "GatewayAPI": { "enable": "${GATEWAY_ENABLE}" } },
+  "server":   { "port": "${PORT}" },
+  "database": { "password": "${DB_PASSWORD}" }
+}
+```
+
+`get_bool` accepts `true|false|1|0|yes|no|on|off` in any case; `get_int` a whole
+decimal integer. An empty or blank string (the variable is not set) counts as
+an absent key: the accessor with a default returns the default, the one without
+throws `ConfigError`. Any other string throws `ConfigError` naming the key and
+the value — nothing is guessed (`GATEWAY_ENABLE=maybe` → `config key
+'module.GatewayAPI.enable' must be a bool (…), got string 'maybe'`). Where that
+lands depends on who reads the key: the master's own settings fail the start;
+a module flag is read when a worker starts, so the worker exits and the master
+respawns it with a backoff — the error line repeats until the variable is fixed.
+
 ## Build (standalone development)
 
 ```bash
