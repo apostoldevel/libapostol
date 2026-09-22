@@ -122,6 +122,34 @@ std::string_view status_text(HttpStatus s) noexcept
     return "Unknown";
 }
 
+std::optional<HttpStatus> status_from_code(int code) noexcept
+{
+    switch (static_cast<HttpStatus>(code)) {
+        case HttpStatus::switching_protocols:
+        case HttpStatus::ok:
+        case HttpStatus::created:
+        case HttpStatus::no_content:
+        case HttpStatus::moved_permanently:
+        case HttpStatus::found:
+        case HttpStatus::not_modified:
+        case HttpStatus::bad_request:
+        case HttpStatus::unauthorized:
+        case HttpStatus::forbidden:
+        case HttpStatus::not_found:
+        case HttpStatus::not_allowed:
+        case HttpStatus::conflict:
+        case HttpStatus::gone:
+        case HttpStatus::unprocessable_entity:
+        case HttpStatus::too_many_requests:
+        case HttpStatus::internal_server_error:
+        case HttpStatus::not_implemented:
+        case HttpStatus::bad_gateway:
+        case HttpStatus::service_unavailable:
+            return static_cast<HttpStatus>(code);
+    }
+    return std::nullopt;
+}
+
 // ─── HttpRequest ─────────────────────────────────────────────────────────────
 
 std::string HttpRequest::header(std::string_view name) const

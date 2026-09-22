@@ -83,10 +83,18 @@ int check_pg_error(std::string_view json, std::string& error_message,
                    std::string& error_id);
 
 /// Map a PG/application error code to an HTTP status.
-/// Mirrors v1 ErrorCodeToStatus().
 ///   - code >= 10000: divide by 100 (e.g. 40100 → 401)
-///   - 401,403,404,500 → respective HttpStatus
-///   - else → 400 bad_request
+///   - a 4xx/5xx status this library knows → itself (409 and 503 included)
+///   - anything else, 2xx and 3xx among it → 400 bad_request
+///
+/// What a caller must be able to trust is that the refusal it reads on the
+/// status line is the one the database declared. The note at the definition
+/// says why only refusals are relayed, and where the "the code is a status"
+/// premise does not hold — read it before adding a member to HttpStatus.
+///
+/// v1's ErrorCodeToStatus(), which this once mirrored, has neither the /100
+/// rule nor anything past the four codes above; a v1 and a v2 brand answer the
+/// same database refusal with different statuses.
 HttpStatus error_code_to_status(int error_code);
 
 /// URL-encode form params to a JSON object string.

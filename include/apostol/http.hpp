@@ -50,6 +50,15 @@ enum class HttpStatus : int {
 /// Return the standard reason phrase for a status code (e.g. "Not Found").
 std::string_view status_text(HttpStatus s) noexcept;
 
+/// The HttpStatus @p code names, or nothing when it names none of them.
+///
+/// The counterpart of status_text: that one turns a status into a phrase, this
+/// one turns a number back into a status. A number that arrives from outside —
+/// a database's error envelope, an upstream's status line — is not a status
+/// until it is recognised as one, and casting it blindly produces a status line
+/// this library has no reason phrase for.
+std::optional<HttpStatus> status_from_code(int code) noexcept;
+
 // ─── HttpRequest ─────────────────────────────────────────────────────────────
 
 struct HttpRequest
