@@ -164,7 +164,41 @@ int Application::run(int argc, char* argv[])
     }
 
     init_logging();
-    load_config();
+
+    // A configuration this process cannot use is the operator's error, and the
+    // answer to it is a message and a non-zero exit — not a core dump. Without
+    // this catch the ConfigError load_config() throws reached no handler at all:
+    // std::terminate, SIGABRT, rc 134 and a memory image written to disk — on
+    // every start of a misconfigured service, and on every -t, whose whole
+    // purpose is to report that verdict BY exit code. So -t could report success
+    // and nothing else: a parse error, an empty file and a config that parses but
+    // fails validate() all aborted alike.
+    //
+    // Reporting the failure belongs here rather than in load_config(), because
+    // only the caller knows what was being attempted: a start that will not
+    // happen, or a reload that changes nothing (single_run's SIGHUP below).
+    // load_config() therefore logs the per-key validation errors, which name
+    // things this line cannot, and leaves the verdict to whoever asked for it.
+    //
+    // ConfigError only. Anything else escaping load_config() is this library's
+    // fault rather than the operator's, and for that a crash is still the honest
+    // answer — unlike the catch (std::exception) further down around
+    // start_process(), which stands after the configuration is known good and
+    // where any failure left IS the run failing.
+    try
+    {
+        load_config();
+    }
+    catch (const ConfigError& e)
+    {
+        if (test_config_)
+            logger_->error("configuration '{}' test failed: {}",
+                config_file_.string(), e.what());
+        else
+            logger_->error("configuration '{}' cannot be used: {}",
+                config_file_.string(), e.what());
+        return 1;
+    }
 
     // Install crash handler now that we know the error log path.
     // Re-registers in every child process too (see worker_run/helper_run/single_run).
@@ -425,46 +459,50 @@ void Application::init_logging()
 
 void Application::load_config()
 {
+    // Nothing of this process changes until the whole configuration is in hand.
+    // Reading into locals is what lets a caller say "keeping old config" and be
+    // telling the truth: parsing is not the last step that can fail, and it is
+    // not even the likely one. AppSettings::populate() throws ConfigError out of
+    // the typed getters on a value of the wrong type ("workers": "abc", a
+    // ${VAR} substitution that did not resolve to a number) and assigns field by
+    // field, so populating the live settings_ in place left it half-new on the
+    // way out — and its first lines recompute every path under prefix. A reload
+    // that was refused would already have moved the pid file and the logs.
+    std::unique_ptr<Config> cfg;
+
     if (!std::filesystem::exists(config_file_))
     {
         logger_->notice("config file '{}' not found, using defaults",
             config_file_.string());
-        config_ = std::make_unique<Config>(Config::from_string("{}"));
+        cfg = std::make_unique<Config>(Config::from_string("{}"));
     }
     else
     {
-        try
-        {
-            config_ = std::make_unique<Config>(Config::from_file(config_file_));
-        }
-        catch (const ConfigError& e)
-        {
-            logger_->error("failed to load config: {}", e.what());
-            throw;
-        }
+        cfg = std::make_unique<Config>(Config::from_file(config_file_));
     }
 
-    // Populate AppSettings from JSON (CMake defaults are the baseline)
-    settings_.populate(*config_);
+    // Populate a copy — see above. The CMake defaults are the baseline, so the
+    // copy starts from what is already in force.
+    AppSettings next = settings_;
+    next.populate(*cfg);
 
     // Strict validation — collect ALL errors before deciding what to do
-    auto errors = settings_.validate();
+    auto errors = next.validate();
     if (!errors.empty())
     {
         for (auto& e : errors)
             logger_->error("configuration error [{}]: {}", e.key, e.message);
 
         if (test_config_)
-        {
-            logger_->error("configuration test failed ({} error(s))", errors.size());
             throw ConfigError(fmt::format("configuration has {} error(s)", errors.size()));
-        }
-        else
-        {
-            logger_->warn("configuration has {} error(s) — applying defaults for invalid values",
-                errors.size());
-        }
+
+        logger_->warn("configuration has {} error(s) — applying defaults for invalid values",
+            errors.size());
     }
+
+    // Accepted: both at once, and only now is anything of this process touched.
+    config_   = std::move(cfg);
+    settings_ = std::move(next);
 
     // Apply log level from settings
     try
@@ -812,7 +850,24 @@ void Application::single_run()
     loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
     loop.add_signal(SIGHUP, [this](const signalfd_siginfo&) {
         logger_->notice("SIGHUP — reconfiguring");
-        load_config();
+        // A reload that cannot be read leaves the process running on what it
+        // already has. The ConfigError went uncaught out of a signal callback on
+        // the loop, so reloading a broken file killed a WORKING single-process
+        // instance: std::terminate, SIGABRT, and the service gone over an edit
+        // that never took effect. "Keeping old config" is exact, not a figure of
+        // speech: load_config() builds the new configuration in locals and swaps
+        // both it and the settings in one step at the end, so a refusal leaves
+        // nothing half-applied. on_reload() is skipped with it, because nothing
+        // was reconfigured.
+        try
+        {
+            load_config();
+        }
+        catch (const ConfigError& e)
+        {
+            logger_->error("config reload failed: {} — keeping old config", e.what());
+            return;
+        }
         on_reload();
     });
     loop.add_signal(SIGUSR1, [this](const signalfd_siginfo&) {
@@ -1405,11 +1460,19 @@ void Application::graceful_shutdown()
 
 void Application::rolling_restart()
 {
-    // Reload config and re-populate settings
+    // Reload config and re-populate settings. Into locals first, and swapped in
+    // one step: populate() assigns field by field and throws from the typed
+    // getters on a value of the wrong type, so doing this in place made the
+    // message below false — the master kept a configuration it had just
+    // refused, with every path under prefix already recomputed. Same shape as
+    // load_config(), and for the same reason.
     try
     {
-        config_ = std::make_unique<Config>(Config::from_file(config_file_));
-        settings_.populate(*config_);
+        auto cfg = std::make_unique<Config>(Config::from_file(config_file_));
+        AppSettings next = settings_;
+        next.populate(*cfg);
+        config_   = std::move(cfg);
+        settings_ = std::move(next);
     }
     catch (const ConfigError& e)
     {
