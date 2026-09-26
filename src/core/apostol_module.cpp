@@ -168,13 +168,9 @@ void ApostolModule::add_allowed_origin(std::string origin)
 
 void ApostolModule::load_allowed_origins(const OAuthProviders& providers)
 {
-    for (const auto& origin : providers.allowed_origins()) {
-        bool found = false;
-        for (const auto& o : allowed_origins_)
-            if (o == origin) { found = true; break; }
-        if (!found)
-            allowed_origins_.push_back(origin);
-    }
+    // A reference, not a copy — see the header. The application's providers
+    // are declared before its module manager, so they outlive every module.
+    origin_providers_ = &providers;
 }
 
 void ApostolModule::add_allowed_header(std::string header)
@@ -189,6 +185,11 @@ bool ApostolModule::is_origin_allowed(std::string_view origin) const
         if (o == "*" || o == origin)
             return true;
     }
+    if (origin_providers_)
+        for (const auto& app : origin_providers_->apps())
+            for (const auto& o : app.javascript_origins)
+                if (o == "*" || o == origin)
+                    return true;
     return false;
 }
 

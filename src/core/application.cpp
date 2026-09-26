@@ -165,6 +165,10 @@ int Application::run(int argc, char* argv[])
 
     init_logging();
 
+    // The base every configuration file is applied onto — the build's
+    // defaults, set_info() and -p, before any file (see base_settings_).
+    base_settings_ = settings_;
+
     // A configuration this process cannot use is the operator's error, and the
     // answer to it is a message and a non-zero exit — not a core dump. Without
     // this catch the ConfigError load_config() throws reached no handler at all:
@@ -204,17 +208,8 @@ int Application::run(int argc, char* argv[])
     // Re-registers in every child process too (see worker_run/helper_run/single_run).
     install_crash_handler(settings_.error_log.string());
 
-    // CLI -w overrides config workers (mirrors v1 DefaultCommands: skip config if CLI set)
-    if (cli_workers_ >= 0)
-        settings_.workers = cli_workers_;
-
-    // CLI -l overrides config locale; then apply to process (mirrors v1 DefaultLocale.SetLocale)
-    if (!locale_.empty())
-        settings_.locale = locale_;
-    if (!settings_.locale.empty())
-        if (::setlocale(LC_ALL, settings_.locale.c_str()) == nullptr)
-            logger_->warn("setlocale('{}') failed — using system default locale",
-                settings_.locale);
+    // CLI -w and -l, and the locale itself, are applied with the configuration
+    // (read_config / apply_config), so that a reload does the same.
 
     if (test_config_)
     {
@@ -508,9 +503,11 @@ Application::StagedConfig Application::read_config(bool reload) const
         staged.config = std::make_unique<Config>(Config::from_file(config_file_));
     }
 
-    // Populate a copy — see above. The CMake defaults are the baseline, so the
-    // copy starts from what is already in force.
-    staged.settings = settings_;
+    // Populate a copy — see above — of the base: the build's defaults and -p,
+    // not what is in force now. From what is in force, a key removed from the
+    // file kept its old value on a reload while a start would give it the
+    // default: one file, two results.
+    staged.settings = base_settings_;
     staged.settings.populate(*staged.config);
 
     // Strict validation — collect ALL errors, log each (they name keys the
@@ -518,6 +515,19 @@ Application::StagedConfig Application::read_config(bool reload) const
     // start: -t exists to predict the start, and a start used to go on after
     // "applying defaults for invalid values" — which it never did; a zero
     // port or 300 workers went into service as written.
+    // The command line over the file — CLI -w over "workers" (mirrors v1
+    // DefaultCommands: skip config if CLI set), -l over "locale" — before the
+    // check, so that what is checked is what the process will run with:
+    // applied after it, -w 1000 went past the limit of 256 that the same
+    // number in the file would not. And on every reading, not only at start:
+    // a reload of a file carrying the key took the flag away — a container
+    // started with -w $WORKER_PROCESSES came back from SIGHUP with the file's
+    // number of workers.
+    if (cli_workers_ >= 0)
+        staged.settings.workers = cli_workers_;
+    if (!locale_.empty())
+        staged.settings.locale = locale_;
+
     auto errors = staged.settings.validate();
     if (!errors.empty())
     {
@@ -567,6 +577,14 @@ void Application::apply_config(StagedConfig&& staged)
     settings_  = std::move(staged.settings);
     providers_ = std::move(staged.providers);
     sites_     = std::move(staged.sites);
+
+    // The locale into effect — here, so that a start and both reloads do it
+    // alike (the single process's SIGHUP never did). Mirrors v1
+    // DefaultLocale.SetLocale.
+    if (!settings_.locale.empty())
+        if (::setlocale(LC_ALL, settings_.locale.c_str()) == nullptr)
+            logger_->warn("setlocale('{}') failed — using system default locale",
+                settings_.locale);
 
     // Apply log level from settings
     try
@@ -1534,11 +1552,6 @@ bool Application::rolling_restart()
         logger_->error("config reload failed: {} — keeping old config", e.what());
         return false;
     }
-
-    // Re-apply locale after config reload
-    if (!settings_.locale.empty())
-        if (::setlocale(LC_ALL, settings_.locale.c_str()) == nullptr)
-            logger_->warn("setlocale('{}') failed on reload", settings_.locale);
 
     // Mark old workers and helpers for retirement
     // (custom processes are also restarted — mirrors v1 StartCustomProcesses(JUST_RESPAWN))

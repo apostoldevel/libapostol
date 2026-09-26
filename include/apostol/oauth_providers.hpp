@@ -58,7 +58,7 @@ struct OAuthApp
 // Replaces three separate filesystem scans:
 //   - Application::load_oauth2_credentials()  (BotSession)
 //   - verify_jwt() per-request scan            (JWT verification)
-//   - ApostolModule::load_allowed_origins()    (CORS)
+//   - ApostolModule::load_allowed_origins()    (CORS; read live at each check)
 //
 // Loaded at startup and again on SIGHUP, each time into a fresh object that
 // replaces the old one only when the whole configuration is accepted

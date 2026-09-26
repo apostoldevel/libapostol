@@ -345,9 +345,19 @@ private:
 
     std::unique_ptr<Logger>  logger_;
     std::unique_ptr<Config>  config_;
-    ModuleManager            module_manager_;
+    // What a configuration file is applied onto — the build's defaults and -p,
+    // as they stood before the first file was read. Every reading starts from
+    // it, so a reload gives what a start with the same file would: a key taken
+    // out of the file falls back to its default instead of keeping the value it
+    // had (populate() only assigns keys that are present).
+    AppSettings              base_settings_;
+    // Before module_manager_ on purpose: members die in reverse order, and
+    // modules keep references to these two (load_allowed_origins, and the
+    // providers_/sites_ references modules take in their constructors) — they
+    // must outlive every module.
     OAuthProviders           providers_;
     SiteConfigs              sites_;
+    ModuleManager            module_manager_;
     uint16_t                 http_port_{0};
 
 #ifdef WITH_POSTGRESQL

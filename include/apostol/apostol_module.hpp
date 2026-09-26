@@ -75,10 +75,10 @@ protected:
     // Call add_allowed_origin() from the constructor (or init_methods()) to
     // enable CORS for specific origins.  Pass "*" to allow any origin.
     //
-    // Alternatively call load_allowed_origins() with the conf/oauth2/ directory
-    // to populate the allow-list automatically from the project's OAuth2 provider
-    // JSON files — mirrors v1 CApostolModule::LoadAllowedOrigins() which reads
-    // from Server().Providers().
+    // Alternatively call load_allowed_origins() with the application's
+    // providers (app.providers()) to allow every javascript_origin of the
+    // project's OAuth2 clients — read live, so a reload reaches it. Mirrors v1
+    // CApostolModule::LoadAllowedOrigins() which reads Server().Providers().
 
     /// Add an origin to the allow-list (e.g. "https://example.com" or "*").
     void add_allowed_origin(std::string origin);
@@ -90,10 +90,18 @@ protected:
     /// True when @p origin is in the allow-list, or "*" is present.
     bool is_origin_allowed(std::string_view origin) const;
 
-    /// Load allowed origins from the centralized OAuthProviders cache.
-    /// Adds each unique javascript_origin to the allow-list.
-    /// Mirrors v1 CApostolModule::LoadAllowedOrigins() / Server().Providers().
+    /// Take allowed origins from the application's OAuthProviders: every
+    /// javascript_origin of every client is allowed. The providers are read at
+    /// each check, not copied — a reload (SIGHUP) replaces them in place, and a
+    /// copy taken at construction kept the old list for as long as the module
+    /// lived: in a single-process run, for good. Mirrors v1
+    /// CApostolModule::LoadAllowedOrigins() / Server().Providers().
+    ///
+    /// The module keeps the address: @p providers must outlive it — the
+    /// application's own (app.providers()) does. A temporary is refused at
+    /// compile time.
     void load_allowed_origins(const OAuthProviders& providers);
+    void load_allowed_origins(const OAuthProviders&&) = delete;
 
     /// If the request carries an allowed Origin, add the four CORS headers.
     /// Called automatically by execute() before every dispatched handler and
@@ -239,7 +247,8 @@ private:
     mutable std::string         allowed_cache_;
     bool                        initialized_ = false;
 
-    std::vector<std::string>    allowed_origins_;
+    std::vector<std::string>    allowed_origins_;          // add_allowed_origin()
+    const OAuthProviders*       origin_providers_ = nullptr; // load_allowed_origins()
     // Default headers match v1 CApostolModule constructor initialisation
     std::vector<std::string>    allowed_headers_{"Content-Type", "X-Requested-With"};
     mutable std::string         allowed_headers_cache_;
