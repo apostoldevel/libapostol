@@ -34,8 +34,13 @@ class SiteConfigs
 {
 public:
     /// Load all *.json files from @p sites_dir.
-    /// Non-existent directory or malformed files are silently skipped.
+    /// Non-existent directory or malformed files are skipped — and each skipped
+    /// file is recorded in skipped(), so that the caller can say so: a provider
+    /// that vanished over a typo must not vanish without a line in the log.
     void load(const std::filesystem::path& sites_dir);
+
+    /// Files the last load() passed over, each as "<path>: <why>".
+    const std::vector<std::string>& skipped() const noexcept { return skipped_; }
 
     /// Clear all loaded configurations (call before reload).
     void clear();
@@ -49,6 +54,7 @@ public:
 
 private:
     std::vector<SiteConfig> sites_;
+    std::vector<std::string> skipped_;
 };
 
 } // namespace apostol

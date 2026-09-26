@@ -60,15 +60,22 @@ struct OAuthApp
 //   - verify_jwt() per-request scan            (JWT verification)
 //   - ApostolModule::load_allowed_origins()    (CORS)
 //
-// Loaded once at startup, reloaded on SIGHUP via clear() + load().
+// Loaded at startup and again on SIGHUP, each time into a fresh object that
+// replaces the old one only when the whole configuration is accepted
+// (Application::read_config / apply_config).
 //
 class OAuthProviders
 {
 public:
     /// Load all *.json files from @p oauth2_dir.
     /// Each file may contain multiple application sections.
-    /// Non-existent directory or malformed files are silently skipped.
+    /// Non-existent directory or malformed files are skipped — and each skipped
+    /// file is recorded in skipped(), so that the caller can say so: a provider
+    /// that vanished over a typo must not vanish without a line in the log.
     void load(const std::filesystem::path& oauth2_dir);
+
+    /// Files the last load() passed over, each as "<path>: <why>".
+    const std::vector<std::string>& skipped() const noexcept { return skipped_; }
 
     /// Clear all loaded applications (call before reload).
     void clear();
@@ -110,6 +117,7 @@ public:
 
 private:
     std::vector<OAuthApp> apps_;
+    std::vector<std::string> skipped_;
 };
 
 } // namespace apostol

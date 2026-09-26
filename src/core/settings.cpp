@@ -237,14 +237,17 @@ std::vector<ValidationError> AppSettings::validate() const
     };
 
     // Log level
+    // The logger's own list (level_from_string), "warning" included: a value
+    // the logger takes must not be one this refuses — now that a refusal here
+    // stops the start, not only -t.
     static constexpr std::string_view valid_levels[] = {
-        "debug", "info", "notice", "warn", "error", "crit", "alert", "emerg"};
+        "debug", "info", "notice", "warn", "warning", "error", "crit", "alert", "emerg"};
     bool level_ok = false;
     for (auto& l : valid_levels)
         if (l == log_level) { level_ok = true; break; }
     if (!level_ok)
         err("log.level",
-            fmt::format("invalid log level '{}'; must be one of: debug info notice warn error crit alert emerg",
+            fmt::format("invalid log level '{}'; must be one of: debug info notice warn warning error crit alert emerg",
                 log_level));
 
     // Server port

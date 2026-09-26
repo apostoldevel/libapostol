@@ -382,6 +382,7 @@ void Application::parse_args(int argc, char* argv[])
         else if ((arg == "-c" || arg == "--config") && i + 1 < argc)
         {
             config_file_ = argv[++i];
+            config_explicit_ = true;
         }
         else if ((arg == "-p" || arg == "--prefix") && i + 1 < argc)
         {
@@ -457,7 +458,7 @@ void Application::init_logging()
     // Actual file logging is set up after load_config().
 }
 
-void Application::load_config()
+Application::StagedConfig Application::read_config(bool reload) const
 {
     // Nothing of this process changes until the whole configuration is in hand.
     // Reading into locals is what lets a caller say "keeping old config" and be
@@ -468,41 +469,104 @@ void Application::load_config()
     // field, so populating the live settings_ in place left it half-new on the
     // way out — and its first lines recompute every path under prefix. A reload
     // that was refused would already have moved the pid file and the logs.
-    std::unique_ptr<Config> cfg;
+    //
+    // One reading for all three callers — a start, the master's SIGHUP and the
+    // single process's SIGHUP — so that one file gets one verdict. They used to
+    // differ: the master's reload skipped validate() and never reread oauth2/
+    // or sites/ (new workers forked with the old providers), and a missing file
+    // was a refusal to the master and "defaults" to the single process.
+    StagedConfig staged;
 
-    if (!std::filesystem::exists(config_file_))
+    std::error_code ec;
+    const bool present = std::filesystem::exists(config_file_, ec);
+    if (ec)
+        throw ConfigError(fmt::format("cannot reach config file '{}': {}",
+            config_file_.string(), ec.message()));
+
+    if (present && std::filesystem::is_directory(config_file_, ec))
+        throw ConfigError(fmt::format("config file '{}' is a directory",
+            config_file_.string()));
+
+    if (!present)
     {
+        // A reload means "apply the file": with no file there is nothing to
+        // apply, and falling back to built-in defaults would swap a working
+        // configuration for one nobody wrote. Nor when the file was named with
+        // -c — a typo there is the operator's error, and -t must be able to
+        // say so. Only an application run without -c, whose default path is
+        // absent, starts on defaults.
+        if (reload || config_explicit_)
+            throw ConfigError(fmt::format("config file '{}' not found",
+                config_file_.string()));
+
         logger_->notice("config file '{}' not found, using defaults",
             config_file_.string());
-        cfg = std::make_unique<Config>(Config::from_string("{}"));
+        staged.config = std::make_unique<Config>(Config::from_string("{}"));
     }
     else
     {
-        cfg = std::make_unique<Config>(Config::from_file(config_file_));
+        staged.config = std::make_unique<Config>(Config::from_file(config_file_));
     }
 
     // Populate a copy — see above. The CMake defaults are the baseline, so the
     // copy starts from what is already in force.
-    AppSettings next = settings_;
-    next.populate(*cfg);
+    staged.settings = settings_;
+    staged.settings.populate(*staged.config);
 
-    // Strict validation — collect ALL errors before deciding what to do
-    auto errors = next.validate();
+    // Strict validation — collect ALL errors, log each (they name keys the
+    // caller's one line cannot), then refuse. The same verdict for -t and for a
+    // start: -t exists to predict the start, and a start used to go on after
+    // "applying defaults for invalid values" — which it never did; a zero
+    // port or 300 workers went into service as written.
+    auto errors = staged.settings.validate();
     if (!errors.empty())
     {
         for (auto& e : errors)
             logger_->error("configuration error [{}]: {}", e.key, e.message);
 
-        if (test_config_)
-            throw ConfigError(fmt::format("configuration has {} error(s)", errors.size()));
-
-        logger_->warn("configuration has {} error(s) — applying defaults for invalid values",
-            errors.size());
+        throw ConfigError(fmt::format("configuration has {} error(s)", errors.size()));
     }
 
-    // Accepted: both at once, and only now is anything of this process touched.
-    config_   = std::move(cfg);
-    settings_ = std::move(next);
+    // The directories next to the prefix. An unreadable one threw
+    // filesystem_error out of directory_iterator — past every ConfigError
+    // handler, so a start ended in std::terminate and a core, and a reload in
+    // a dead master.
+    try
+    {
+        staged.providers.load(staged.settings.resolve("oauth2"));
+        staged.sites.load(staged.settings.resolve("sites"));
+    }
+    catch (const std::filesystem::filesystem_error& e)
+    {
+        throw ConfigError(e.what());
+    }
+
+    // A file the loaders passed over is not a refusal — skipping is their
+    // contract — but it is never silent: a provider that disappears over a typo
+    // turns every token of its audience into "unknown audience", and now that a
+    // reload rereads these directories, that can happen to a running service.
+    for (const auto& why : staged.providers.skipped())
+        logger_->warn("oauth2 file skipped: {}", why);
+    for (const auto& why : staged.sites.skipped())
+        logger_->warn("sites file skipped: {}", why);
+
+    return staged;
+}
+
+void Application::load_config(bool reload)
+{
+    apply_config(read_config(reload));
+}
+
+void Application::apply_config(StagedConfig&& staged)
+{
+    // Accepted: all of it at once, and only now is anything of this process
+    // touched. providers_ and sites_ are assigned, not rebuilt: modules hold
+    // references to these members, not copies.
+    config_    = std::move(staged.config);
+    settings_  = std::move(staged.settings);
+    providers_ = std::move(staged.providers);
+    sites_     = std::move(staged.sites);
 
     // Apply log level from settings
     try
@@ -538,14 +602,6 @@ void Application::load_config()
         }
     }
 
-    // Load OAuth2 provider configs (oauth2/*.json) — v1 convention.
-    // clear() + load() is safe for repeated calls on SIGHUP.
-    providers_.clear();
-    providers_.load(settings_.resolve("oauth2"));
-
-    // Load site configs (sites/*.json) — v1 convention.
-    sites_.clear();
-    sites_.load(settings_.resolve("sites"));
 }
 
 // ─── PID file ────────────────────────────────────────────────────────────────
@@ -865,7 +921,7 @@ void Application::single_run()
         // was reconfigured.
         try
         {
-            load_config();
+            load_config(/*reload=*/true);
         }
         catch (const ConfigError& e)
         {
@@ -1464,19 +1520,14 @@ void Application::graceful_shutdown()
 
 bool Application::rolling_restart()
 {
-    // Reload config and re-populate settings. Into locals first, and swapped in
-    // one step: populate() assigns field by field and throws from the typed
-    // getters on a value of the wrong type, so doing this in place made the
-    // message below false — the master kept a configuration it had just
-    // refused, with every path under prefix already recomputed. Same shape as
-    // load_config(), and for the same reason.
+    // The same reading as a start (read_config): the file, validate(), oauth2/
+    // and sites/ into locals, swapped in one step only when all of it is good.
+    // The new processes fork from this master, so what it holds is what they
+    // get — the providers included, which this path used to leave as they were
+    // at start.
     try
     {
-        auto cfg = std::make_unique<Config>(Config::from_file(config_file_));
-        AppSettings next = settings_;
-        next.populate(*cfg);
-        config_   = std::move(cfg);
-        settings_ = std::move(next);
+        load_config(/*reload=*/true);
     }
     catch (const ConfigError& e)
     {

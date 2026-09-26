@@ -18,13 +18,17 @@ void SiteConfigs::load(const std::filesystem::path& sites_dir)
             continue;
 
         std::ifstream f(entry.path());
-        if (!f.is_open())
+        if (!f.is_open()) {
+            skipped_.push_back(entry.path().string() + ": cannot be opened");
             continue;
+        }
 
         try {
             auto j = nlohmann::json::parse(f);
-            if (!j.is_object())
+            if (!j.is_object()) {
+                skipped_.push_back(entry.path().string() + ": not a JSON object");
                 continue;
+            }
 
             SiteConfig site;
 
@@ -51,8 +55,12 @@ void SiteConfigs::load(const std::filesystem::path& sites_dir)
             }
 
             sites_.push_back(std::move(site));
-        } catch (...) {
+        } catch (const std::exception& e) {
+            skipped_.push_back(entry.path().string() + ": " + e.what());
             continue; // skip malformed JSON
+        } catch (...) {
+            skipped_.push_back(entry.path().string() + ": unreadable");
+            continue;
         }
     }
 }
@@ -60,6 +68,7 @@ void SiteConfigs::load(const std::filesystem::path& sites_dir)
 void SiteConfigs::clear()
 {
     sites_.clear();
+    skipped_.clear();
 }
 
 const SiteConfig* SiteConfigs::find(std::string_view hostname) const

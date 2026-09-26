@@ -218,7 +218,26 @@ private:
     // ── Startup ───────────────────────────────────────────────────────────────
     void parse_args(int argc, char* argv[]);
     void init_logging();
-    void load_config();
+
+    /// Everything a configuration is made of, read and checked into locals: the
+    /// file, the settings populated from it, and the oauth2/ and sites/
+    /// directories under its prefix. Nothing of the running process is touched
+    /// until apply_config(), so a refusal at any step leaves it as it was.
+    struct StagedConfig
+    {
+        std::unique_ptr<Config> config;
+        AppSettings             settings;
+        OAuthProviders          providers;
+        SiteConfigs             sites;
+    };
+
+    /// Read, populate, validate and load the directories. Throws ConfigError
+    /// for anything the process must not run on. A missing file is an error on
+    /// a @p reload and when the file was named with -c; otherwise — the
+    /// default path of an application run without one — defaults apply.
+    StagedConfig read_config(bool reload) const;
+    void apply_config(StagedConfig&& staged);
+    void load_config(bool reload = false);
     void write_pid_file() const;
     void remove_pid_file() const;
     bool check_running() const;
@@ -308,6 +327,7 @@ private:
 
     // Parsed options
     std::filesystem::path config_file_; // set from settings_.conf_file, then optionally overridden by -c
+    bool config_explicit_{false};       // -c was given: a missing file is an error, not "defaults"
     bool daemon_{false};
     bool test_config_{false};
     bool show_version_{false};
