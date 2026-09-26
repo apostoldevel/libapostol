@@ -201,7 +201,8 @@ protected:
     // Called in master/single once, before workers are spawned (or loop starts).
     virtual void on_start() {}
 
-    // Called in master after config is reloaded (SIGHUP).
+    // Called in master after config is reloaded (SIGHUP) — only when the new
+    // configuration was accepted; a refused reload keeps the old one silently.
     virtual void on_reload() {}
 
     // Called in each worker (and single) process. Register HTTP handlers here.
@@ -232,7 +233,9 @@ private:
 
     void fast_shutdown();
     void graceful_shutdown();
-    void rolling_restart();
+    /// Reload the configuration and restart the processes on it. False when the
+    /// file was refused — the old configuration stays and nothing is restarted.
+    bool rolling_restart();
 
     // ── OS-level helpers ──────────────────────────────────────────────────────
     void init_setproctitle(int argc, char* argv[]);

@@ -745,11 +745,15 @@ void Application::master_run()
             loop.stop(); // all already gone
     });
 
-    // SIGHUP — reload config + rolling restart
+    // SIGHUP — reload config + rolling restart. on_reload() only when the new
+    // configuration was taken: after a refusal the master keeps the old one and
+    // restarts nothing, so telling the application to reconfigure would have it
+    // act on a file that never took effect. Same rule as the single-process
+    // branch below.
     loop.add_signal(SIGHUP, [this](const signalfd_siginfo&) {
         logger_->notice("SIGHUP received — reloading config");
-        rolling_restart();
-        on_reload();
+        if (rolling_restart())
+            on_reload();
     });
 
     // SIGWINCH — gracefully stop workers only (keep custom + helper alive).
@@ -1458,7 +1462,7 @@ void Application::graceful_shutdown()
 
 // ─── Rolling restart (SIGHUP) ────────────────────────────────────────────────
 
-void Application::rolling_restart()
+bool Application::rolling_restart()
 {
     // Reload config and re-populate settings. Into locals first, and swapped in
     // one step: populate() assigns field by field and throws from the typed
@@ -1477,7 +1481,7 @@ void Application::rolling_restart()
     catch (const ConfigError& e)
     {
         logger_->error("config reload failed: {} — keeping old config", e.what());
-        return;
+        return false;
     }
 
     // Re-apply locale after config reload
@@ -1525,6 +1529,8 @@ void Application::rolling_restart()
         if (child.shutting_down)
             ::kill(child.pid, SIGQUIT);
     }
+
+    return true;
 }
 
 // ─── OS-level helpers ─────────────────────────────────────────────────────────
