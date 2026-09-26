@@ -6,6 +6,7 @@
 #include "apostol/pg.hpp"
 #include "apostol/service_token.hpp"
 
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -58,8 +59,40 @@ void sign_out(PgPool& pool, std::string_view session,
 /// This is the asymmetry that made service sessions immortal: the token was
 /// obtained through daemon.token and released through api.signout, and only the
 /// first of those two schemas is open to the role doing the work.
+///
+/// Fire and forget: for a caller that has nobody to answer — a process on its way
+/// out. Refusals and failures are logged through @p log; a session that is already
+/// gone is not, because at shutdown that is the common case.
 void close_session(PgPool& pool, std::string_view token,
                    Logger* log = nullptr, std::string_view tag = {});
+
+/// What daemon.session_close answered.
+struct SessionCloseResult
+{
+    enum class Status
+    {
+        closed,   ///< the session the token names is closed now
+        gone,     ///< the token names no live session: expired, swept, closed elsewhere
+        refused,  ///< the database refused — the token is not ours, access denied, …
+        failed,   ///< no answer to read: the pool, the connection, a malformed reply
+    };
+
+    Status      status = Status::failed;
+    std::string message;   ///< the database's or the pool's words, for a log line
+};
+
+using SessionCloseHandler = std::function<void(const SessionCloseResult&)>;
+
+/// The same statement for a caller that must answer someone — an endpoint closing
+/// the session it was asked to. @p on_done is called exactly once, from the pool's
+/// callback; with an empty @p token there is nothing to run and it is called at
+/// once, before this returns, with Status::gone.
+///
+/// Only the access token is accepted. daemon.session_close validates it as a JWT,
+/// so a refresh token is refused, and an access token past its lifetime reads as
+/// gone even while its session and refresh token live on: to close such a session,
+/// renew the pair first (daemon.refresh_token) and close by the new access token.
+void close_session(PgPool& pool, std::string_view token, SessionCloseHandler on_done);
 
 } // namespace apostol::db_platform
 

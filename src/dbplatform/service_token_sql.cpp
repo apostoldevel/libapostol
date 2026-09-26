@@ -48,89 +48,141 @@ void sign_out(PgPool& pool, std::string_view session, Logger* log, std::string_v
 
 // ─── close_session ───────────────────────────────────────────────────────────
 
-void close_session(PgPool& pool, std::string_view token, Logger* log, std::string_view tag)
+namespace
 {
-    if (token.empty())
+
+using CloseStatus = SessionCloseResult::Status;
+
+// One reading of daemon.session_close's answer for both overloads. It reports
+// refusals as a json object with an "error" member rather than as a failed
+// statement, and on success returns the claims of the token it closed by.
+SessionCloseResult read_session_close(const std::vector<PgResult>& results)
+{
+    if (results.empty())
+        return {CloseStatus::failed, "no result"};
+
+    if (!results[0].ok()) {
+        const char* msg = results[0].error_message();
+        return {CloseStatus::failed, msg ? msg : "unknown error"};
+    }
+
+    if (results[0].rows() == 0 || results[0].columns() == 0)
+        return {CloseStatus::failed, "no row"};
+
+    const char* v = results[0].value(0, 0);
+    if (!v)
+        return {CloseStatus::failed, "null answer"};
+
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(v);
+    } catch (...) {
+        return {CloseStatus::failed, "the answer is not json"};
+    }
+
+    if (!j.is_object() || !j.contains("error"))
+        return {CloseStatus::closed, {}};
+
+    const auto& e = j["error"];
+
+    int code = 0;
+    std::string error_id;
+    std::string message;
+    try {
+        code = e.is_object() ? e.value("code", 0) : 0;
+
+        if (e.is_object() && e.contains("error") && e["error"].is_string()) {
+            auto value = e["error"].get<std::string>();
+            if (value.rfind("ERR-", 0) == 0)
+                error_id = std::move(value);
+        }
+
+        message = e.is_object() ? e.value("message", "") : std::string(v);
+    } catch (const nlohmann::json::exception&) {
+        // A member of the wrong type — a null message, a code in quotes. The
+        // answer is unreadable, not a refusal.
+        return {CloseStatus::failed, v};
+    }
+
+    // Not a refusal but the database failing: daemon.session_close catches every
+    // exception, and one without an ERR- identifier — a lock timeout, a
+    // serialisation failure, a broken constraint inside SessionOut — comes back
+    // as code 500. Read as a refusal it would tell a caller the session is closed
+    // while it lives on; RFC 7009 §2.2.1 asks for 503 there, not 200.
+    if (code >= 500)
+        return {CloseStatus::failed, std::move(message)};
+
+    // "Token not FOUND or has expired": the session is already gone — with an
+    // expired token, a sweep, or a sign-out elsewhere. For a caller closing it that
+    // is a job done, not a refusal.
+    //
+    // Three ways to recognise it, one per era of the database this binary may be
+    // talking to, and a rollout puts all three in front of it at once:
+    //
+    //   1.2.14 and later — daemon.* reports the identifier, so the branch is exact
+    //     and nothing else is taken for it;
+    //   1.2.13 — the status is right and the identifier absent;
+    //   before 1.2.13 — TokenExpired was still ERR-403-001.
+    //
+    // Falling back to the status takes the rest of its group too. On the way in to
+    // daemon.session_close only TokenExpired answers 401 at all — IssuerNotFound,
+    // AudienceNotFound, TokenError, TokenBelong and AccessDenied are all group 400 —
+    // so in practice it takes nothing else.
+    const bool gone = !error_id.empty()
+        ? (error_id == "ERR-401-008" || error_id == "ERR-403-001")
+        : (code == 401 || code == 403);
+
+    return {gone ? CloseStatus::gone : CloseStatus::refused, std::move(message)};
+}
+
+} // namespace
+
+void close_session(PgPool& pool, std::string_view token, SessionCloseHandler on_done)
+{
+    if (token.empty()) {
+        if (on_done)
+            on_done({CloseStatus::gone, {}});
         return;
+    }
 
-    std::string label(tag);
-
-    // daemon.session_close validates the token, takes the session code from its
-    // "sub" claim and calls SessionOut. Reported failures come back as a json
-    // object with an "error" member rather than as a failed statement.
+    // quiet: the statement carries the access token.
     pool.execute(fmt::format("SELECT * FROM daemon.session_close({})",
                              pq_quote_literal(token)),
-        [log, label](std::vector<PgResult> results) {
-            if (!log)
-                return;
-
-            if (results.empty() || !results[0].ok()) {
-                log->warn("{} close session failed: {}", label,
-                          results.empty() ? "no result" : results[0].error_message());
-                return;
-            }
-
-            if (results[0].rows() == 0 || results[0].columns() == 0)
-                return;
-
-            const char* v = results[0].value(0, 0);
-            if (!v)
-                return;
-
-            try {
-                auto j = nlohmann::json::parse(v);
-                if (!j.contains("error"))
-                    return;
-
-                const auto& e = j["error"];
-                const int code = e.is_object() ? e.value("code", 0) : 0;
-
-                std::string error_id;
-                if (e.is_object() && e.contains("error") && e["error"].is_string()) {
-                    auto value = e["error"].get<std::string>();
-                    if (value.rfind("ERR-", 0) == 0)
-                        error_id = std::move(value);
-                }
-
-                // "Token not FOUND or has expired". At shutdown this is not a
-                // refusal but a job already done: the session went with an expired
-                // token, a sweep, or a sign-out elsewhere. Warning about it would
-                // put a line per worker per restart into the log and teach whoever
-                // reads it to ignore the ones that matter.
-                //
-                // Three ways to recognise it, one per era of the database this
-                // binary may be talking to, and a rollout puts all three in front
-                // of it at once:
-                //
-                //   1.2.14 and later — daemon.* reports the identifier, so the
-                //     branch is exact and nothing else is silenced;
-                //   1.2.13 — the status is right and the identifier absent;
-                //   before 1.2.13 — TokenExpired was still ERR-403-001.
-                //
-                // Falling back to the status silences the rest of its group too. On
-                // the way in to daemon.session_close only TokenExpired answers 401
-                // at all — IssuerNotFound, AudienceNotFound, TokenError, TokenBelong
-                // and AccessDenied are all group 400 — so in practice it silences
-                // nothing else. And at a shutdown close the cost of being wrong is
-                // a warning not written, which is what this branch is for.
-                if (!error_id.empty()) {
-                    if (error_id == "ERR-401-008" || error_id == "ERR-403-001")
-                        return;
-                } else if (code == 401 || code == 403) {
-                    return;
-                }
-
-                log->warn("{} close session refused: {}", label,
-                          e.is_object() ? e.value("message", "") : std::string(v));
-            } catch (...) {
-                // Not json: the claims came back as something else. Nothing to say.
-            }
+        [on_done](std::vector<PgResult> results) {
+            if (on_done)
+                on_done(read_session_close(results));
         },
-        [log, label](std::string_view error) {
-            if (log)
-                log->warn("{} close session failed: {}", label, error);
+        [on_done](std::string_view error) {
+            if (on_done)
+                on_done({CloseStatus::failed, std::string(error)});
         },
         /*quiet=*/true);
+}
+
+void close_session(PgPool& pool, std::string_view token, Logger* log, std::string_view tag)
+{
+    if (token.empty() || !log) {
+        close_session(pool, token, SessionCloseHandler{});
+        return;
+    }
+
+    // "Gone" is not worth a line here. This overload is what a process calls at
+    // shutdown, and there a session that went on its own is the common case: a
+    // warning per worker per restart would teach whoever reads the log to ignore
+    // the ones that matter.
+    close_session(pool, token, [log, label = std::string(tag)](const SessionCloseResult& r) {
+        switch (r.status) {
+            case CloseStatus::closed:
+            case CloseStatus::gone:
+                return;
+            case CloseStatus::refused:
+                log->warn("{} close session refused: {}", label, r.message);
+                return;
+            case CloseStatus::failed:
+                log->warn("{} close session failed: {}", label, r.message);
+                return;
+        }
+    });
 }
 
 // ─── refresh_service_token ───────────────────────────────────────────────────
