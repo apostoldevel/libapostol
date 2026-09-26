@@ -38,7 +38,26 @@ public:
 
     ExecStatusType status() const;
     const char*    status_string() const;
+
+    /// libpq's error text — or, once withhold_statement() was called, the
+    /// reduced one it produced.
     const char*    error_message() const;
+
+    /// For a statement whose text must not be repeated (a quiet query: its
+    /// literals are tokens, passwords, secrets). libpq's message quotes the
+    /// statement back ("LINE 1: SELECT …"), and DETAIL/CONTEXT and even the
+    /// primary message can carry a literal value (invalid input syntax for
+    /// type uuid: "<the value>"). From here on error_message() answers
+    /// "<SEVERITY>:  <primary message>[; PL/pgSQL function … line N …]
+    /// (SQLSTATE <code>)" — the primary message withheld for class 22 and
+    /// 42601, where it quotes a value; the context reduced to the PL/pgSQL
+    /// location lines without quotes. Enough to tell what failed and where,
+    /// nothing of what was sent. No-op on a success.
+    ///
+    /// Relies on a convention, not a proof: the platform's own messages
+    /// (RAISE … 'ERR-…') are kept verbatim, so a message that interpolates a
+    /// secret would pass. None does today.
+    void           withhold_statement();
 
     int rows()    const;   // PQntuples
     int columns() const;   // PQnfields
@@ -59,6 +78,7 @@ public:
 
 private:
     std::unique_ptr<PGresult, decltype(&PQclear)> res_;
+    std::string withheld_;   // non-empty: error_message() answers this instead
 };
 
 // ── PgQuery ───────────────────────────────────────────────────────────────────
@@ -184,7 +204,17 @@ public:
     bool         resetting() const { return resetting_; }
     bool         needs_flush() const { return needs_flush_; }
 
+    /// libpq's connection error text — without the error of a quiet statement
+    /// that libpq keeps at its head until the next query is sent (see
+    /// withhold_last_error()).
     const char*  error_message() const;
+
+    /// The current connection error text is a quiet statement's error, which
+    /// quotes the statement. libpq 14+ keeps it in the connection's buffer
+    /// until the next query and appends to it — a connection lost while idle
+    /// reported "ERROR: … LINE 1: <the statement>" first. From here until the
+    /// next send_query(), error_message() answers only what came after it.
+    void         withhold_last_error();
 
     PgQuery* current_query() const        { return current_query_; }
     void     set_current_query(PgQuery* q){ current_query_ = q; }
@@ -201,6 +231,8 @@ public:
     void set_notice_callback(NoticeCallback cb);
 
 private:
+    std::string  withheld_error_;   // the head error_message() must not repeat
+
     static void notice_processor(void* arg, const char* message);
 
     std::unique_ptr<PGconn, decltype(&PQfinish)> conn_;

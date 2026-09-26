@@ -96,13 +96,16 @@ PgResult::~PgResult() = default;
 
 PgResult::PgResult(PgResult&& o) noexcept
     : res_(std::move(o.res_))
+    , withheld_(std::move(o.withheld_))
 {
 }
 
 PgResult& PgResult::operator=(PgResult&& o) noexcept
 {
-    if (this != &o)
-        res_ = std::move(o.res_);
+    if (this != &o) {
+        res_      = std::move(o.res_);
+        withheld_ = std::move(o.withheld_);
+    }
     return *this;
 }
 
@@ -118,7 +121,73 @@ const char* PgResult::status_string() const
 
 const char* PgResult::error_message() const
 {
+    if (!withheld_.empty())
+        return withheld_.c_str();
     return PQresultErrorMessage(res_.get());
+}
+
+void PgResult::withhold_statement()
+{
+    if (!res_ || ok())
+        return;
+
+    const char* severity = PQresultErrorField(res_.get(), PG_DIAG_SEVERITY);
+    const char* sqlstate = PQresultErrorField(res_.get(), PG_DIAG_SQLSTATE);
+    const char* primary  = PQresultErrorField(res_.get(), PG_DIAG_MESSAGE_PRIMARY);
+
+    // No fields: not a server error but libpq's own (a lost connection), whose
+    // text never carries the statement.
+    if (!primary)
+        return;
+
+    // The primary message stays, except where it quotes a value from the
+    // statement: a data exception (class 22 — invalid input syntax for type
+    // uuid: "<value>") and a syntax error (42601 — at or near "<token>"). There
+    // the whole message goes, not only the quoted part: the quote marks follow
+    // lc_messages (»…« in German, « … » in French) and a value containing a
+    // quote is not escaped, so cutting between quotes is not a guarantee.
+    // Elsewhere the quotes hold names — relation "db.x" does not exist — which
+    // are what a reader needs and carry nothing that was sent.
+    const std::string state = sqlstate ? sqlstate : "";
+    const std::string_view text(primary);
+
+    // Any quote mark of any translation: ASCII, «», „“, ‘’, ».
+    static constexpr std::string_view kQuotes[] = {
+        "\"", "'", "\u00AB", "\u00BB", "\u201E", "\u201C", "\u201D", "\u2018", "\u2019", "\u201A"};
+    const bool quotes_something = std::any_of(std::begin(kQuotes), std::end(kQuotes),
+        [text](std::string_view q) { return text.find(q) != std::string_view::npos; });
+
+    const bool quotes_values =
+        (state.rfind("22", 0) == 0 || state == "42601") && quotes_something;
+
+    std::string reduced = quotes_values
+        ? "(message withheld: it quotes a value from the statement)"
+        : std::string(text);
+
+    // From the context, the lines that locate the failure in PL/pgSQL —
+    // "PL/pgSQL function kernel.x(text) line 12 at SQL statement" — and only
+    // those without quotes: the other context lines ("SQL statement \"…\"")
+    // are statement text. A scheduled job's label, which is where this text
+    // ends up (TaskScheduler), is useless without them.
+    if (const char* context = PQresultErrorField(res_.get(), PG_DIAG_CONTEXT)) {
+        std::string_view rest(context);
+        while (!rest.empty()) {
+            const auto eol  = rest.find('\n');
+            const auto line = rest.substr(0, eol);
+            if (line.rfind("PL/pgSQL function ", 0) == 0 &&
+                line.find_first_of("\"'") == std::string_view::npos) {
+                reduced += "; ";
+                reduced += line;
+            }
+            if (eol == std::string_view::npos)
+                break;
+            rest.remove_prefix(eol + 1);
+        }
+    }
+
+    withheld_ = fmt::format("{}:  {} (SQLSTATE {})\n",
+                            severity ? severity : "ERROR", reduced,
+                            sqlstate ? sqlstate : "?????");
 }
 
 int PgResult::rows() const    { return PQntuples(res_.get()); }
@@ -294,6 +363,8 @@ bool PgConnection::send_query(const std::string& sql)
         return false;
     if (PQsendQuery(conn_.get(), sql.c_str()) == 0)
         return false;
+    // libpq cleared its error buffer for this query: nothing left to withhold.
+    withheld_error_.clear();
     int flush_ret = PQflush(conn_.get());
     if (flush_ret == -1)
         return false;  // flush error — treat as send failure
@@ -385,7 +456,29 @@ int PgConnection::consume_notify(
 
 const char* PgConnection::error_message() const
 {
-    return conn_ ? PQerrorMessage(conn_.get()) : "";
+    if (!conn_)
+        return "";
+
+    const char* msg = PQerrorMessage(conn_.get());
+    if (withheld_error_.empty())
+        return msg;
+
+    // Compared by text, not by length: if libpq has reset its buffer since,
+    // the head is gone and the whole message is new.
+    const std::string_view all(msg);
+    if (all.rfind(withheld_error_, 0) != 0)
+        return msg;
+
+    const char* tail = msg + withheld_error_.size();
+    while (*tail == '\n' || *tail == ' ')
+        ++tail;
+    return *tail ? tail : "connection error (the previous statement's error is withheld)";
+}
+
+void PgConnection::withhold_last_error()
+{
+    if (conn_)
+        withheld_error_ = PQerrorMessage(conn_.get());
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -594,10 +687,20 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
 
             // Issue #1: PQconsumeInput failed — connection is dead
             if (conn.state() == PgConnState::Error) {
+                // With a quiet query in flight, the buffer may hold its own
+                // error ahead of the disconnect — both arriving in one read,
+                // before withhold_last_error() had a result to mark it by.
+                // Rare (the server does not drop a session over an ERROR), but
+                // the cost of a generic line is nil.
+                const bool quiet_inflight =
+                    conn.current_query() && conn.current_query()->quiet();
+                const char* reason = quiet_inflight
+                    ? "connection lost (the in-flight statement is quiet; its text is withheld)"
+                    : conn.error_message();
                 if (pg_logger_)
                     pg_logger_->error("{} PQconsumeInput failed: {}",
-                                     conn_tag(conn), conn.error_message());
-                fail_inflight_query(conn, conn.error_message());
+                                     conn_tag(conn), reason);
+                fail_inflight_query(conn, reason);
                 if (!try_reconnect(conn))
                     replace_connection(conn);
                 break;
@@ -629,8 +732,24 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                 break;
             }
 
+            // A quiet statement carries credentials in its literals, and libpq
+            // quotes the statement back in its error text. Reduce that text
+            // before anyone sees it: the log line below, the query's exception
+            // handler (which modules log, and AuthServer answers a client with)
+            // and a caller reading error_message() itself (T306).
+            const bool quiet = conn.current_query() && conn.current_query()->quiet();
+            if (quiet) {
+                for (auto& r : results)
+                    r.withhold_statement();
+                // libpq also keeps that error in the connection's own buffer,
+                // and a connection lost while idle is reported with it at the
+                // head (PQerrorMessage appends).
+                if (std::any_of(results.begin(), results.end(),
+                                [](const PgResult& r) { return !r.ok(); }))
+                    conn.withhold_last_error();
+            }
+
             if (pg_logger_) {
-                bool quiet = conn.current_query() && conn.current_query()->quiet();
                 for (const auto& r : results) {
                     if (r.ok()) {
                         if (!quiet)
