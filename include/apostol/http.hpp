@@ -195,6 +195,11 @@ public:
     /// returned false).
     std::string_view error() const noexcept { return error_msg_; }
 
+    /// The last feed() failed because the bytes are not a valid request —
+    /// as opposed to llhttp pausing after an Upgrade request, which it reports
+    /// the same way (feed() returns false) though nothing is wrong with it.
+    bool malformed() const noexcept { return malformed_; }
+
 private:
     // llhttp parser state — allocated to keep llhttp out of public headers
     std::unique_ptr<llhttp_t>          parser_;
@@ -205,6 +210,7 @@ private:
     std::string   current_field_;   // partially received header field name
     std::string   current_value_;   // partially received header field value
     bool          error_{false};
+    bool          malformed_{false};
     std::string   error_msg_;
 
     Handler handler_;
@@ -349,6 +355,19 @@ private:
     EventLoop*    loop_{nullptr};
     bool          closed_{false};
     bool          close_after_send_{false};  // deferred response + Connection: close
+
+    // Deferred responses handed out and not yet sent. A refusal of a
+    // malformed request must not overtake an answer still owed. Counted at one
+    // point — response_started(), called by send_response() and by the sending
+    // path of send_file() — and only for a deferred response that did not go
+    // out during its own dispatch (FileServer marks deferred and sends the
+    // file at once). Should the count ever run high, the only effect is the
+    // old silent close instead of a 400: nothing waits on it.
+    int           awaiting_deferred_{0};
+    bool          dispatching_{false};
+    bool          answered_in_dispatch_{false};
+
+    void response_started() noexcept;
 
     // Async write buffer
     std::string   write_buf_;

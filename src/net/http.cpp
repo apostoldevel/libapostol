@@ -8,6 +8,8 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <fmt/format.h>
+
+#include <sys/socket.h>
 #include <stdexcept>
 #include <string>
 #include <strings.h>
@@ -702,6 +704,10 @@ bool HttpParser::feed(const char* data, std::size_t len)
     llhttp_errno_t err = llhttp_execute(parser_.get(), data, len);
     if (err != HPE_OK) {
         error_    = true;
+        // HPE_PAUSED_UPGRADE is llhttp stopping after any request that carries
+        // Upgrade (a WebSocket handshake, h2c, CONNECT) — the request itself
+        // was fine and has been dispatched.
+        malformed_ = err != HPE_PAUSED_UPGRADE;
         error_msg_ = llhttp_errno_name(err);
         return false;
     }
@@ -729,17 +735,26 @@ bool HttpConnection::on_readable(RequestHandler handler)
     char buf[8192];
     bool should_close = false;
 
+    dispatching_ = true;
+    struct DispatchGuard {
+        bool& flag;
+        ~DispatchGuard() { flag = false; }
+    } dispatch_guard{dispatching_};
+
     // Set the handler so the parser calls it per-request
     parser_.set_handler([&](HttpRequest req) {
         req.peer_ip   = conn_.peer_address();
         req.peer_port = conn_.peer_port();
         req.socket_fd = conn_.fd();
         HttpResponse resp;
+        answered_in_dispatch_ = false;
         handler(req, resp);
         // Skip response if the handler upgraded to WebSocket (release_tcp() was called)
         // or if the handler marked it as deferred (async PG response)
         if (!closed_ && !resp.is_deferred())
             send_response(resp);
+        if (resp.is_deferred() && !answered_in_dispatch_)
+            ++awaiting_deferred_;
         if (!req.keep_alive()) {
             if (resp.is_deferred())
                 close_after_send_ = true;  // close after deferred response is sent
@@ -764,6 +779,52 @@ bool HttpConnection::on_readable(RequestHandler handler)
         }
 
         if (!parser_.feed(buf, static_cast<std::size_t>(n))) {
+            // A request this parser cannot read — raw UTF-8 in the target, a
+            // broken header line — used to end in a closed socket with no answer
+            // at all. The client saw "empty reply", a proxy in front turned it
+            // into 502, and 502 reads as "the server is down" when the fault is
+            // the request's. RFC 9112 §3: a server that receives an invalid
+            // request-line SHOULD respond with 400. The body is RFC 9457 with
+            // type about:blank: routing has not happened, so no module's shape
+            // applies. Not after a WebSocket upgrade: the socket belongs to the
+            // WebSocket side then (release_tcp() set closed_).
+            //
+            // Only for a request that is actually malformed: llhttp reports its
+            // pause after ANY Upgrade request the same way — a WebSocket
+            // handshake a filter refused, "Upgrade: h2c" from curl --http2 —
+            // and those have been answered already. And not while a deferred
+            // answer is owed on this connection: a pipelined request behind one
+            // still in the database would take its place on the wire, and a
+            // client reads the first response as the answer to its first
+            // request. There the old silent close stays — it loses the owed
+            // answer as it always did, but holding the socket for it has no
+            // bound: a cancelled query never calls back.
+            if (!closed_ && parser_.malformed() && awaiting_deferred_ == 0) {
+                // The llhttp error name is an identifier (HPE_INVALID_URL…):
+                // nothing in it needs escaping.
+                const std::string body = fmt::format(
+                    "{{\"type\":\"about:blank\",\"title\":\"Bad Request\",\"status\":400,"
+                    "\"detail\":\"the request could not be parsed ({})\"}}",
+                    parser_.error());
+                HttpResponse r;
+                r.set_status(HttpStatus::bad_request)
+                 .set_header("Connection", "close")
+                 .set_body(body, "application/problem+json");
+                send_response(r);
+
+                // Close the way a server that answered should: half-close and
+                // take what is already queued, so the close() that follows does
+                // not find unread data and answer it with RST — a client whose
+                // request was larger than one read would see "connection reset"
+                // before it could read the 400.
+                // Only when the 400 went out whole: a half-close under a tail
+                // still in write_buf_ would cut it off.
+                if (!closed_ && !has_pending_writes()) {
+                    ::shutdown(conn_.fd(), SHUT_WR);
+                    char sink[8192];
+                    while (conn_.read(sink, sizeof(sink)) > 0) {}
+                }
+            }
             closed_ = true;
             return false;
         }
@@ -777,8 +838,20 @@ bool HttpConnection::on_readable(RequestHandler handler)
     return true;
 }
 
+void HttpConnection::response_started() noexcept
+{
+    // During a dispatch this is the current request's answer going out at
+    // once; afterwards it is a deferred one arriving.
+    if (dispatching_)
+        answered_in_dispatch_ = true;
+    else if (awaiting_deferred_ > 0)
+        --awaiting_deferred_;
+}
+
 void HttpConnection::send_response(const HttpResponse& resp)
 {
+    response_started();
+
     if (closed_) return;
 
     std::string data = resp.serialize();
@@ -849,6 +922,10 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
     }
 
     auto file_size = static_cast<std::size_t>(st.st_size);
+
+    // The answer is going out from here on. The refusals above went through
+    // send_response(), which counts them itself.
+    response_started();
 
     // Construct HTTP response headers
     auto headers = fmt::format(
