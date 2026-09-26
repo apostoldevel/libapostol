@@ -551,14 +551,25 @@ Application::StagedConfig Application::read_config(bool reload) const
         throw ConfigError(e.what());
     }
 
-    // A file the loaders passed over is not a refusal — skipping is their
-    // contract — but it is never silent: a provider that disappears over a typo
-    // turns every token of its audience into "unknown audience", and now that a
-    // reload rereads these directories, that can happen to a running service.
-    for (const auto& why : staged.providers.skipped())
-        logger_->warn("oauth2 file skipped: {}", why);
-    for (const auto& why : staged.sites.skipped())
-        logger_->warn("sites file skipped: {}", why);
+    // A file the loaders passed over refuses the configuration. The loaders
+    // themselves only skip and record it — that is their contract, and their
+    // unit tests hold it — but a process must not run without it: a provider
+    // that disappears over a typo turns every token of its audience into
+    // "unknown audience", a site into the wrong one, and a server running
+    // quietly without a provider is worse than one that did not start (the
+    // owner's word, T312 item 1). -t says so, a start does not happen, a reload
+    // keeps what it had.
+    const auto skipped = staged.providers.skipped().size() + staged.sites.skipped().size();
+    if (skipped > 0)
+    {
+        for (const auto& why : staged.providers.skipped())
+            logger_->error("configuration error [oauth2]: {}", why);
+        for (const auto& why : staged.sites.skipped())
+            logger_->error("configuration error [sites]: {}", why);
+
+        throw ConfigError(fmt::format("{} file(s) in oauth2/ or sites/ could not be read",
+            skipped));
+    }
 
     return staged;
 }
