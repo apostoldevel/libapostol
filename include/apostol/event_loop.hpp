@@ -124,10 +124,15 @@ private:
 
     bool running_{false};
 
+    // seq — when the entry was registered, by registration_seq_. An epoll_wait
+    // batch is collected before any of its handlers runs, so an event in it
+    // for an entry newer than the batch was raised for whatever had the fd
+    // number before (T619).
     struct IOEntry
     {
         uint32_t events;
         IOCallback callback;
+        uint64_t seq;
     };
 
     struct TimerEntry
@@ -135,6 +140,7 @@ private:
         int fd;
         bool repeat;
         TimerCallback callback;
+        uint64_t seq;
     };
 
     std::unordered_map<int, IOEntry> io_handlers_;       // fd → entry
@@ -144,6 +150,7 @@ private:
 
     sigset_t signal_mask_{};
     TimerId next_timer_id_{1};
+    uint64_t registration_seq_{0};   // bumped by add_io() and add_timer()
 
     static constexpr int MAX_EVENTS = 512;
 };

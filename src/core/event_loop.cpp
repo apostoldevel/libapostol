@@ -99,6 +99,19 @@ void EventLoop::poll_once(int timeout_ms)
             throw std::system_error(errno, std::system_category(), "epoll_wait");
         }
 
+        // The batch is keyed by bare fd numbers. A handler earlier in it may
+        // close a number and register a new socket or timer under the same one
+        // (accept, connect, add_timer); the event still ahead in the batch was
+        // raised for the old descriptor and would reach the new holder — a
+        // peer's reset read as "connected" by a TcpClient still in SYN_SENT, a
+        // fresh timer fired at once (T619). Such events are dropped: nothing is
+        // lost, EPOLL_CTL_ADD reports the new descriptor's own readiness to the
+        // next epoll_wait, and a new timer has its own expiry. A live socket
+        // taken off and registered again by another handler (curl does) is
+        // deferred the same way, one epoll_wait later. Held as a number,
+        // not a flag, so a nested run_for() cannot hide its registrations.
+        const uint64_t collected_at = registration_seq_;
+
         for (int i = 0; i < n && running_; ++i)
         {
             int fd = events[i].data.fd;
@@ -110,10 +123,15 @@ void EventLoop::poll_once(int timeout_ms)
             }
             else if (auto it = timer_fd_to_id_.find(fd); it != timer_fd_to_id_.end())
             {
+                if (auto t = timers_.find(it->second); t != timers_.end() && t->second.seq > collected_at)
+                    continue;
                 dispatch_timer(fd);
             }
             else if (auto it = io_handlers_.find(fd); it != io_handlers_.end())
             {
+                if (it->second.seq > collected_at)
+                    continue;
+
                 // Copy before calling: callback may remove_io(fd), invalidating 'it'
                 auto cb = it->second.callback;
                 cb(ev);
@@ -155,7 +173,7 @@ void EventLoop::add_io(int fd, uint32_t events, IOCallback cb)
         throw std::system_error(errno, std::system_category(),
             fmt::format("epoll_ctl ADD fd={}", fd));
 
-    io_handlers_[fd] = {events, std::move(cb)};
+    io_handlers_[fd] = {events, std::move(cb), ++registration_seq_};
 }
 
 namespace
@@ -304,7 +322,7 @@ EventLoop::TimerId EventLoop::add_timer(std::chrono::milliseconds interval, Time
     }
 
     TimerId id = next_timer_id_++;
-    timers_[id] = {tfd, repeat, std::move(cb)};
+    timers_[id] = {tfd, repeat, std::move(cb), ++registration_seq_};
     timer_fd_to_id_[tfd] = id;
     return id;
 }
@@ -325,8 +343,12 @@ void EventLoop::cancel_timer(TimerId id)
 void EventLoop::dispatch_timer(int timer_fd)
 {
     // Consume the expiration count — required to re-arm EPOLLIN
+    // Nothing read, nothing expired: the event was not this timer's (T619) or
+    // a nested run_for() already took the expiry. Fired anyway, it went off
+    // early, or twice.
     uint64_t count = 0;
-    [[maybe_unused]] ssize_t n = ::read(timer_fd, &count, sizeof(count));
+    if (::read(timer_fd, &count, sizeof(count)) != static_cast<ssize_t>(sizeof(count)))
+        return;
 
     auto id_it = timer_fd_to_id_.find(timer_fd);
     if (id_it == timer_fd_to_id_.end())
