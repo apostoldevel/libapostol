@@ -52,6 +52,12 @@ void reply_sql(HttpResponse&                resp,
 /// Mirrors v1 PQQuoteLiteral().
 std::string pq_quote_literal(std::string_view val);
 
+/// SQL-quote an identifier without PGconn*: wrap in double quotes, double
+/// every double quote inside ("a""b"). Always quoted, so case and spaces
+/// survive as given. An empty name gives "" — which the server rejects, as it
+/// should: there is no such identifier.
+std::string pq_quote_ident(std::string_view name);
+
 /// Convert HTTP headers to a JSON object string: {"Name":"value",...}.
 /// Mirrors v1 FetchCommon::HeadersToJson().
 std::string headers_to_json(

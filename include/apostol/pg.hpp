@@ -442,6 +442,18 @@ private:
     // unlisten() and restart_listener() can strike a channel out of it while
     // handlers of the same batch are running.
     std::unordered_set<std::string>                             confirmed_listens_;
+    // A batch runs as one implicit transaction: one bad channel rolls back
+    // every LISTEN in it. Its channels are then shipped one per query (a
+    // subset of pending_listens_), so the one the server refuses is named and
+    // the rest subscribe.
+    std::unordered_set<std::string>                             single_listens_;
+    // Refused by the server on this listener, alone. Stays unsubscribed until
+    // the listener is replaced; counted out of the "LISTEN active" line.
+    std::unordered_set<std::string>                             rejected_listens_;
+    // How many channels the query in flight carried when it was shipped.
+    // unlisten() shrinks sent_listens_, so its size cannot tell a lone refusal
+    // from a batch rolled back around an innocent channel.
+    std::size_t                                                 sent_batch_size_{0};
     // Bumped each time start_listener() creates a connection. Tells a caller
     // that ran handlers whether the listener it held is still the same one —
     // a pointer comparison cannot, since a new object may reuse the address.

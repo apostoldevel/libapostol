@@ -181,6 +181,22 @@ std::string pq_quote_literal(std::string_view val)
     return out;
 }
 
+// ─── pq_quote_ident ─────────────────────────────────────────────────────────
+
+std::string pq_quote_ident(std::string_view name)
+{
+    std::string out;
+    out.reserve(name.size() + 2);
+    out += '"';
+    for (char c : name) {
+        if (c == '"')
+            out += '"';
+        out += c;
+    }
+    out += '"';
+    return out;
+}
+
 // ─── headers_to_json ────────────────────────────────────────────────────────
 
 std::string headers_to_json(

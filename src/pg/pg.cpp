@@ -1,4 +1,5 @@
 #include "apostol/pg.hpp"
+#include "apostol/pg_utils.hpp"
 
 #include <fmt/format.h>
 #include <sys/epoll.h>
@@ -1282,8 +1283,11 @@ void PgPool::unlisten(std::string_view channel)
     sent_listens_.erase(ch);
     confirmed_listens_.erase(ch);
 
+    single_listens_.erase(ch);
+    rejected_listens_.erase(ch);
+
     if (listener_ && listener_->state() == PgConnState::Ready)
-        listener_->send_query("UNLISTEN \"" + ch + "\"");
+        listener_->send_query("UNLISTEN " + pq_quote_ident(ch));
     // If listener is busy/connecting, callbacks are already removed from
     // notify_handlers_ so notifications won't be dispatched even if UNLISTEN
     // hasn't been sent yet.
@@ -1396,6 +1400,11 @@ void PgPool::restart_listener(std::string_view reason)
     // Answered by the connection that just died: live no more. Reached from
     // inside dispatch_listen_ready() too, when a handler kills the listener.
     confirmed_listens_.clear();
+    // A new connection gets the whole registry as one batch again; a channel
+    // refused by the old one is tried afresh (and split out again if bad).
+    single_listens_.clear();
+    rejected_listens_.clear();
+    sent_batch_size_ = 0;
 
     // Safe to call unconditionally (no hot-loop risk): start_listener() itself
     // checks next_connect_attempt_ and defers via schedule_reconnect_timer()
@@ -1409,10 +1418,23 @@ void PgPool::send_pending_listens()
     if (pending_listens_.empty() || !listener_)
         return;
 
+    std::unordered_set<std::string> sent;
+    if (!single_listens_.empty()) {
+        auto node = single_listens_.extract(single_listens_.begin());
+        pending_listens_.erase(node.value());
+        sent.insert(std::move(node.value()));
+    } else {
+        sent = std::move(pending_listens_);
+        pending_listens_.clear();
+    }
+
+    // Quoted as an identifier: a channel name is data — WebSocketAPI reads
+    // them from the database — and a bare `"` in one made the whole batch a
+    // syntax error, taking every other channel in it down too.
     std::string sql;
     std::string names;
-    for (const auto& ch : pending_listens_) {
-        sql += "LISTEN \"" + ch + "\";";
+    for (const auto& ch : sent) {
+        sql += "LISTEN " + pq_quote_ident(ch) + ";";
         if (!names.empty())
             names += ", ";
         names += ch;
@@ -1425,18 +1447,16 @@ void PgPool::send_pending_listens()
     if (pg_logger_)
         pg_logger_->notice("{} LISTEN {}", conn_tag(*listener_), names);
 
-    auto sent = std::move(pending_listens_);
-    pending_listens_.clear();
-
     if (!listener_->send_query(sql)) {  // listener → Busy
-        // The channels were cleared above. Losing them here would leave a
+        // The channels were taken out above. Losing them here would leave a
         // healthy listener subscribed to nothing — the same silent outcome
         // by a different route.
-        pending_listens_ = std::move(sent);
+        pending_listens_.insert(sent.begin(), sent.end());
         restart_listener("send_query failed while shipping LISTEN");
         return;
     }
 
+    sent_batch_size_ = sent.size();
     sent_listens_.insert(sent.begin(), sent.end());
 }
 
@@ -1518,9 +1538,29 @@ void PgPool::on_listener_io(uint32_t events)
             // The answer to the batch shipped last. Taken before anything below
             // can ship the next one. A batch runs as one implicit transaction,
             // so a single failed LISTEN rolls back the rest: none is confirmed.
-            if (all_ok)
+            if (all_ok) {
+                for (const auto& ch : sent_listens_)
+                    rejected_listens_.erase(ch);
                 confirmed_listens_.insert(sent_listens_.begin(), sent_listens_.end());
+            } else if (sent_batch_size_ > 1) {
+                // Which one is bad is unknown; the rest are innocent. Before,
+                // the whole batch was dropped here with one error line.
+                if (pg_logger_)
+                    pg_logger_->error("{} LISTEN batch of {} channel(s) rejected — resending one per query",
+                                      conn_tag(*listener_), sent_batch_size_);
+                for (const auto& ch : sent_listens_) {
+                    pending_listens_.insert(ch);
+                    single_listens_.insert(ch);
+                }
+            } else if (!sent_listens_.empty()) {
+                const auto& ch = *sent_listens_.begin();
+                rejected_listens_.insert(ch);
+                if (pg_logger_)
+                    pg_logger_->error("{} LISTEN {} rejected by the server — channel NOT subscribed until the listener is replaced",
+                                      conn_tag(*listener_), pq_quote_ident(ch));
+            }
             sent_listens_.clear();
+            sent_batch_size_ = 0;
 
             // Command completed (LISTEN/UNLISTEN returned PGRES_COMMAND_OK)
             // Send any further pending listens, or transition to Ready
@@ -1537,15 +1577,28 @@ void PgPool::on_listener_io(uint32_t events)
                 send_pending_listens();   // → Busy again
                 if (listener_.get() != before)
                     return;               // listener replaced or gone — the tail is not ours
-            } else if (all_ok && pg_logger_) {
+            } else if ((all_ok || !rejected_listens_.empty()) && pg_logger_) {
                 // The confirmation half of the pair: the command was shipped
                 // AND the server acknowledged it. This line is what tells an
                 // operator that a silent channel is subscribed rather than
                 // orphaned. Worded for both commands that land here — after an
                 // UNLISTEN "established" would name the wrong event, while the
-                // count stays right either way.
-                pg_logger_->notice("{} LISTEN active on {} channel(s)",
-                                  conn_tag(*listener_), notify_handlers_.size());
+                // count stays right either way. A refused channel is counted
+                // out and named: the registry holds it, the server does not.
+                const std::size_t active = notify_handlers_.size() - rejected_listens_.size();
+                if (rejected_listens_.empty()) {
+                    pg_logger_->notice("{} LISTEN active on {} channel(s)",
+                                      conn_tag(*listener_), active);
+                } else {
+                    std::string refused;
+                    for (const auto& ch : rejected_listens_) {
+                        if (!refused.empty())
+                            refused += ", ";
+                        refused += pq_quote_ident(ch);
+                    }
+                    pg_logger_->error("{} LISTEN active on {} channel(s), NOT subscribed: {}",
+                                      conn_tag(*listener_), active, refused);
+                }
             }
             // In either case, check for notifications that arrived simultaneously
             if (listener_->consume_notify([this](const char* ch, const char* payload) {
