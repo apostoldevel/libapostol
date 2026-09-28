@@ -1233,12 +1233,23 @@ void PgPool::heartbeat()
 
 // ── PgPool — LISTEN / NOTIFY ──────────────────────────────────────────────────
 
-void PgPool::listen(const std::string& channel, NotifyHandler cb)
+void PgPool::listen(const std::string& channel, NotifyHandler cb, ListenReadyHandler on_ready)
 {
     bool is_new_channel = !notify_handlers_.contains(channel);
     notify_handlers_[channel].push_back(std::move(cb));
 
-    if (is_new_channel)
+    // A second subscriber to a live channel would otherwise wait for the next
+    // reconnect to hear that it is live. Re-sending LISTEN costs nothing on
+    // the server, and its answer is the one thing that may say "ready". Not
+    // when an answer for the channel is already on its way or already read:
+    // handlers are looked up when it is dispatched, so it covers this one.
+    const bool answer_coming = sent_listens_.contains(channel) ||
+                               confirmed_listens_.contains(channel);
+    const bool wants_ready   = static_cast<bool>(on_ready);
+    if (wants_ready)
+        ready_handlers_[channel].push_back(std::move(on_ready));
+
+    if (is_new_channel || (wants_ready && !answer_coming))
         pending_listens_.insert(channel);
 
     if (!listener_) {
@@ -1266,7 +1277,10 @@ void PgPool::unlisten(std::string_view channel)
 {
     std::string ch(channel);
     notify_handlers_.erase(ch);
+    ready_handlers_.erase(ch);
     pending_listens_.erase(ch);
+    sent_listens_.erase(ch);
+    confirmed_listens_.erase(ch);
 
     if (listener_ && listener_->state() == PgConnState::Ready)
         listener_->send_query("UNLISTEN \"" + ch + "\"");
@@ -1288,6 +1302,7 @@ void PgPool::start_listener()
     }
 
     listener_ = std::make_unique<PgConnection>(conninfo_);
+    ++listener_gen_;
     setup_notice_handler(*listener_);
 
     if (!listener_->connect_start()) {
@@ -1374,6 +1389,14 @@ void PgPool::restart_listener(std::string_view reason)
     for (const auto& [ch, _] : notify_handlers_)
         pending_listens_.insert(ch);
 
+    // A LISTEN shipped on the dead connection and never answered confirms
+    // nothing; the channel is in pending_listens_ again, and the next
+    // listener's answer is the one that will say it is live.
+    sent_listens_.clear();
+    // Answered by the connection that just died: live no more. Reached from
+    // inside dispatch_listen_ready() too, when a handler kills the listener.
+    confirmed_listens_.clear();
+
     // Safe to call unconditionally (no hot-loop risk): start_listener() itself
     // checks next_connect_attempt_ and defers via schedule_reconnect_timer()
     // when a connect attempt would be premature or fails again.
@@ -1411,7 +1434,10 @@ void PgPool::send_pending_listens()
         // by a different route.
         pending_listens_ = std::move(sent);
         restart_listener("send_query failed while shipping LISTEN");
+        return;
     }
+
+    sent_listens_.insert(sent.begin(), sent.end());
 }
 
 void PgPool::on_listener_io(uint32_t events)
@@ -1489,6 +1515,13 @@ void PgPool::on_listener_io(uint32_t events)
                     pg_logger_->error("{} Listener {}", conn_tag(*listener_), r.error_message());
             }
 
+            // The answer to the batch shipped last. Taken before anything below
+            // can ship the next one. A batch runs as one implicit transaction,
+            // so a single failed LISTEN rolls back the rest: none is confirmed.
+            if (all_ok)
+                confirmed_listens_.insert(sent_listens_.begin(), sent_listens_.end());
+            sent_listens_.clear();
+
             // Command completed (LISTEN/UNLISTEN returned PGRES_COMMAND_OK)
             // Send any further pending listens, or transition to Ready
             if (!pending_listens_.empty()) {
@@ -1521,6 +1554,16 @@ void PgPool::on_listener_io(uint32_t events)
             {
                 restart_listener("PQconsumeInput failed right after LISTEN");
                 return;
+            }
+
+            // Last, and on its own guard: a handler may call listen(),
+            // unlisten() or anything that replaces the listener, and the rearm
+            // below must not touch a connection it did not see.
+            if (!confirmed_listens_.empty()) {
+                const auto gen = listener_gen_;
+                dispatch_listen_ready();
+                if (!listener_ || listener_gen_ != gen)
+                    return;
             }
             break;
         }
@@ -1575,6 +1618,27 @@ void PgPool::dispatch_notify(const char* channel, const char* payload)
     auto handlers = it->second;
     for (const auto& cb : handlers)
         cb(channel, payload ? payload : "");
+}
+
+void PgPool::dispatch_listen_ready()
+{
+    // One channel at a time, taken out of the member set before its handlers
+    // run: a handler may unlisten() a channel still waiting here (struck out,
+    // so a later listen() of it waits for its own answer) or kill the
+    // listener (restart_listener() empties the set — nothing it held is live).
+    while (!confirmed_listens_.empty()) {
+        const std::string ch =
+            std::move(confirmed_listens_.extract(confirmed_listens_.begin()).value());
+
+        auto it = ready_handlers_.find(ch);
+        if (it == ready_handlers_.end())
+            continue;
+
+        // Copy the handler list — callbacks may mutate ready_handlers_
+        auto handlers = it->second;
+        for (const auto& cb : handlers)
+            cb(ch);
+    }
 }
 
 } // namespace apostol

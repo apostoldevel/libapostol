@@ -18,6 +18,12 @@
 #include <unordered_set>
 #include <vector>
 
+// PgPool::listen() takes a third argument, ListenReadyHandler. Modules are
+// pinned against different libapostol revisions across projects; a module
+// that wants the hook tests this macro instead of failing to build on an
+// older library.
+#define APOSTOL_PG_LISTEN_READY 1
+
 namespace apostol
 {
 
@@ -301,10 +307,30 @@ public:
     using NotifyHandler = std::function<void(std::string_view channel,
                                              std::string_view payload)>;
 
+    /// Called when the server has acknowledged LISTEN on `channel`.
+    using ListenReadyHandler = std::function<void(std::string_view channel)>;
+
     /// Subscribe to a PostgreSQL channel.
     /// The callback is invoked from within the EventLoop for each notification.
     /// May be called before or after start().
-    void listen(const std::string& channel, NotifyHandler cb);
+    ///
+    /// `on_ready` fires, from within the EventLoop, each time the server
+    /// acknowledges LISTEN on the channel: the first subscription and every
+    /// re-subscription after the listener connection is lost and replaced
+    /// (the process keeps running; the pool reconnects on its own). A NOTIFY
+    /// committed after that moment will be delivered; one committed before it
+    /// may have been lost, and the handler is where a consumer looks for it.
+    ///
+    /// It may fire more often than the connection is lost: subscribing with
+    /// `on_ready` to a channel that is already live re-sends LISTEN (a no-op on
+    /// the server) so that the new subscriber gets its call, and the answer
+    /// fires every `on_ready` of that channel. It never fires on a LISTEN the
+    /// server rejected, nor for one shipped on a connection lost before the
+    /// answer came — that channel is confirmed by the next listener instead.
+    /// A server that rejects every LISTEN (a hot standby: "cannot execute
+    /// LISTEN during recovery") therefore never fires it at all.
+    void listen(const std::string& channel, NotifyHandler cb,
+                ListenReadyHandler on_ready = {});
 
     /// Unsubscribe from a channel (removes all callbacks for that channel).
     void unlisten(std::string_view channel);
@@ -403,10 +429,23 @@ private:
     void on_listener_io(uint32_t events);
     void send_pending_listens();
     void dispatch_notify(const char* channel, const char* payload);
+    void dispatch_listen_ready();
 
     std::unique_ptr<PgConnection>                               listener_;
     std::unordered_map<std::string, std::vector<NotifyHandler>> notify_handlers_;
+    std::unordered_map<std::string, std::vector<ListenReadyHandler>> ready_handlers_;
     std::unordered_set<std::string>                             pending_listens_;
+    // Shipped by send_pending_listens(), answer not read yet. Only the answer
+    // makes a subscription real; the send alone does not.
+    std::unordered_set<std::string>                             sent_listens_;
+    // Answered, on_ready not called yet. A member, not a local, so that
+    // unlisten() and restart_listener() can strike a channel out of it while
+    // handlers of the same batch are running.
+    std::unordered_set<std::string>                             confirmed_listens_;
+    // Bumped each time start_listener() creates a connection. Tells a caller
+    // that ran handlers whether the listener it held is still the same one —
+    // a pointer comparison cannot, since a new object may reuse the address.
+    std::uint64_t                                               listener_gen_{0};
 };
 
 } // namespace apostol
