@@ -270,7 +270,8 @@ role active and the rest waiting:
 
 - `process.leader` — applies to the helper process and to every custom process;
   `module.<Name>.leader` overrides it for one custom process. Workers are not
-  affected.
+  affected. Either key is checked with the file — a value that is not a bool,
+  or `true` without `postgres.helper`, refuses a start, a reload and `-t`.
 - Before its modules start, the process takes `pg_try_advisory_lock` on a
   dedicated connection (the `postgres.helper` settings), key
   `"<application>/<role>"`. Holding it — it starts; otherwise it waits as
@@ -290,7 +291,9 @@ role active and the rest waiting:
   timeout, so a leader that vanished without closing its socket frees the role
   in about a minute, after it has stepped down on its own clock.
 - Timer-driven work (`heartbeat`) of a leader past a stall waits until the lock
-  is confirmed again. Work arriving on sockets — a NOTIFY read in the same wake-up
+  is confirmed again, and before each beat the lock's socket is asked whether
+  the server has closed it: a session killed while the process stood is a loss
+  before the beat, not after. Work arriving on sockets — a NOTIFY read in the same wake-up
   as the loss — cannot be ordered that way: where a duplicate costs money, claim
   the row in the database as well.
 
