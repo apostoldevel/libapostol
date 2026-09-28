@@ -1425,12 +1425,32 @@ pid_t Application::fork_child(ProcessRole role, std::string child_name,
 
         role_ = role;
 
-        if (role == ProcessRole::worker)
-            worker_run();
-        else if (role == ProcessRole::helper)
-            helper_run();
-        else if (role == ProcessRole::custom && custom_fn)
-            custom_fn();
+        // Nothing may unwind past this point. Above it are the master's frames,
+        // copied by fork() — and a respawn forks from inside the master's loop,
+        // so they include master_run() and its EventLoop. An exception out of the
+        // child's own loop used to reach the catch in run() through them: the
+        // copy of ~EventLoop took the signalfd off the epoll instance the child
+        // shares with the master, and the master stopped hearing signals —
+        // SIGCHLD and SIGTERM pending, children left as zombies, only kill -9
+        // (T597). std::exception only, as run() catches: anything else still
+        // terminates without unwinding. The log line is guarded too — a throw
+        // from it (a failed write, a rotation) would leave by the same road.
+        try
+        {
+            if (role == ProcessRole::worker)
+                worker_run();
+            else if (role == ProcessRole::helper)
+                helper_run();
+            else if (role == ProcessRole::custom && custom_fn)
+                custom_fn();
+        }
+        catch (const std::exception& e)
+        {
+            exit_code_ = 1;
+            try {
+                logger_->error("{} '{}' fatal: {}", role_name(role), child_name, e.what());
+            } catch (...) {}
+        }
 
         // exit_code_, not a literal 0: a child whose startup threw sets exit_code_
         // to 1 and returns here, and exiting 0 anyway reported a failed start to the
