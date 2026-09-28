@@ -1,5 +1,7 @@
 #include "apostol/event_loop.hpp"
+#include "apostol/logger.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <fmt/format.h>
 #include <stdexcept>
@@ -156,18 +158,69 @@ void EventLoop::add_io(int fd, uint32_t events, IOCallback cb)
     io_handlers_[fd] = {events, std::move(cb)};
 }
 
-void EventLoop::modify_io(int fd, uint32_t events)
+namespace
+{
+// Process-wide: every loop of the process reports to the same log. Atomic only
+// for the reader's sake; it is set once, before any loop runs.
+std::atomic<Logger*> g_diagnostics{nullptr};
+
+// EPOLL_CTL_MOD failed because the socket a handler was registered for is
+// gone: EBADF — the descriptor is closed; ENOENT — the registration went with
+// a close (the number may be open again, under anyone); EPERM — the number
+// now names something epoll cannot watch. One policy for modify_io() and
+// rearm_io(): the handler is dropped, nothing is registered in its place.
+bool registration_lost(int err) noexcept
+{
+    return err == EBADF || err == ENOENT || err == EPERM;
+}
+}
+
+void EventLoop::set_diagnostics(Logger* logger) noexcept
+{
+    g_diagnostics.store(logger, std::memory_order_relaxed);
+}
+
+void EventLoop::unset_diagnostics(Logger* logger) noexcept
+{
+    g_diagnostics.compare_exchange_strong(logger, nullptr, std::memory_order_relaxed);
+}
+
+bool EventLoop::modify_io(int fd, uint32_t events)
 {
     epoll_event ev{};
     ev.events = events | kExtraFlags;
     ev.data.fd = fd;
 
-    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0)
-        throw std::system_error(errno, std::system_category(),
+    auto it = io_handlers_.find(fd);
+
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) == 0)
+    {
+        if (it != io_handlers_.end())
+            it->second.events = events;
+        return true;
+    }
+
+    const int err = errno;
+    if (!registration_lost(err))
+        throw std::system_error(err, std::system_category(),
             fmt::format("epoll_ctl MOD fd={}", fd));
 
-    if (auto it = io_handlers_.find(fd); it != io_handlers_.end())
-        it->second.events = events;
+    // No handler: the caller let go of this fd itself (remove_io) and is
+    // asking about a registration it no longer holds — nothing to report.
+    if (it == io_handlers_.end())
+        return false;
+
+    // Not registered again even when the number is open: whoever opened it is
+    // not known here, and a holder that keeps going on a number it did not
+    // open reads a socket that is not its own. The loud path — the holder
+    // drops the connection and makes a new one — is the one that cannot go
+    // wrong quietly. A library that swaps sockets under its holder is fixed
+    // at the source (libpq, T596), not here.
+    io_handlers_.erase(it);
+    if (Logger* log = g_diagnostics.load(std::memory_order_relaxed))
+        log->error("epoll_ctl MOD fd={}: {} — handler dropped, the caller's socket is not watched",
+                   fd, std::system_category().message(err));
+    return false;
 }
 
 void EventLoop::rearm_io(int fd, uint32_t events)
@@ -194,12 +247,13 @@ void EventLoop::rearm_io(int fd, uint32_t events)
         // fd), then return. This must NOT escalate to an exception: a single
         // mistimed fd closure would otherwise unwind the whole worker and
         // tear down every other healthy connection it serves.
-        if (errno == EBADF || errno == ENOENT || errno == EPERM)
+        const int err = errno;
+        if (registration_lost(err))
         {
             io_handlers_.erase(it);
             return;
         }
-        throw std::system_error(errno, std::system_category(),
+        throw std::system_error(err, std::system_category(),
             fmt::format("epoll_ctl MOD (rearm) fd={}", fd));
     }
 

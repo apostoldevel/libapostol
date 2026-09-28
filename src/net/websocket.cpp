@@ -374,8 +374,20 @@ void WsConnection::arm_write_interest()
     // later registers the WS fd with additional flags (e.g. EPOLLRDHUP for
     // peer half-close detection), this modify_io will drop them. Revisit
     // this assumption if the WebSocketAPI handler widens its mask.
-    if (loop_ && !closed_ && conn_.fd() >= 0)
-        loop_->modify_io(conn_.fd(), EPOLLIN | EPOLLOUT);
+    if (loop_ && !closed_ && conn_.fd() >= 0 &&
+        !loop_->modify_io(conn_.fd(), EPOLLIN | EPOLLOUT))
+        lost_watch();
+}
+
+void WsConnection::lost_watch()
+{
+    // Closed under us (T607): the loop has dropped the handler, so neither
+    // EPOLLOUT for the queued tail nor the peer's close will ever arrive. As
+    // with a fatal write — closed(), and the session is torn down by whoever
+    // polls it.
+    closed_ = true;
+    pending_.clear();
+    pending_pos_ = 0;
 }
 
 void WsConnection::send_raw(uint8_t opcode, std::string_view payload, bool fin)
@@ -463,8 +475,9 @@ bool WsConnection::on_writable()
     pending_pos_ = 0;
 
     // Fully drained — drop EPOLLOUT interest.
-    if (loop_ && !closed_ && conn_.fd() >= 0)
-        loop_->modify_io(conn_.fd(), EPOLLIN);
+    if (loop_ && !closed_ && conn_.fd() >= 0 &&
+        !loop_->modify_io(conn_.fd(), EPOLLIN))
+        lost_watch();
 
     return true;
 }

@@ -689,7 +689,19 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
             if ((events & EPOLLOUT) && conn.needs_flush()) {
                 if (conn.flush()) {
                     // Fully flushed — only need EPOLLIN for results
-                    loop_.modify_io(conn.fd(), EPOLLIN);
+                    if (!loop_.modify_io(conn.fd(), EPOLLIN)) {
+                        // The loop no longer watches the socket (closed under
+                        // us, T607): no result will ever be read from it.
+                        // Lost like any other — the path PQconsumeInput
+                        // failing takes below.
+                        if (pg_logger_)
+                            pg_logger_->error("{} Socket fd={} is no longer watched, reconnecting",
+                                             conn_tag(conn), conn.fd());
+                        fail_inflight_query(conn, "socket no longer watched");
+                        if (!try_reconnect(conn))
+                            replace_connection(conn);
+                        break;
+                    }
                 }
                 // If flush() returned false (PQflush==1), keep EPOLLOUT
                 if (!(events & EPOLLIN))
@@ -952,9 +964,20 @@ void PgPool::dispatch_queue(PgConnection& conn)
         return;
     }
 
-    // If flush was incomplete, need EPOLLOUT to continue flushing
-    if (conn.needs_flush())
-        loop_.modify_io(conn.fd(), EPOLLIN | EPOLLOUT);
+    // If flush was incomplete, need EPOLLOUT to continue flushing. A socket
+    // the loop no longer watches (T607) would leave the rest unsent for good;
+    // the server has not got the whole statement, so it has not run it —
+    // re-queued as when send_query fails.
+    if (conn.needs_flush() && !loop_.modify_io(conn.fd(), EPOLLIN | EPOLLOUT)) {
+        if (pg_logger_)
+            pg_logger_->error("{} Socket fd={} is no longer watched in dispatch, re-queuing",
+                             conn_tag(conn), conn.fd());
+        conn.set_current_query(nullptr);
+        queue_.push(std::move(query));
+        conn.set_state(PgConnState::Error);
+        try_reconnect(conn);
+        return;
+    }
 
     inflight_.push_back(std::move(query));
 }
@@ -990,14 +1013,20 @@ PgPool::QueryId PgPool::execute(std::string              sql,
                 pg_logger_->debug("{} Query: {}", conn_tag(*c), q->sql());
 
             if (c->send_query(q->sql())) {
-                if (c->needs_flush())
-                    loop_.modify_io(c->fd(), EPOLLIN | EPOLLOUT);
-                inflight_.push_back(std::move(q));
-                return qid;
+                // A partial flush on a socket the loop no longer watches
+                // (T607): the rest would never go out, and the server, not
+                // having the whole statement, has not run it — on to the next
+                // connection, as when send_query fails.
+                if (!c->needs_flush() || loop_.modify_io(c->fd(), EPOLLIN | EPOLLOUT)) {
+                    inflight_.push_back(std::move(q));
+                    return qid;
+                }
+                if (pg_logger_)
+                    pg_logger_->error("{} Socket fd={} is no longer watched, reconnecting",
+                                     conn_tag(*c), c->fd());
             }
-
             // send_query failed — connection probably died
-            if (pg_logger_)
+            else if (pg_logger_)
                 pg_logger_->error("{} send_query failed (state={}): {}, reconnecting",
                                  conn_tag(*c),
                                  static_cast<int>(c->state()),

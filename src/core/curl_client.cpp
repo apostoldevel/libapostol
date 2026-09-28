@@ -51,6 +51,8 @@ CurlClient::~CurlClient()
 {
     if (timer_id_ != EventLoop::kInvalidTimer)
         loop_.cancel_timer(timer_id_);
+    if (lost_timer_ != EventLoop::kInvalidTimer)
+        loop_.cancel_timer(lost_timer_);
 
     // Remove any leftover registered fds from the event loop
     for (auto fd : registered_fds_)
@@ -205,6 +207,11 @@ int CurlClient::socket_callback(CURL* /*easy*/, curl_socket_t s, int what,
         self->loop_.remove_io(static_cast<int>(s));
         auto& fds = self->registered_fds_;
         fds.erase(std::remove(fds.begin(), fds.end(), s), fds.end());
+        // curl let go of a socket reported lost below: its number is free, and
+        // the next socket curl opens will likely get it — that one must be
+        // registered, and must not get the error meant for this one.
+        auto& lost = self->lost_fds_;
+        lost.erase(std::remove(lost.begin(), lost.end(), s), lost.end());
         return 0;
     }
 
@@ -217,7 +224,30 @@ int CurlClient::socket_callback(CURL* /*easy*/, curl_socket_t s, int what,
     bool already = std::find(fds.begin(), fds.end(), s) != fds.end();
 
     if (already) {
-        self->loop_.modify_io(static_cast<int>(s), events);
+        if (!self->loop_.modify_io(static_cast<int>(s), events)) {
+            // Closed under curl (T607): the loop has dropped the handler, and
+            // curl, which waits on this socket, would wait for good unless the
+            // transfer has a timeout. Forget the registration and tell curl
+            // the socket failed — from a timer, not from inside this callback.
+            fds.erase(std::remove(fds.begin(), fds.end(), s), fds.end());
+            self->lost_fds_.push_back(s);
+            if (self->lost_timer_ == EventLoop::kInvalidTimer)
+                self->lost_timer_ = self->loop_.add_timer(std::chrono::milliseconds(1),
+                    [self]() {
+                        self->lost_timer_ = EventLoop::kInvalidTimer;
+                        auto lost = std::move(self->lost_fds_);
+                        self->lost_fds_.clear();
+                        int still_running = 0;
+                        for (auto fd : lost)
+                            curl_multi_socket_action(self->multi_, fd, CURL_CSELECT_ERR, &still_running);
+                        self->check_multi_info();
+                    },
+                    /*repeat=*/false);
+        }
+    } else if (std::find(self->lost_fds_.begin(), self->lost_fds_.end(), s) != self->lost_fds_.end()) {
+        // Already reported as failed (above), the timer has not run yet: not
+        // registered again — add_io on a closed number would throw, and from
+        // here through libcurl's frames.
     } else {
         fds.push_back(s);
         self->loop_.add_io(static_cast<int>(s), events,

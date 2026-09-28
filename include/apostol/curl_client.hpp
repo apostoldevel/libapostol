@@ -96,6 +96,12 @@ private:
 
     // Track registered socket fds so we can clean up properly
     std::vector<curl_socket_t> registered_fds_;
+
+    // Sockets the loop stopped watching under curl (T607), reported back to
+    // curl as errored from a one-shot timer — curl_multi_socket_action may
+    // not be called from inside socket_callback.
+    std::vector<curl_socket_t> lost_fds_;
+    EventLoop::TimerId lost_timer_{EventLoop::kInvalidTimer};
 };
 
 } // namespace apostol

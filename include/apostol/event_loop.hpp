@@ -12,6 +12,8 @@
 namespace apostol
 {
 
+class Logger;
+
 // ─── EventLoop ───────────────────────────────────────────────────────────────
 //
 // Single-threaded event loop based on epoll + timerfd + signalfd.
@@ -61,8 +63,26 @@ public:
     // Register fd for epoll. events: EPOLLIN, EPOLLOUT, EPOLLET, etc.
     void add_io(int fd, uint32_t events, IOCallback cb);
 
-    // Change monitored events for an already-registered fd.
-    void modify_io(int fd, uint32_t events);
+    // Change monitored events for an already-registered fd. Returns true when
+    // the fd is registered with @p events afterwards.
+    //
+    // A registration can vanish under its holder: epoll drops it when the
+    // descriptor is closed, whoever closed it. That used to throw out of the
+    // loop and take the process down (T596, T607). Now, on EBADF, ENOENT or
+    // EPERM the handler is dropped — a later socket with this number cannot
+    // reach it — an error is logged through set_diagnostics(), and false is
+    // returned: the caller's socket is not watched any more, and the caller
+    // must treat it as a lost connection (close it, fail what was in flight,
+    // reconnect). The fd is never registered again here, even when the number
+    // is open: this loop cannot tell who opened it. Any other error throws.
+    [[nodiscard]] bool modify_io(int fd, uint32_t events);
+
+    // Where EventLoop reports what it tolerated instead of throwing. One per
+    // process, for every loop in it; Application sets its log here.
+    // nullptr (the default) — not reported.
+    static void set_diagnostics(Logger* logger) noexcept;
+    // Clears the setting only if @p logger is the one set.
+    static void unset_diagnostics(Logger* logger) noexcept;
 
     // Re-arm a fd registered with APOSTOL_EPOLL_ET (edge-triggered + one-shot)
     // so further events resume being delivered. With @p events==0 (default)

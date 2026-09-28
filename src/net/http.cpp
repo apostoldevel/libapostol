@@ -861,7 +861,7 @@ bool HttpConnection::on_readable(RequestHandler handler)
     }
 
     update_interest();
-    return true;
+    return !closed_;   // the loop may have let go of the fd (update_interest)
 }
 
 bool HttpConnection::feed_input(const char* data, std::size_t len)
@@ -1264,15 +1264,14 @@ void HttpConnection::update_interest()
     // One epoll_ctl per change, not per request: a keep-alive /ping never
     // leaves EPOLLIN | EPOLLRDHUP and never pays for this.
     if (m != mask_) {
-        try {
-            loop_->modify_io(conn_.fd(), m);
+        if (loop_->modify_io(conn_.fd(), m))
             mask_ = m;
-        } catch (const std::system_error&) {
+        else
             // The fd is no longer in the loop — dropped by the caller after
-            // something threw. Nothing is going to read or write it again;
-            // throwing here would do it inside a module's callback.
+            // something threw, or closed under us; the loop has let go of the
+            // handler, and with it of this connection. Nothing is going to
+            // read or write it again.
             closed_ = true;
-        }
     }
 }
 

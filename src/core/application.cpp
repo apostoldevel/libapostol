@@ -68,10 +68,16 @@ Application::Application(std::string_view name) : name_(name), logger_(std::make
     // Default: log to stderr at info level until config is loaded
     logger_->add_target(std::make_unique<StderrTarget>());
     logger_->set_level(LogLevel::info);
+
+    // Every loop of the process — master, worker, helper, custom — reports
+    // what it tolerated (EventLoop::modify_io) to the error log. The logger
+    // lives as long as the Application; fork keeps the pointer valid.
+    EventLoop::set_diagnostics(logger_.get());
 }
 
 Application::~Application()
 {
+    EventLoop::unset_diagnostics(logger_.get());
     delete[] os_environ_;
 }
 

@@ -265,8 +265,11 @@ void PgLeaderLock::on_io(std::uint32_t events)
         }
 
         case PgConnState::Busy: {
-            if ((events & EPOLLOUT) && conn_->needs_flush() && conn_->flush())
-                loop_.modify_io(conn_->fd(), EPOLLIN);
+            if ((events & EPOLLOUT) && conn_->needs_flush() && conn_->flush() &&
+                !loop_.modify_io(conn_->fd(), EPOLLIN)) {
+                drop("the socket is no longer watched");   // closed under us (T607)
+                return;
+            }
 
             auto results = conn_->collect_results();
             if (results.empty()) {
@@ -350,8 +353,9 @@ void PgLeaderLock::send(Ask what)
     asked_ = what;
     since_ = std::chrono::steady_clock::now();
 
-    if (conn_->needs_flush() && conn_->fd() >= 0)
-        loop_.modify_io(conn_->fd(), EPOLLIN | EPOLLOUT);
+    if (conn_->needs_flush() && conn_->fd() >= 0 &&
+        !loop_.modify_io(conn_->fd(), EPOLLIN | EPOLLOUT))
+        drop("the socket is no longer watched");   // closed under us (T607)
 }
 
 void PgLeaderLock::handle(std::vector<PgResult>& results)

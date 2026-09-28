@@ -76,10 +76,8 @@ void TcpClient::send(std::string_view data)
     bool was_empty = output_.empty();
     output_.push_back({std::string(data), 0});
 
-    if (was_empty) {
-        // Start monitoring EPOLLOUT
-        loop_.modify_io(fd_, EPOLLIN | EPOLLOUT);
-    }
+    if (was_empty)
+        (void)watch(EPOLLIN | EPOLLOUT);   // start monitoring EPOLLOUT
 }
 
 void TcpClient::close()
@@ -213,8 +211,8 @@ void TcpClient::handle_connect_result()
 #ifdef WITH_SSL
     if (tls_enabled_) {
         state_ = TcpClientState::TlsHandshake;
-        loop_.modify_io(fd_, EPOLLIN | EPOLLOUT);
-        do_tls_handshake();
+        if (watch(EPOLLIN | EPOLLOUT))
+            do_tls_handshake();
         return;
     }
 #endif
@@ -234,7 +232,8 @@ void TcpClient::on_connected()
 
     if (fd_ >= 0) {
         if (io_registered_) {
-            loop_.modify_io(fd_, events);
+            if (!watch(events))
+                return;
         } else {
             loop_.add_io(fd_, events, [this](uint32_t ev) { on_io(ev); });
             io_registered_ = true;
@@ -320,7 +319,7 @@ void TcpClient::drain_output()
 
     // All data sent — stop monitoring EPOLLOUT
     if (fd_ >= 0 && state_ == TcpClientState::Connected)
-        loop_.modify_io(fd_, EPOLLIN);
+        (void)watch(EPOLLIN);
 }
 
 // ─── Error handling ──────────────────────────────────────────────────────────
@@ -335,6 +334,19 @@ void TcpClient::enter_error(std::string_view msg)
         on_error_(msg);
 
     (void)prev_state;
+}
+
+bool TcpClient::watch(uint32_t events)
+{
+    if (loop_.modify_io(fd_, events))
+        return true;
+
+    // Closed under us (T607): the loop has dropped the handler, so no event
+    // will come for this socket — without a timer the client would wait
+    // forever. Nothing left to remove_io.
+    io_registered_ = false;
+    enter_error("the socket is no longer watched");
+    return false;
 }
 
 void TcpClient::cleanup()
@@ -416,8 +428,8 @@ void TcpClient::start_tls()
 
     tls_enabled_ = true;
     state_ = TcpClientState::TlsHandshake;
-    loop_.modify_io(fd_, EPOLLIN | EPOLLOUT);
-    do_tls_handshake();
+    if (watch(EPOLLIN | EPOLLOUT))
+        do_tls_handshake();
 }
 
 void TcpClient::do_tls_handshake()
@@ -461,10 +473,10 @@ void TcpClient::do_tls_handshake()
     int ssl_err = ::SSL_get_error(ssl_.get(), rc);
     switch (ssl_err) {
         case SSL_ERROR_WANT_READ:
-            loop_.modify_io(fd_, EPOLLIN);
+            (void)watch(EPOLLIN);
             break;
         case SSL_ERROR_WANT_WRITE:
-            loop_.modify_io(fd_, EPOLLOUT);
+            (void)watch(EPOLLOUT);
             break;
         default: {
             unsigned long e = ::ERR_get_error();

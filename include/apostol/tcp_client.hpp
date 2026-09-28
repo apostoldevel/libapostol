@@ -102,6 +102,9 @@ private:
     void handle_writable();
     void drain_output();
     void enter_error(std::string_view msg);
+    // modify_io() on fd_; false — the loop no longer watches it, and the
+    // client is in Error already (on_error_ has run: return at once).
+    bool watch(uint32_t events);
     void cleanup();
     void start_connect_timer();
     void cancel_connect_timer();
