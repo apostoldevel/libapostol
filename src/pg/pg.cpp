@@ -599,22 +599,20 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
     switch (conn.state()) {
 
         case PgConnState::Connecting: {
-            int old_fd = conn.fd();
+            // libpq may close the socket and open another inside one poll —
+            // the next host or address (host=pg1,pg2; localhost as ::1 then
+            // 127.0.0.1), target_session_attrs — and the new one usually gets
+            // the same number. Comparing numbers saw no change while epoll had
+            // dropped the registration with the close, so modify_io() below
+            // failed with ENOENT and threw out of the loop (T596). Take the fd
+            // out before polling and register whatever is there after — as
+            // PgLeaderLock::on_io does.
+            const int polled_fd = conn.fd();
+            if (polled_fd >= 0)
+                loop_.remove_io(polled_fd);
 
             // Use reset_poll for reconnecting connections, connect_poll for new ones
             auto ps = conn.resetting() ? conn.reset_poll() : conn.connect_poll();
-
-            // Handle fd change during handshake (docs: PQsocket can change after each poll)
-            int new_fd = conn.fd();
-            if (new_fd != old_fd) {
-                if (old_fd >= 0)
-                    loop_.remove_io(old_fd);
-                if (new_fd >= 0) {
-                    loop_.add_io(new_fd, EPOLLIN | EPOLLOUT, [this, &conn](uint32_t ev) {
-                        on_io(conn, ev);
-                    });
-                }
-            }
 
             if (pg_logger_)
                 pg_logger_->debug("{} {} PollingStatus: {}",
@@ -622,13 +620,26 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                                  conn.resetting() ? "Reset" : "Connect",
                                  polling_status_name(ps));
 
+            if (ps != PGRES_POLLING_FAILED && conn.fd() < 0) {
+                // No socket to wait on: no event would ever come for it.
+                if (pg_logger_)
+                    pg_logger_->error("{} {} left without a socket (was fd={}): {}",
+                                     conn_tag(conn), conn.resetting() ? "Reset" : "Connect",
+                                     polled_fd, conn.error_message());
+                record_connect_failure();
+                replace_connection(conn);
+                break;
+            }
+
             if (ps == PGRES_POLLING_OK) {
                 if (pg_logger_)
                     pg_logger_->notice("{} {}.",
                                       conn_tag(conn),
                                       conn.resetting() ? "Reconnected" : "Connected");
                 record_connect_success();
-                loop_.modify_io(conn.fd(), EPOLLIN);
+                loop_.add_io(conn.fd(), EPOLLIN, [this, &conn](uint32_t ev) {
+                    on_io(conn, ev);
+                });
                 dispatch_queue(conn);
             } else if (ps == PGRES_POLLING_FAILED) {
                 if (pg_logger_)
@@ -638,12 +649,13 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                 // Replace this dead connection
                 replace_connection(conn);
             } else {
-                // Adjust epoll for what poll needs next (Issue #5)
+                // Register for what poll needs next (Issue #5)
                 uint32_t want = (ps == PGRES_POLLING_READING) ? EPOLLIN
                               : (ps == PGRES_POLLING_WRITING) ? EPOLLOUT
                               : (EPOLLIN | EPOLLOUT);
-                if (conn.fd() >= 0)
-                    loop_.modify_io(conn.fd(), want);
+                loop_.add_io(conn.fd(), want, [this, &conn](uint32_t ev) {
+                    on_io(conn, ev);
+                });
             }
             break;
         }
@@ -844,7 +856,8 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
 
     // Under APOSTOL_EPOLL_ET the fd was armed with EPOLLONESHOT and the
     // kernel disabled further delivery. Rearm the current mask (set by
-    // modify_io inside the switch) so the next read/write transition is
+    // modify_io inside the switch, or by add_io in Connecting — there the
+    // rearm is redundant and harmless) so the next read/write transition is
     // signalled. Under LT (flag off) rearm_io is a no-op. registered_conns_
     // lookup is O(1) and survives replace_connection (which erases the
     // pointer from the set before destroying the object), so accessing
@@ -1468,21 +1481,45 @@ void PgPool::on_listener_io(uint32_t events)
     // Transition to Error state so the Error branch below reconnects from
     // scratch; without this the listener would silently loop rearming a
     // dead fd under LT, or stay disarmed under ET.
-    if (events & (EPOLLERR | EPOLLHUP))
+    //
+    // Not during the handshake: there the error is libpq's to judge. A refused
+    // connect reports EPOLLERR|EPOLLHUP, and connect_poll() is what moves on to
+    // the next address or host — taking it for a death restarted the listener
+    // from the first host every time, and with that host down it never
+    // subscribed (T596; the same as PgLeaderLock::on_io).
+    if ((events & (EPOLLERR | EPOLLHUP)) && listener_->state() != PgConnState::Connecting)
         listener_->set_state(PgConnState::Error);
 
     switch (listener_->state()) {
 
         case PgConnState::Connecting: {
+            // The socket may be replaced inside the poll under the same number
+            // (see on_io, T596): out before polling, registered after.
+            const int polled_fd = listener_->fd();
+            if (polled_fd >= 0)
+                loop_.remove_io(polled_fd);
+
             auto ps = listener_->connect_poll();
 
             if (pg_logger_)
                 pg_logger_->debug("{} Listener PollingStatus: {}", conn_tag(*listener_), polling_status_name(ps));
 
+            if (ps != PGRES_POLLING_FAILED && listener_->fd() < 0) {
+                if (pg_logger_)
+                    pg_logger_->error("{} Listener left without a socket (was fd={}): {}",
+                                     conn_tag(*listener_), polled_fd, listener_->error_message());
+                listener_.reset();
+                record_connect_failure();
+                schedule_reconnect_timer();
+                return;
+            }
+
             if (ps == PGRES_POLLING_OK) {
                 if (pg_logger_)
                     pg_logger_->notice("{} Listener Connected.", conn_tag(*listener_));
-                loop_.modify_io(listener_->fd(), EPOLLIN);
+                loop_.add_io(listener_->fd(), EPOLLIN, [this](uint32_t ev) {
+                    on_listener_io(ev);
+                });
                 if (!pending_listens_.empty())
                     send_pending_listens();
             } else if (ps == PGRES_POLLING_FAILED) {
@@ -1496,12 +1533,13 @@ void PgPool::on_listener_io(uint32_t events)
                 record_connect_failure();
                 schedule_reconnect_timer();
             } else {
-                // Adjust epoll for what poll needs next (same as worker connections)
+                // Register for what poll needs next (same as worker connections)
                 uint32_t want = (ps == PGRES_POLLING_READING) ? EPOLLIN
                               : (ps == PGRES_POLLING_WRITING) ? EPOLLOUT
                               : (EPOLLIN | EPOLLOUT);
-                if (listener_->fd() >= 0)
-                    loop_.modify_io(listener_->fd(), want);
+                loop_.add_io(listener_->fd(), want, [this](uint32_t ev) {
+                    on_listener_io(ev);
+                });
             }
             break;
         }
