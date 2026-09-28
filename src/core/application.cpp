@@ -1969,18 +1969,9 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
                                 // even if a handler throws. Leaking it armed-but-
                                 // disabled under ET = dark connection forever.
                                 try {
-                                    // Drain pending async writes (sendfile, buffered responses)
-                                    if (events & EPOLLOUT)
-                                        http_conn->on_writable();
-
-                                    if (!(events & (EPOLLIN | EPOLLRDHUP))) {
-                                        loop.rearm_io(conn_fd);
-                                        return;
-                                    }
-
                                     bool upgraded = false;
 
-                                    bool keep = http_conn->on_readable(
+                                    bool keep = http_conn->on_event(events,
                                         [this, &loop, &http_conn, conn_fd, &upgraded]
                                         (const HttpRequest& req, HttpResponse& resp)
                                         {

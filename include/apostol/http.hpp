@@ -3,6 +3,7 @@
 #include "apostol/tcp.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -189,7 +190,23 @@ public:
     void set_handler(Handler h) { handler_ = std::move(h); }
 
     /// Feed @p len bytes. Returns false if the parser encountered an error.
+    /// consumed() tells how many of them were parsed: fewer than @p len when
+    /// the handler called hold(), or when llhttp paused after an Upgrade
+    /// request (feed() returns false then, and malformed() is false).
     bool feed(const char* data, std::size_t len);
+
+    /// Stop after the request being dispatched: called from the handler, it
+    /// makes feed() return with the bytes after that request unparsed, so
+    /// that the caller can answer it before reading the next one (T314).
+    void hold() noexcept { hold_ = true; }
+
+    /// Bytes of the last feed() that were parsed.
+    std::size_t consumed() const noexcept { return consumed_; }
+
+    /// Go on parsing after an Upgrade request that was answered over HTTP/1.1
+    /// (h2c, a refused WebSocket handshake): RFC 9110 §7.8 lets a server
+    /// ignore Upgrade. Returns false unless feed() stopped on exactly that.
+    bool resume_after_upgrade() noexcept;
 
     /// Human-readable description of the last error (valid only when feed()
     /// returned false).
@@ -211,6 +228,8 @@ private:
     std::string   current_value_;   // partially received header field value
     bool          error_{false};
     bool          malformed_{false};
+    bool          hold_{false};
+    std::size_t   consumed_{0};
     std::string   error_msg_;
 
     Handler handler_;
@@ -300,7 +319,11 @@ private:
 // ─── HttpConnection ──────────────────────────────────────────────────────────
 
 /// Owns a TcpConnection and an HttpParser.
-/// Call on_readable() each time the fd becomes readable (EPOLLIN).
+/// Drive it with on_event() for every epoll event on its fd (as
+/// Application::start_http_server does): it reads, dispatches one request at a
+/// time, writes, and sets the fd's event mask itself. on_readable() remains
+/// for a synchronous caller without an EventLoop; with one, calling it while an
+/// answer is owed means "the peer left" and closes the connection.
 ///
 /// Supports async writes: if a write cannot complete immediately, the remainder
 /// is buffered and flushed via EPOLLOUT (requires EventLoop* passed to ctor).
@@ -326,6 +349,13 @@ public:
     /// request.  Sends the response synchronously via send_response().
     /// Returns false when the connection should be closed (EOF or parse error).
     bool on_readable(RequestHandler handler);
+
+    /// Handle one epoll event on this connection's fd: drain pending writes on
+    /// EPOLLOUT, then read and dispatch requests. The whole per-event step of
+    /// the server's I/O callback, so that a test drives the path the server
+    /// runs. Returns false when the caller should remove the fd from the loop;
+    /// otherwise the caller re-arms it.
+    bool on_event(uint32_t events, const RequestHandler& handler);
 
     /// Write the serialized response to the socket.
     /// If EventLoop is available and the write would block, the remainder is
@@ -354,20 +384,44 @@ private:
     HttpParser    parser_;
     EventLoop*    loop_{nullptr};
     bool          closed_{false};
-    bool          close_after_send_{false};  // deferred response + Connection: close
 
-    // Deferred responses handed out and not yet sent. A refusal of a
-    // malformed request must not overtake an answer still owed. Counted at one
-    // point — response_started(), called by send_response() and by the sending
-    // path of send_file() — and only for a deferred response that did not go
-    // out during its own dispatch (FileServer marks deferred and sends the
-    // file at once). Should the count ever run high, the only effect is the
-    // old silent close instead of a 400: nothing waits on it.
-    int           awaiting_deferred_{0};
+    // One request in work per connection (T314; RFC 9112 §9.3.2 wants answers
+    // in request order, and a module answering later through connection_ctx
+    // does not say which request it answers). While an answer is owed —
+    // deferred and not yet sent, or a file still being written — the parser
+    // holds after the request, the bytes read past it wait in pending_in_,
+    // and the socket is not read: EPOLLIN is off, EPOLLRDHUP stays on so that
+    // a client who left is noticed (there is no idle timeout, and an answer
+    // may never come). The answer arriving from a module's callback gives the
+    // reading back; the next request is parsed in this connection's own I/O
+    // callback, never inside the module's.
+    bool          awaiting_{false};          // deferred answer not yet started
     bool          dispatching_{false};
     bool          answered_in_dispatch_{false};
+    bool          close_after_send_{false};  // the request in work asked to close
+    bool          stop_reading_{false};      // ... so nothing after it is parsed
+    std::string   pending_in_;               // read, not yet parsed
+    uint32_t      mask_;                     // events last set on the loop
+
+    /// An answer is owed: nothing further may be parsed.
+    bool owed() const noexcept { return awaiting_ || file_fd_ >= 0; }
+
+    /// Bytes already read wait to be parsed and nothing stops them.
+    bool resumable() const noexcept;
 
     void response_started() noexcept;
+
+    /// An answer may have gone out whole: close if the request asked for it,
+    /// otherwise give the reading back. Not during a dispatch — on_readable
+    /// settles the connection itself at its end.
+    void after_response();
+
+    /// Feed bytes to the parser; false when the connection is to be closed.
+    bool feed_input(const char* data, std::size_t len);
+
+    /// Half-close and read what the client already sent, so that close()
+    /// does not answer unread input with RST.
+    void shutdown_and_drain() noexcept;
 
     // Async write buffer
     std::string   write_buf_;
@@ -380,7 +434,7 @@ private:
 
     bool drain_buffer();
     bool drain_file();
-    void update_write_interest();
+    void update_interest();
 };
 
 } // namespace apostol

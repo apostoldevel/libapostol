@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <strings.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
@@ -636,6 +637,12 @@ int HttpParser::cb_on_message_complete(llhttp_t* p)
     hp->current_       = {};
     hp->current_field_ = {};
     hp->current_value_ = {};
+
+    // hold(): stop here; llhttp resumes after this message on the next execute.
+    if (hp->hold_) {
+        hp->hold_ = false;
+        return HPE_PAUSED;
+    }
     return 0;
 }
 
@@ -698,10 +705,17 @@ HttpParser& HttpParser::operator=(HttpParser&& o) noexcept
 
 bool HttpParser::feed(const char* data, std::size_t len)
 {
+    consumed_ = 0;
     if (error_)
         return false;
 
     llhttp_errno_t err = llhttp_execute(parser_.get(), data, len);
+    if (err == HPE_PAUSED) {
+        // hold() from the handler: the request is dispatched, the rest waits.
+        consumed_ = static_cast<std::size_t>(llhttp_get_error_pos(parser_.get()) - data);
+        llhttp_resume(parser_.get());
+        return true;
+    }
     if (err != HPE_OK) {
         error_    = true;
         // HPE_PAUSED_UPGRADE is llhttp stopping after any request that carries
@@ -709,8 +723,21 @@ bool HttpParser::feed(const char* data, std::size_t len)
         // was fine and has been dispatched.
         malformed_ = err != HPE_PAUSED_UPGRADE;
         error_msg_ = llhttp_errno_name(err);
+        if (!malformed_)
+            consumed_ = static_cast<std::size_t>(llhttp_get_error_pos(parser_.get()) - data);
         return false;
     }
+    consumed_ = len;
+    return true;
+}
+
+bool HttpParser::resume_after_upgrade() noexcept
+{
+    if (!error_ || malformed_)
+        return false;
+    llhttp_resume_after_upgrade(parser_.get());
+    error_ = false;
+    error_msg_.clear();
     return true;
 }
 
@@ -719,6 +746,7 @@ bool HttpParser::feed(const char* data, std::size_t len)
 HttpConnection::HttpConnection(TcpConnection conn, EventLoop* loop)
     : conn_(std::move(conn))
     , loop_(loop)
+    , mask_(EPOLLIN | EPOLLRDHUP)   // what start_http_server registers
 {}
 
 HttpConnection::~HttpConnection()
@@ -732,8 +760,16 @@ bool HttpConnection::on_readable(RequestHandler handler)
     if (closed_)
         return false;
 
-    char buf[8192];
-    bool should_close = false;
+    // Not reading, yet called: the socket's EPOLLIN is off, so what brought us
+    // here is the peer — EPOLLRDHUP, EPOLLHUP, EPOLLERR. It left under an
+    // answer still owed (or before the last one went out): close, as nginx
+    // does with a client that aborts. The answer, should it come, finds the
+    // connection closed and goes nowhere. Keeping the socket for it instead has
+    // no bound: a cancelled query never calls back, and there is no idle timer.
+    if (owed() || stop_reading_) {
+        closed_ = true;
+        return false;
+    }
 
     dispatching_ = true;
     struct DispatchGuard {
@@ -754,17 +790,26 @@ bool HttpConnection::on_readable(RequestHandler handler)
         if (!closed_ && !resp.is_deferred())
             send_response(resp);
         if (resp.is_deferred() && !answered_in_dispatch_)
-            ++awaiting_deferred_;
+            awaiting_ = true;
         if (!req.keep_alive()) {
-            if (resp.is_deferred())
-                close_after_send_ = true;  // close after deferred response is sent
-            else
-                should_close = true;
+            close_after_send_ = true;
+            stop_reading_     = true;   // RFC 9112 §9.6: nothing after it is processed
         }
+        if (closed_ || owed() || stop_reading_)
+            parser_.hold();
     });
 
-    for (;;) {
-        if (closed_) break;   // released for WebSocket upgrade
+    // What an earlier hold left unparsed goes first.
+    if (!pending_in_.empty()) {
+        std::string in = std::move(pending_in_);
+        pending_in_.clear();
+        if (!feed_input(in.data(), in.size()))
+            return false;
+    }
+
+    char buf[8192];
+
+    while (!closed_ && !owed() && !stop_reading_ && pending_in_.empty()) {
         ssize_t n = conn_.read(buf, sizeof(buf));
 
         if (n == 0) {
@@ -778,7 +823,49 @@ bool HttpConnection::on_readable(RequestHandler handler)
             break;
         }
 
-        if (!parser_.feed(buf, static_cast<std::size_t>(n))) {
+        if (!feed_input(buf, static_cast<std::size_t>(n)))
+            return false;
+    }
+
+    if (closed_)
+        return false;   // released for WebSocket upgrade, or a write failed
+
+    // The last request asked to close and its answer is out whole.
+    if (close_after_send_ && !owed() && !has_pending_writes()) {
+        shutdown_and_drain();
+        closed_ = true;
+        return false;
+    }
+
+    update_interest();
+    return true;
+}
+
+bool HttpConnection::feed_input(const char* data, std::size_t len)
+{
+    while (len > 0 && !closed_) {
+        const bool ok   = parser_.feed(data, len);
+        const auto used = parser_.consumed();
+        data += used;
+        len  -= used;
+
+        if (!ok) {
+            if (!parser_.malformed()) {
+                // llhttp stops after any Upgrade request. A WebSocket handshake
+                // took the socket (closed_); anything else — "Upgrade: h2c"
+                // from curl --http2, a refused handshake — has been answered
+                // over HTTP/1.1 or is owed, and the connection stays HTTP/1.1.
+                if (closed_)
+                    return true;
+                parser_.resume_after_upgrade();
+                if (owed() || stop_reading_) {
+                    if (!stop_reading_)
+                        pending_in_.assign(data, len);
+                    return true;
+                }
+                continue;
+            }
+
             // A request this parser cannot read — raw UTF-8 in the target, a
             // broken header line — used to end in a closed socket with no answer
             // at all. The client saw "empty reply", a proxy in front turned it
@@ -789,17 +876,10 @@ bool HttpConnection::on_readable(RequestHandler handler)
             // applies. Not after a WebSocket upgrade: the socket belongs to the
             // WebSocket side then (release_tcp() set closed_).
             //
-            // Only for a request that is actually malformed: llhttp reports its
-            // pause after ANY Upgrade request the same way — a WebSocket
-            // handshake a filter refused, "Upgrade: h2c" from curl --http2 —
-            // and those have been answered already. And not while a deferred
-            // answer is owed on this connection: a pipelined request behind one
-            // still in the database would take its place on the wire, and a
-            // client reads the first response as the answer to its first
-            // request. There the old silent close stays — it loses the owed
-            // answer as it always did, but holding the socket for it has no
-            // bound: a cancelled query never calls back.
-            if (!closed_ && parser_.malformed() && awaiting_deferred_ == 0) {
+            // Nothing is owed here: the parser holds after a request whose
+            // answer is, so a request behind it is read only once that answer
+            // is out — and the 400 takes its place in line.
+            if (!closed_ && !owed()) {
                 // The llhttp error name is an identifier (HPE_INVALID_URL…):
                 // nothing in it needs escaping.
                 const std::string body = fmt::format(
@@ -811,41 +891,107 @@ bool HttpConnection::on_readable(RequestHandler handler)
                  .set_header("Connection", "close")
                  .set_body(body, "application/problem+json");
                 send_response(r);
+                if (closed_)
+                    return false;   // the write failed
 
-                // Close the way a server that answered should: half-close and
-                // take what is already queued, so the close() that follows does
-                // not find unread data and answer it with RST — a client whose
-                // request was larger than one read would see "connection reset"
-                // before it could read the 400.
-                // Only when the 400 went out whole: a half-close under a tail
-                // still in write_buf_ would cut it off.
-                if (!closed_ && !has_pending_writes()) {
-                    ::shutdown(conn_.fd(), SHUT_WR);
-                    char sink[8192];
-                    while (conn_.read(sink, sizeof(sink)) > 0) {}
-                }
+                // Close like any "Connection: close" answer: nothing after it is
+                // read, and the connection closes once the 400 is out whole —
+                // at the end of on_readable(), or from on_writable() when it sits
+                // behind the tail of an earlier answer still in write_buf_.
+                // Both paths half-close and drain first, so the close() does not
+                // find unread input and answer it with RST. Closing here instead
+                // dropped that tail and the 400 with it.
+                close_after_send_ = true;
+                stop_reading_     = true;
+                return true;
             }
             closed_ = true;
             return false;
         }
-    }
 
-    if (should_close) {
-        closed_ = true;
-        return false;
+        if (len > 0) {
+            // hold(): the request in work is owed an answer or asked to close.
+            // After a close the rest is dropped — RFC 9112 §9.6.
+            if (!stop_reading_)
+                pending_in_.assign(data, len);
+            return true;
+        }
     }
-
     return true;
+}
+
+bool HttpConnection::on_event(uint32_t events, const RequestHandler& handler)
+{
+    // Whatever throws here gets the connection dropped by the caller
+    // (remove_io). Closed here as well: an answer arriving later would
+    // otherwise try to set the mask of an fd the loop no longer has.
+    try {
+        // Drain pending async writes (sendfile, buffered responses)
+        if (events & EPOLLOUT)
+            on_writable();
+
+        if (closed_)
+            return false;
+
+        // EPOLLHUP and EPOLLERR arrive whatever the mask says: under LT, left
+        // unread they would fire again at once, round after round.
+        if (!(events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) && !resumable())
+            return true;
+
+        return on_readable(handler);
+    } catch (...) {
+        closed_ = true;
+        throw;
+    }
+}
+
+void HttpConnection::shutdown_and_drain() noexcept
+{
+    // Close the way a server that answered should: half-close, then take what
+    // the client already sent. A close() that finds unread input answers with
+    // RST, and a client that gets RST drops what it has not read yet — the
+    // tail of our answer. Input is left unread after a "Connection: close"
+    // request with more behind it (RFC 9112 §9.6), or after a bad request.
+    // Bounded: a client still streaming is not waited for.
+    ::shutdown(conn_.fd(), SHUT_WR);
+    char sink[8192];
+    for (int i = 0; i < 64 && conn_.read(sink, sizeof(sink)) > 0; ++i) {}
+}
+
+bool HttpConnection::resumable() const noexcept
+{
+    return !closed_ && !owed() && !stop_reading_ && !pending_in_.empty();
 }
 
 void HttpConnection::response_started() noexcept
 {
     // During a dispatch this is the current request's answer going out at
-    // once; afterwards it is a deferred one arriving.
+    // once; afterwards it is the deferred one arriving.
     if (dispatching_)
         answered_in_dispatch_ = true;
-    else if (awaiting_deferred_ > 0)
-        --awaiting_deferred_;
+    else
+        awaiting_ = false;
+}
+
+void HttpConnection::after_response()
+{
+    if (dispatching_ || closed_)
+        return;
+
+    if (close_after_send_ && !owed() && !has_pending_writes()) {
+        close_after_send_ = false;
+        shutdown_and_drain();
+        closed_ = true;
+        if (loop_)
+            loop_->remove_io(conn_.fd());
+        return;
+    }
+
+    // Reading back — and, with bytes already waiting in pending_in_, EPOLLOUT
+    // as the wake-up: a writable socket reports it on the next turn of the
+    // loop, where the I/O callback parses them. Not from here: this runs inside
+    // a module's callback, and the next request is not to be dispatched there.
+    update_interest();
 }
 
 void HttpConnection::send_response(const HttpResponse& resp)
@@ -859,6 +1005,7 @@ void HttpConnection::send_response(const HttpResponse& resp)
     // If there are already pending writes, just append
     if (write_pos_ < write_buf_.size() || file_fd_ >= 0) {
         write_buf_.append(data);
+        after_response();
         return;
     }
 
@@ -880,7 +1027,7 @@ void HttpConnection::send_response(const HttpResponse& resp)
             if (loop_) {
                 write_buf_.assign(ptr, rem);
                 write_pos_ = 0;
-                update_write_interest();
+                after_response();
                 return;
             }
             // No EventLoop — legacy short-spin for tests / sync handlers.
@@ -891,13 +1038,7 @@ void HttpConnection::send_response(const HttpResponse& resp)
         rem -= static_cast<std::size_t>(n);
     }
 
-    // Deferred response with Connection: close — close now that response is sent
-    if (close_after_send_) {
-        close_after_send_ = false;
-        closed_ = true;
-        if (loop_)
-            loop_->remove_io(conn_.fd());
-    }
+    after_response();
 }
 
 void HttpConnection::send_file(const std::string& path, std::string_view mime_type)
@@ -945,12 +1086,13 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
             [[maybe_unused]] ssize_t n = ::read(fd, buf.data(), file_size);
             ::close(fd);
             write_buf_.append(buf);
+            after_response();
             return;
         }
         file_fd_ = fd;
         file_offset_ = 0;
         file_remaining_ = file_size;
-        update_write_interest();
+        after_response();
         return;
     }
 
@@ -975,10 +1117,10 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
             file_fd_ = fd;
             file_offset_ = 0;
             file_remaining_ = file_size;
-            update_write_interest();
+            after_response();
             return;
         }
-        if (n == 0) { ::close(fd); return; }
+        if (n == 0) { ::close(fd); after_response(); return; }
         ptr += n;
         rem -= static_cast<std::size_t>(n);
     }
@@ -988,11 +1130,10 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
     file_offset_ = 0;
     file_remaining_ = file_size;
 
-    if (drain_file())
-        return;  // File fully sent
-
-    // Partial — register EPOLLOUT for remainder
-    update_write_interest();
+    // Fully sent, or partial with EPOLLOUT for the remainder — or, on a
+    // failed sendfile, closed (drain_file).
+    drain_file();
+    after_response();
 }
 
 bool HttpConnection::on_writable()
@@ -1009,16 +1150,8 @@ bool HttpConnection::on_writable()
             return true;
     }
 
-    // All done — remove EPOLLOUT interest
-    update_write_interest();
-
-    // Deferred response with Connection: close — close after write completes
-    if (close_after_send_) {
-        close_after_send_ = false;
-        closed_ = true;
-        if (loop_)
-            loop_->remove_io(conn_.fd());
-    }
+    // All out: close if asked, otherwise drop EPOLLOUT and read again.
+    after_response();
 
     return false;
 }
@@ -1091,14 +1224,31 @@ bool HttpConnection::drain_file()
     return true;
 }
 
-void HttpConnection::update_write_interest()
+void HttpConnection::update_interest()
 {
-    if (!loop_) return;
+    if (!loop_ || closed_) return;
 
-    if (has_pending_writes())
-        loop_->modify_io(conn_.fd(), EPOLLIN | EPOLLOUT | EPOLLRDHUP);
-    else
-        loop_->modify_io(conn_.fd(), EPOLLIN | EPOLLRDHUP);
+    uint32_t m = 0;
+    if (owed())
+        m = EPOLLRDHUP;              // not reading; only watch the peer leave
+    else if (!stop_reading_)
+        m = EPOLLIN | EPOLLRDHUP;
+    if (has_pending_writes() || resumable())
+        m |= EPOLLOUT;               // a tail to write, or held bytes to wake for
+
+    // One epoll_ctl per change, not per request: a keep-alive /ping never
+    // leaves EPOLLIN | EPOLLRDHUP and never pays for this.
+    if (m != mask_) {
+        try {
+            loop_->modify_io(conn_.fd(), m);
+            mask_ = m;
+        } catch (const std::system_error&) {
+            // The fd is no longer in the loop — dropped by the caller after
+            // something threw. Nothing is going to read or write it again;
+            // throwing here would do it inside a module's callback.
+            closed_ = true;
+        }
+    }
 }
 
 TcpConnection HttpConnection::release_tcp()
