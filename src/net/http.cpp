@@ -741,6 +741,17 @@ bool HttpParser::resume_after_upgrade() noexcept
     return true;
 }
 
+// A request asking for the WebSocket protocol — by its Upgrade header alone,
+// complete handshake or not: a handshake refused for a missing key is refused
+// all the same, and its client is just as unlikely to send anything else.
+static bool wants_websocket(const HttpRequest& req)
+{
+    std::string up = req.header("Upgrade");
+    std::transform(up.begin(), up.end(), up.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return up.find("websocket") != std::string::npos;
+}
+
 // ─── HttpConnection ───────────────────────────────────────────────────────────
 
 HttpConnection::HttpConnection(TcpConnection conn, EventLoop* loop)
@@ -785,13 +796,25 @@ bool HttpConnection::on_readable(RequestHandler handler)
         HttpResponse resp;
         answered_in_dispatch_ = false;
         handler(req, resp);
+        // A WebSocket handshake the handler did not take (release_tcp() sets
+        // closed_) was refused — 401, 403, 400, now or deferred. Its client
+        // waits for 101 or for the close, never sends another request, and
+        // there is no idle timer: kept alive, the socket stays until the
+        // client goes, and a station retrying with a wrong name holds one fd
+        // per attempt (T621). Close once the refusal is out, as before T314.
+        // Only for "Upgrade: websocket" — any other Upgrade (h2c from curl
+        // --http2) is an ordinary request answered over HTTP/1.1, and its
+        // connection stays open.
+        const bool ws_refused = !closed_ && wants_websocket(req);
+        if (ws_refused && !resp.is_deferred())
+            resp.set_close(true);
         // Skip response if the handler upgraded to WebSocket (release_tcp() was called)
         // or if the handler marked it as deferred (async PG response)
         if (!closed_ && !resp.is_deferred())
             send_response(resp);
         if (resp.is_deferred() && !answered_in_dispatch_)
             awaiting_ = true;
-        if (!req.keep_alive()) {
+        if (!req.keep_alive() || ws_refused) {
             close_after_send_ = true;
             stop_reading_     = true;   // RFC 9112 §9.6: nothing after it is processed
         }
@@ -851,10 +874,12 @@ bool HttpConnection::feed_input(const char* data, std::size_t len)
 
         if (!ok) {
             if (!parser_.malformed()) {
-                // llhttp stops after any Upgrade request. A WebSocket handshake
-                // took the socket (closed_); anything else — "Upgrade: h2c"
-                // from curl --http2, a refused handshake — has been answered
-                // over HTTP/1.1 or is owed, and the connection stays HTTP/1.1.
+                // llhttp stops after any Upgrade request it was not told to hold
+                // on — in practice "Upgrade: h2c" from curl --http2, answered at
+                // once over HTTP/1.1: the connection stays HTTP/1.1. A WebSocket
+                // handshake, taken (closed_) or refused (stop_reading_, see the
+                // dispatch above), is held, and hold() wins over the upgrade
+                // pause: it does not come here.
                 if (closed_)
                     return true;
                 parser_.resume_after_upgrade();

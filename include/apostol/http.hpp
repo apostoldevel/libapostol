@@ -204,8 +204,9 @@ public:
     std::size_t consumed() const noexcept { return consumed_; }
 
     /// Go on parsing after an Upgrade request that was answered over HTTP/1.1
-    /// (h2c, a refused WebSocket handshake): RFC 9110 §7.8 lets a server
-    /// ignore Upgrade. Returns false unless feed() stopped on exactly that.
+    /// (h2c): RFC 9110 §7.8 lets a server ignore Upgrade. A refused WebSocket
+    /// handshake does not come here — it closes after its answer (T621).
+    /// Returns false unless feed() stopped on exactly that.
     bool resume_after_upgrade() noexcept;
 
     /// Human-readable description of the last error (valid only when feed()
