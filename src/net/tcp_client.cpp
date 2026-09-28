@@ -508,9 +508,11 @@ ssize_t TcpClient::ssl_read(void* buf, size_t len)
 
 ssize_t TcpClient::ssl_write(const void* buf, size_t len)
 {
+    errno = 0;
     int n = ::SSL_write(ssl_.get(), buf, static_cast<int>(len));
     if (n > 0)
         return n;
+    const int sys_err = errno;
 
     int ssl_err = ::SSL_get_error(ssl_.get(), n);
     if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
@@ -518,7 +520,9 @@ ssize_t TcpClient::ssl_write(const void* buf, size_t len)
         return -1;
     }
 
-    errno = EIO;
+    // The socket's own error (EPIPE, ECONNRESET) says what happened to the
+    // peer; EIO only when OpenSSL left none (T649).
+    errno = (ssl_err == SSL_ERROR_SYSCALL && sys_err != 0) ? sys_err : EIO;
     return -1;
 }
 

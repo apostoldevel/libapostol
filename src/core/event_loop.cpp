@@ -200,7 +200,7 @@ bool registration_lost(int err) noexcept
 // holder's, and a number closed behind its back is the next socket's (T619) —
 // and not shut for writing: the peer would see the end before the holder
 // chose it (a leader lock released while its process still drains), and the
-// holder's own goodbye (TLS close_notify) would die of SIGPIPE. Its read side
+// holder's own goodbye (TLS close_notify) could not go out. Its read side
 // is shut and the holder gets one more event — end of input, which it takes
 // for a lost peer and tears the connection down by its own road, closing the
 // fd itself. A holder that throws again, keeps the fd after that event, or

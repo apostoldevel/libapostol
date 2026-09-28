@@ -139,6 +139,16 @@ std::filesystem::path Application::resolve_path(std::string_view path,
 
 int Application::run(int argc, char* argv[])
 {
+    // A write into a connection its peer has closed raises SIGPIPE, and its
+    // default action ends the process without a line in the log — a worker
+    // with every connection it served. send() here passes MSG_NOSIGNAL, but
+    // sendfile(2) (HttpConnection::drain_file) and OpenSSL's socket BIO
+    // (SSL_write, SSL_shutdown) cannot (T649). Ignored, the write fails with
+    // EPIPE and its caller tears the connection down as for any other error.
+    // Set before the first fork: master, every child and a daemonized copy
+    // inherit it.
+    ::signal(SIGPIPE, SIG_IGN);
+
     init_setproctitle(argc, argv);
 
     // Build cmdline string for use in process titles
