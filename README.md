@@ -253,6 +253,51 @@ lands depends on who reads the key: the master's own settings fail the start;
 a module flag is read when a worker starts, so the worker exits and the master
 respawns it with a backoff — the error line repeats until the variable is fixed.
 
+### One active copy per background role
+
+Two copies of an application on one database — two containers, two pods, a
+rolling update — run every background role twice: two schedulers take the same
+job, two PGFetch send the same request. `"leader": true` keeps one copy of each
+role active and the rest waiting:
+
+```json
+{
+  "node":    "${NODE_NAME}",
+  "process": { "helper": true, "leader": "${LEADER}", "leader_interval": 5 },
+  "module":  { "LicenseServer": { "enable": true, "leader": false } }
+}
+```
+
+- `process.leader` — applies to the helper process and to every custom process;
+  `module.<Name>.leader` overrides it for one custom process. Workers are not
+  affected.
+- Before its modules start, the process takes `pg_try_advisory_lock` on a
+  dedicated connection (the `postgres.helper` settings), key
+  `"<application>/<role>"`. Holding it — it starts; otherwise it waits as
+  `… process (standby)` with one connection and no pool, asking every
+  `leader_interval` seconds, and logs who holds the role (the holder's
+  `application_name`: `"<application> <role> <node>:<pid>"`).
+- The lock connection must reach PostgreSQL in session mode — directly, or a
+  pgbouncer pool in `session` mode. Under transaction pooling a session lock
+  guarantees nothing: two copies can be active at once, and the lock can stay
+  behind in pgbouncer's server connection after the process is gone, blocking
+  the role for everyone. The leader reports a changed server session and steps
+  down, but that is a diagnosis, not a guard.
+- Losing the lock — the connection breaks, the server does not answer within
+  max(3 × interval, 15 s), or the lock is gone — stops the modules and ends the
+  process with code 1; the master starts a new one, which waits as a standby.
+  The session sets `idle_session_timeout` (PostgreSQL 14+) to four times that
+  timeout, so a leader that vanished without closing its socket frees the role
+  in about a minute, after it has stepped down on its own clock.
+- Timer-driven work (`heartbeat`) of a leader past a stall waits until the lock
+  is confirmed again. Work arriving on sockets — a NOTIFY read in the same wake-up
+  as the loss — cannot be ordered that way: where a duplicate costs money, claim
+  the row in the database as well.
+
+`node` names this copy — `Application::node_id()`: the configured value, else
+`$NODE_NAME` (in Kubernetes, the pod name from the downward API), else the host
+name; `node_process_id()` adds `:<pid>`.
+
 ## Build (standalone development)
 
 ```bash

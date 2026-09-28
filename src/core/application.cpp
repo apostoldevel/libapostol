@@ -5,6 +5,7 @@
 #include "apostol/process_module.hpp"
 #endif
 #include "apostol/http.hpp"
+#include "apostol/node.hpp"
 #include "apostol/settings.hpp"
 #include "apostol/tcp.hpp"
 #ifdef WITH_POSTGRESQL
@@ -106,6 +107,16 @@ const nlohmann::json* Application::module_config(std::string_view name) const no
     } catch (...) {
         return nullptr;
     }
+}
+
+std::string Application::node_id() const
+{
+    return apostol::node_id(settings_.node);
+}
+
+std::string Application::node_process_id() const
+{
+    return apostol::node_process_id(settings_.node);
 }
 
 std::filesystem::path Application::resolve_path(std::string_view path,
@@ -312,6 +323,24 @@ void Application::start_process()
                             settings_.server_listen.empty() ? "*" : settings_.server_listen,
                             http_port_);
         }
+
+#ifdef WITH_POSTGRESQL
+        // A leader role with nothing to hold its lock on fails in the child,
+        // and the master would respawn it forever. Refuse here instead.
+        // process.leader is checked by validate(); this is the per-process key.
+        if (settings_.pg_conninfo_helper.empty())
+            for (const auto& cp : custom_processes_)
+                if (config_->get_bool(fmt::format("module.{}.leader", cp.name), false))
+                {
+                    logger_->error("module.{}.leader needs a PostgreSQL connection to hold "
+                                   "the lock on (postgres.helper) — not starting", cp.name);
+                    exit_code_ = 1;
+                    master_listener_.reset();
+                    listen_fd_ = -1;
+                    remove_pid_file();
+                    return;
+                }
+#endif
 
         if (cfg_helper()) spawn_helper();
         // Spawn custom processes first, then workers
@@ -1086,54 +1115,107 @@ void Application::helper_run()
 #endif
     });
 
+    bool started = false;
+#ifdef WITH_POSTGRESQL
+    const PgLeaderLock* gate = nullptr;   // set under "process.leader"
+#endif
+
+    // Everything the helper does once it may: build its modules, start them,
+    // arm the heartbeats. Run at once, or — under "process.leader" — when the
+    // role's lock is taken.
+    auto start = [&]() -> bool
+    {
+        try
+        {
+            on_helper_start(loop);
+            module_manager_.on_start();
+        }
+        catch (const std::exception& e)
+        {
+            logger_->error("{} helper startup failed: {}", name_, e.what());
+            exit_code_ = 1;
+            return false;
+        }
+
+        started = true;
+
+        // Drop privileges after initialization (DB connected)
+        set_user(cfg_user(), cfg_group());
+
+        // Set process title AFTER modules are registered
+        auto names = module_manager_.module_names();
+        set_process_title(names.empty()
+            ? fmt::format("{}: helper process", name_)
+            : fmt::format("{}: helper process ({})", name_, names));
+
+        // Module heartbeat — every 1 second (mirrors worker's heartbeat in start_http_server)
+        loop.add_timer(std::chrono::seconds(1),
+            [&]
+            {
+#ifdef WITH_POSTGRESQL
+                // A leader past a stall: not before the lock is confirmed.
+                if (gate && !gate->fresh())
+                    return;
+#endif
+                module_manager_.heartbeat(std::chrono::system_clock::now());
+            });
+
+#ifdef WITH_POSTGRESQL
+        // PgPool heartbeat — every 60 seconds (connection health check + reconnect)
+        if (db_pool_) {
+            loop.add_timer(std::chrono::seconds(60),
+                [this]
+                {
+                    db_pool_->heartbeat();
+                    for (auto& [_, pool] : named_pools_)
+                        pool->heartbeat();
+                });
+        }
+#endif
+        return true;
+    };
+
+#ifdef WITH_POSTGRESQL
+    bool stopping = false;
+    std::unique_ptr<PgLeaderLock> lock;
     try
     {
-        on_helper_start(loop);
-        module_manager_.on_start();
+        lock = run_as_leader(loop, "helper", settings_.leader, stopping,
+                             [&start, &loop] { if (!start()) loop.stop(); });
+        gate = lock.get();
     }
     catch (const std::exception& e)
     {
         logger_->error("{} helper startup failed: {}", name_, e.what());
-        stop_db();   // while the loop is alive, before ~Application — see single_run
         exit_code_ = 1;
         return;
     }
-
-    // Drop privileges after initialization (DB connected)
-    set_user(cfg_user(), cfg_group());
-
-    // Set process title AFTER modules are registered
-    auto names = module_manager_.module_names();
-    set_process_title(names.empty()
-        ? fmt::format("{}: helper process", name_)
-        : fmt::format("{}: helper process ({})", name_, names));
-
-    // Module heartbeat — every 1 second (mirrors worker's heartbeat in start_http_server)
-    loop.add_timer(std::chrono::seconds(1),
-        [this]
-        {
-            module_manager_.heartbeat(std::chrono::system_clock::now());
-        });
-
-#ifdef WITH_POSTGRESQL
-    // PgPool heartbeat — every 60 seconds (connection health check + reconnect)
-    if (db_pool_) {
-        loop.add_timer(std::chrono::seconds(60),
-            [this]
-            {
-                db_pool_->heartbeat();
-                for (auto& [_, pool] : named_pools_)
-                    pool->heartbeat();
-            });
-    }
+    if (!lock && !start())
+#else
+    if (!start())
 #endif
+    {
+        stop_db();   // while the loop is alive, before ~Application — see single_run
+        return;
+    }
 
     loop.run();
 
-    module_manager_.on_stop();
-    drain_db(loop);
+#ifdef WITH_POSTGRESQL
+    stopping = true;
+#endif
+    if (started) {
+        module_manager_.on_stop();
+        drain_db(loop);
+    }
     stop_db();
-    logger_->notice("{} helper process exiting (pid={})", name_, ::getpid());
+#ifdef WITH_POSTGRESQL
+    // Last: the lock goes with its connection, and a standby elsewhere starts
+    // only once this process has finished its work.
+    lock.reset();
+#endif
+    if (started || exit_code_ == 0)
+        logger_->notice("{} helper process exiting (pid={})", name_, ::getpid());
 }
 
 // ─── Custom process loop ──────────────────────────────────────────────────
@@ -1165,73 +1247,164 @@ void Application::custom_process_run(CustomProcess& proc)
         if (pg_logger_) pg_logger_->reopen();
     });
 
-    // 5. PgPool (if helper conninfo is configured)
-    const auto& conninfo = settings().pg_conninfo_helper;
-    if (!conninfo.empty()) {
-        setup_db(loop, conninfo,
-            static_cast<std::size_t>(settings().pg_pool_min),
-            static_cast<std::size_t>(settings().pg_pool_max));
-    }
+    bool started = false;
+    EventLoop::TimerId heartbeat_timer      = EventLoop::kInvalidTimer;
+    EventLoop::TimerId pool_heartbeat_timer = EventLoop::kInvalidTimer;
+    const PgLeaderLock* gate = nullptr;   // set under "leader"
 
-    // 6. Process on_start
+    // Steps 5–7: what the process does once it may. Run at once, or — under
+    // "leader" — when the role's lock is taken; a standby holds no pool.
+    auto start = [&]() -> bool
+    {
+        // 5. PgPool (if helper conninfo is configured)
+        const auto& conninfo = settings().pg_conninfo_helper;
+        if (!conninfo.empty()) {
+            setup_db(loop, conninfo,
+                static_cast<std::size_t>(settings().pg_pool_min),
+                static_cast<std::size_t>(settings().pg_pool_max));
+        }
+
+        // 6. Process on_start
+        try {
+            proc.on_start(loop, *this);
+        } catch (const std::exception& e) {
+            logger_->error("{} process '{}' startup failed: {}",
+                           name_, proc.name(), e.what());
+            exit_code_ = 1;
+            return false;
+        }
+
+        started = true;
+
+        // 7. Drop privileges after initialization (sockets bound, DB connected)
+        set_user(cfg_user(), cfg_group());
+
+        // Set process title AFTER on_start (modules may be registered)
+        auto names = module_manager_.module_names();
+        set_process_title(names.empty()
+            ? fmt::format("{}: {} process", name_, proc.title())
+            : fmt::format("{}: {} process ({})", name_, proc.title(), names));
+
+        // 7. Heartbeat timer (1s). The id is kept because the drain below runs the loop
+        // again after on_stop(): a process whose session was released there would be
+        // asked to beat once more and would log back in, leaving behind the very
+        // session the drain exists to close. Modules are latched by ModuleManager;
+        // a custom process has no manager, so its timer is cancelled by hand.
+        heartbeat_timer = loop.add_timer(std::chrono::seconds(1),
+            [&proc, &gate] {
+                // A leader past a stall: not before the lock is confirmed.
+                if (gate && !gate->fresh())
+                    return;
+                proc.heartbeat(std::chrono::system_clock::now());
+            });
+
+        // 7b. PgPool heartbeat — every 60 seconds, mirroring worker_run() and
+        // helper_run(). A custom process is its own OS process with its own pool
+        // and its own LISTEN connection, and this timer was simply absent here:
+        // nothing in the process ever checked connection health. MessageServer
+        // ("outbox") and ReportServer ("report") therefore had no way at all to
+        // notice a lost subscription — the recovery path in PgPool existed but
+        // had nothing to drive it. Cancelled next to the one above, and for the
+        // same reason: the drain re-runs the loop after on_stop().
+        if (db_pool_)
+            pool_heartbeat_timer = loop.add_timer(std::chrono::seconds(60),
+                [this] {
+                    db_pool_->heartbeat();
+                    for (auto& [_, pool] : named_pools_)
+                        pool->heartbeat();
+                });
+
+        return true;
+    };
+
+    bool stopping = false;
+    std::unique_ptr<PgLeaderLock> lock;
     try {
-        proc.on_start(loop, *this);
+        lock = run_as_leader(loop, proc.name(),
+            config_->get_bool(fmt::format("module.{}.leader", proc.name()), settings_.leader),
+            stopping, [&start, &loop] { if (!start()) loop.stop(); });
+        gate = lock.get();
     } catch (const std::exception& e) {
-        logger_->error("{} process '{}' startup failed: {}",
-                       name_, proc.name(), e.what());
-        stop_db();
+        logger_->error("{} process '{}' startup failed: {}", name_, proc.name(), e.what());
         exit_code_ = 1;
         return;
     }
 
-    // 7. Drop privileges after initialization (sockets bound, DB connected)
-    set_user(cfg_user(), cfg_group());
-
-    // Set process title AFTER on_start (modules may be registered)
-    auto names = module_manager_.module_names();
-    set_process_title(names.empty()
-        ? fmt::format("{}: {} process", name_, proc.title())
-        : fmt::format("{}: {} process ({})", name_, proc.title(), names));
-
-    // 7. Heartbeat timer (1s). The id is kept because the drain below runs the loop
-    // again after on_stop(): a process whose session was released there would be
-    // asked to beat once more and would log back in, leaving behind the very
-    // session the drain exists to close. Modules are latched by ModuleManager;
-    // a custom process has no manager, so its timer is cancelled by hand.
-    const auto heartbeat_timer = loop.add_timer(std::chrono::seconds(1),
-        [&proc] {
-            proc.heartbeat(std::chrono::system_clock::now());
-        });
-
-    // 7b. PgPool heartbeat — every 60 seconds, mirroring worker_run() and
-    // helper_run(). A custom process is its own OS process with its own pool
-    // and its own LISTEN connection, and this timer was simply absent here:
-    // nothing in the process ever checked connection health. MessageServer
-    // ("outbox") and ReportServer ("report") therefore had no way at all to
-    // notice a lost subscription — the recovery path in PgPool existed but
-    // had nothing to drive it. Cancelled next to the one above, and for the
-    // same reason: the drain re-runs the loop after on_stop().
-    const auto pool_heartbeat_timer = db_pool_
-        ? loop.add_timer(std::chrono::seconds(60),
-            [this] {
-                db_pool_->heartbeat();
-                for (auto& [_, pool] : named_pools_)
-                    pool->heartbeat();
-            })
-        : EventLoop::kInvalidTimer;
+    if (!lock && !start()) {
+        stop_db();
+        return;
+    }
 
     // 8. Event loop
     loop.run();
+    stopping = true;
 
     // 9. Cleanup: on_stop() first, then stop_db() while EventLoop is still alive
-    proc.on_stop();
-    loop.cancel_timer(heartbeat_timer);
-    if (pool_heartbeat_timer != EventLoop::kInvalidTimer)
-        loop.cancel_timer(pool_heartbeat_timer);
-    drain_db(loop);
+    if (started) {
+        proc.on_stop();
+        loop.cancel_timer(heartbeat_timer);
+        if (pool_heartbeat_timer != EventLoop::kInvalidTimer)
+            loop.cancel_timer(pool_heartbeat_timer);
+        drain_db(loop);
+    }
     stop_db();
-    logger_->notice("{} process '{}' exiting (pid={})",
-                    name_, proc.name(), ::getpid());
+    // Last: the lock goes with its connection, and a standby elsewhere starts
+    // only once this process has finished its work.
+    lock.reset();
+
+    if (started || exit_code_ == 0)
+        logger_->notice("{} process '{}' exiting (pid={})",
+                        name_, proc.name(), ::getpid());
+}
+
+// ─── Leadership of a background role ─────────────────────────────────────────
+
+std::unique_ptr<PgLeaderLock> Application::run_as_leader(
+    EventLoop& loop, std::string_view role, bool enabled, const bool& stopping,
+    std::function<void()> start)
+{
+    if (!enabled)
+        return nullptr;
+
+    // The lock rides on the helper's connection settings: in a typical
+    // deployment that one reaches PostgreSQL directly (LISTEN needs a session
+    // too), while the worker's may go through transaction pooling.
+    const auto& conninfo = settings_.pg_conninfo_helper;
+    if (conninfo.empty())
+        throw std::runtime_error(fmt::format(
+            "'{}' is configured as a leader role, but there is no PostgreSQL "
+            "connection to hold its lock on (postgres.helper)", role));
+
+    auto lock = std::make_unique<PgLeaderLock>(loop, conninfo,
+        fmt::format("{}/{}", name_, role),
+        fmt::format("{} {} {}", name_, role, node_process_id()),
+        std::chrono::seconds(settings_.leader_interval), logger_.get());
+
+    set_process_title(fmt::format("{}: {} process (standby)", name_, role));
+
+    if (!settings_.master)
+        logger_->warn("{} {}: leader mode without a master process — after a loss nobody "
+                      "restarts this process but the service supervisor", name_, role);
+
+    // No retry in place: modules are not asked to survive on_stop() followed
+    // by on_start(). The process ends, the master starts a new one, and that
+    // one waits as a standby like any other.
+    lock->start(std::move(start),
+        [this, &loop, &stopping, r = std::string(role)](std::string_view why)
+        {
+            // During a shutdown already under way the loss is expected (the
+            // drain re-runs the loop) and must not turn a clean exit into 1.
+            if (stopping) {
+                logger_->notice("{} {}: leadership lost while stopping ({})", name_, r, why);
+                return;
+            }
+            logger_->error("{} {}: leadership lost ({}) — stopping; the process exits "
+                           "and a fresh one waits as a standby", name_, r, why);
+            exit_code_ = 1;
+            loop.stop();
+        });
+
+    return lock;
 }
 
 #endif // WITH_POSTGRESQL

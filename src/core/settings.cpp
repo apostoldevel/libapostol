@@ -94,6 +94,10 @@ void AppSettings::populate(const Config& cfg)
     helper     = cfg.get_bool("process.helper",  helper);
     daemon     = cfg.get_bool("daemon.enabled",  daemon);
 
+    leader          = cfg.get_bool("process.leader", leader);
+    leader_interval = static_cast<int>(cfg.get_int("process.leader_interval", leader_interval));
+    node            = cfg.get_string("node", node);
+
     user         = cfg.get_string("process.user",         user);
     group        = cfg.get_string("process.group",        group);
     limit_nofile = static_cast<std::uint32_t>(
@@ -249,6 +253,16 @@ std::vector<ValidationError> AppSettings::validate() const
         err("log.level",
             fmt::format("invalid log level '{}'; must be one of: debug info notice warn warning error crit alert emerg",
                 log_level));
+
+    // Upper bound: the session's idle_session_timeout is 12 × interval and
+    // PostgreSQL refuses one past INT_MAX milliseconds — no leader, ever.
+    if (leader_interval < 1 || leader_interval > 3600)
+        err("process.leader_interval",
+            fmt::format("process.leader_interval must be 1..3600 seconds, got {}", leader_interval));
+
+    if (leader && pg_conninfo_helper.empty())
+        err("process.leader",
+            "process.leader needs a PostgreSQL connection to hold the lock on (postgres.helper)");
 
     // Server port
     if (server_port == 0)

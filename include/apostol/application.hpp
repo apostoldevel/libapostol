@@ -11,6 +11,7 @@
 #ifdef WITH_POSTGRESQL
 #include "apostol/custom_process.hpp"
 #include "apostol/pg.hpp"
+#include "apostol/pg_leader.hpp"
 #include "apostol/process_module.hpp"
 #endif
 #include "apostol/process.hpp"
@@ -70,6 +71,12 @@ public:
     int run(int argc, char* argv[]);
 
     std::string_view app_name() const noexcept { return name_; }
+
+    /// This copy of the application: "node" from the configuration, else
+    /// $NODE_NAME, else the host name. See apostol/node.hpp.
+    std::string node_id() const;
+    /// node_id() + ":<pid>" — this process.
+    std::string node_process_id() const;
     ProcessRole role() const noexcept { return role_; }
 
     Logger&        logger()         noexcept { return *logger_; }
@@ -313,6 +320,16 @@ protected:
     virtual void helper_run();
 #ifdef WITH_POSTGRESQL
     void custom_process_run(CustomProcess& proc);
+
+    /// "One active copy per role". With @p enabled false — nullptr, and the
+    /// caller starts at once. Otherwise a started PgLeaderLock on key
+    /// "<app>/<role>": @p start runs when the lock is taken; losing it stops
+    /// the loop (unless @p stopping) and sets the exit code, so the master
+    /// respawns the process as a standby. Throws when there is no connection
+    /// to hold the lock on.
+    std::unique_ptr<PgLeaderLock> run_as_leader(EventLoop& loop, std::string_view role,
+                                                bool enabled, const bool& stopping,
+                                                std::function<void()> start);
 #endif
 
     pid_t fork_child(ProcessRole role, std::string name,

@@ -72,6 +72,16 @@ struct AppSettings
     bool helper     {false};
     bool daemon     {false};
 
+    // One active copy per background role (helper, each custom process):
+    // "process.leader" — the default for all of them, "module.<Name>.leader" —
+    // per custom process. See PgLeaderLock and Application::run_as_leader().
+    bool leader          {false};
+    int  leader_interval {5};   // seconds between asking (standby) and probing (leader)
+
+    // ── Identity ──────────────────────────────────────────────────────────
+    // "node" — this copy's name for node_id(); empty → $NODE_NAME → host name.
+    std::string node;
+
     // ── System ────────────────────────────────────────────────────────────
     std::string   user         {APP_DEFAULT_USER};
     std::string   group        {APP_DEFAULT_GROUP};

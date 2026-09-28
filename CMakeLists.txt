@@ -106,6 +106,7 @@ add_library(apostol STATIC
     src/core/service_token.cpp
     src/core/file_utils.cpp
     src/core/http_utils.cpp
+    src/core/node.cpp
     src/core/http_client.cpp
     src/core/fetch_client.cpp
     src/core/route_manager.cpp
@@ -123,6 +124,7 @@ if(WITH_POSTGRESQL)
         src/pg/pg.cpp
         src/pg/pg_utils.cpp
         src/pg/pg_exec.cpp
+        src/pg/pg_leader.cpp
         src/core/bot_session.cpp
     )
 
