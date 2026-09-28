@@ -941,45 +941,41 @@ void PgPool::dispatch_queue(PgConnection& conn)
         return;  // queue will be drained when connection recovers
     }
 
-    auto query = std::move(queue_.front());
+    if (pg_logger_ && !queue_.front()->quiet())
+        pg_logger_->debug("{} Query: {}", conn_tag(conn), queue_.front()->sql());
+
+    // Owned by inflight_ before the connection points at it — see execute() (T650).
+    PgQuery* raw_q = queue_.front().get();
+    inflight_.push_back(std::move(queue_.front()));
     queue_.pop();
-
-    PgQuery* raw_q = query.get();
     conn.set_current_query(raw_q);
-
-    if (pg_logger_ && !query->quiet())
-        pg_logger_->debug("{} Query: {}", conn_tag(conn), query->sql());
-
-    if (!conn.send_query(query->sql())) {
-        if (pg_logger_)
-            pg_logger_->error("{} send_query failed in dispatch (state={}): {}, re-queuing",
-                             conn_tag(conn),
-                             static_cast<int>(conn.state()),
-                             conn.error_message());
-        conn.set_current_query(nullptr);
-        // Re-queue the query instead of losing it (P1 Fix: retry)
-        queue_.push(std::move(query));
-        conn.set_state(PgConnState::Error);
-        try_reconnect(conn);
-        return;
-    }
 
     // If flush was incomplete, need EPOLLOUT to continue flushing. A socket
     // the loop no longer watches (T607) would leave the rest unsent for good;
     // the server has not got the whole statement, so it has not run it —
     // re-queued as when send_query fails.
-    if (conn.needs_flush() && !loop_.modify_io(conn.fd(), EPOLLIN | EPOLLOUT)) {
-        if (pg_logger_)
+    const bool sent = conn.send_query(raw_q->sql());
+    if (sent && (!conn.needs_flush() || loop_.modify_io(conn.fd(), EPOLLIN | EPOLLOUT)))
+        return;
+
+    // Taken back and the connection marked before the log line: a throw from
+    // the log leaves no query that nothing points at (T650). Re-queue the
+    // query instead of losing it (P1 Fix: retry).
+    const int state = static_cast<int>(conn.state());
+    conn.set_current_query(nullptr);
+    auto query = std::move(inflight_.back());
+    inflight_.pop_back();
+    queue_.push(std::move(query));
+    conn.set_state(PgConnState::Error);
+    if (pg_logger_) {
+        if (sent)
             pg_logger_->error("{} Socket fd={} is no longer watched in dispatch, re-queuing",
                              conn_tag(conn), conn.fd());
-        conn.set_current_query(nullptr);
-        queue_.push(std::move(query));
-        conn.set_state(PgConnState::Error);
-        try_reconnect(conn);
-        return;
+        else
+            pg_logger_->error("{} send_query failed in dispatch (state={}): {}, re-queuing",
+                             conn_tag(conn), state, conn.error_message());
     }
-
-    inflight_.push_back(std::move(query));
+    try_reconnect(conn);
 }
 
 PgPool::QueryId PgPool::execute(std::string              sql,
@@ -1006,33 +1002,39 @@ PgPool::QueryId PgPool::execute(std::string              sql,
                 continue;  // skip to next connection
             }
 
-            PgQuery* raw_q = q.get();
-            c->set_current_query(raw_q);
-
             if (pg_logger_ && !q->quiet())
                 pg_logger_->debug("{} Query: {}", conn_tag(*c), q->sql());
 
-            if (c->send_query(q->sql())) {
-                // A partial flush on a socket the loop no longer watches
-                // (T607): the rest would never go out, and the server, not
-                // having the whole statement, has not run it — on to the next
-                // connection, as when send_query fails.
-                if (!c->needs_flush() || loop_.modify_io(c->fd(), EPOLLIN | EPOLLOUT)) {
-                    inflight_.push_back(std::move(q));
-                    return qid;
-                }
-                if (pg_logger_)
+            // inflight_ owns the query before the connection points at it
+            // (T650): a throw in between leaves the pointer on a live query,
+            // never on one the unwinding of this frame freed.
+            PgQuery* raw_q = q.get();
+            inflight_.push_back(std::move(q));
+            c->set_current_query(raw_q);
+
+            // A partial flush on a socket the loop no longer watches (T607):
+            // the rest would never go out, and the server, not having the
+            // whole statement, has not run it — on to the next connection, as
+            // when send_query fails (connection probably died).
+            const bool sent = c->send_query(raw_q->sql());
+            if (sent && (!c->needs_flush() || loop_.modify_io(c->fd(), EPOLLIN | EPOLLOUT)))
+                return qid;
+
+            // Taken back and the connection marked before the log line: a
+            // throw from the log leaves no query that nothing points at.
+            const int state = static_cast<int>(c->state());
+            c->set_current_query(nullptr);
+            q = std::move(inflight_.back());
+            inflight_.pop_back();
+            c->set_state(PgConnState::Error);
+            if (pg_logger_) {
+                if (sent)
                     pg_logger_->error("{} Socket fd={} is no longer watched, reconnecting",
                                      conn_tag(*c), c->fd());
+                else
+                    pg_logger_->error("{} send_query failed (state={}): {}, reconnecting",
+                                     conn_tag(*c), state, c->error_message());
             }
-            // send_query failed — connection probably died
-            else if (pg_logger_)
-                pg_logger_->error("{} send_query failed (state={}): {}, reconnecting",
-                                 conn_tag(*c),
-                                 static_cast<int>(c->state()),
-                                 c->error_message());
-            c->set_current_query(nullptr);
-            c->set_state(PgConnState::Error);
             try_reconnect(*c);
             // Don't return — try next connection or queue
         }
