@@ -38,7 +38,9 @@ class PgResult;
 // Losing the lock:
 //   - the connection breaks (EOF, error, EPOLLHUP);
 //   - the server does not answer within answer_timeout();
-//   - the probe finds the lock no longer held by this session.
+//   - the probe finds the lock no longer held by this session;
+//   - fresh() finds the socket closed by the server (on_lost runs from
+//     inside that fresh() call).
 // on_lost is called once, and the object goes inert: it does not try to take
 // the lock again, and it keeps the connection — a slow session still holds
 // the lock — until it is destroyed, after the caller has stopped its work. Leadership is re-acquired by a fresh start — in
@@ -85,9 +87,13 @@ public:
     /// stall (a stopped process, a starved host) every ready event is
     /// delivered at once, and a timer may run before the socket that says
     /// the session is gone: held() is still true then, fresh() is not.
+    /// Nor after a shorter stall: the lock's socket is asked on the spot, in
+    /// any state, whether the server has closed it — and if so that is a loss,
+    /// reported from inside this call (the lost handler runs synchronously)
+    /// before the caller's work rather than after it.
     /// Timer-driven work of a leader asks this; work arriving on sockets
     /// cannot be ordered that way — a row claim covers that window.
-    bool fresh() const noexcept;
+    bool fresh();
 
     const std::string& key() const noexcept { return key_; }
     std::int64_t lock_id() const noexcept { return lock_id_; }

@@ -324,24 +324,6 @@ void Application::start_process()
                             http_port_);
         }
 
-#ifdef WITH_POSTGRESQL
-        // A leader role with nothing to hold its lock on fails in the child,
-        // and the master would respawn it forever. Refuse here instead.
-        // process.leader is checked by validate(); this is the per-process key.
-        if (settings_.pg_conninfo_helper.empty())
-            for (const auto& cp : custom_processes_)
-                if (config_->get_bool(fmt::format("module.{}.leader", cp.name), false))
-                {
-                    logger_->error("module.{}.leader needs a PostgreSQL connection to hold "
-                                   "the lock on (postgres.helper) — not starting", cp.name);
-                    exit_code_ = 1;
-                    master_listener_.reset();
-                    listen_fd_ = -1;
-                    remove_pid_file();
-                    return;
-                }
-#endif
-
         if (cfg_helper()) spawn_helper();
         // Spawn custom processes first, then workers
         for (auto& cp : custom_processes_)
@@ -558,6 +540,31 @@ Application::StagedConfig Application::read_config(bool reload) const
         staged.settings.locale = locale_;
 
     auto errors = staged.settings.validate();
+
+    // module.<Name>.leader is read by the child that runs the process, with
+    // the same get_bool as here. A value it cannot read ("tru"; an unresolved
+    // ${VAR} is "" and gives the default, process.leader) failed the child's
+    // start, and the master respawned it forever while -t and the start said
+    // nothing; so did "true" with no postgres.helper after a SIGHUP. Read here,
+    // where the verdict refuses the file — for a start, a reload and -t alike.
+    // Every module.*, not only the custom processes: those are not registered
+    // yet when a start reads the file, and a key that cannot be read is the
+    // operator's error wherever it stands.
+    if (const auto& j = staged.config->json(); j.contains("module") && j["module"].is_object())
+        for (const auto& [name, m] : j["module"].items())
+            if (m.is_object() && m.contains("leader"))
+            {
+                const auto key = fmt::format("module.{}.leader", name);
+                try {
+                    if (staged.config->get_bool(key, false) &&
+                        staged.settings.pg_conninfo_helper.empty())
+                        errors.push_back({key, key + " needs a PostgreSQL connection to hold "
+                                                     "the lock on (postgres.helper)"});
+                } catch (const ConfigError& e) {
+                    errors.push_back({key, e.what()});
+                }
+            }
+
     if (!errors.empty())
     {
         for (auto& e : errors)
@@ -1117,7 +1124,7 @@ void Application::helper_run()
 
     bool started = false;
 #ifdef WITH_POSTGRESQL
-    const PgLeaderLock* gate = nullptr;   // set under "process.leader"
+    PgLeaderLock* gate = nullptr;   // set under "process.leader"
 #endif
 
     // Everything the helper does once it may: build its modules, start them,
@@ -1250,7 +1257,7 @@ void Application::custom_process_run(CustomProcess& proc)
     bool started = false;
     EventLoop::TimerId heartbeat_timer      = EventLoop::kInvalidTimer;
     EventLoop::TimerId pool_heartbeat_timer = EventLoop::kInvalidTimer;
-    const PgLeaderLock* gate = nullptr;   // set under "leader"
+    PgLeaderLock* gate = nullptr;   // set under "leader"
 
     // Steps 5–7: what the process does once it may. Run at once, or — under
     // "leader" — when the role's lock is taken; a standby holds no pool.

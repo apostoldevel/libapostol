@@ -4,6 +4,7 @@
 #include "apostol/pg.hpp"
 #include "apostol/pg_utils.hpp"
 
+#include <poll.h>
 #include <sys/epoll.h>
 
 #include <algorithm>
@@ -86,9 +87,44 @@ std::chrono::seconds PgLeaderLock::server_timeout() const noexcept
     return answer_timeout() * 4;
 }
 
-bool PgLeaderLock::fresh() const noexcept
+bool PgLeaderLock::fresh()
 {
-    return held_ && std::chrono::steady_clock::now() - confirmed_ <= answer_timeout();
+    if (!held_)
+        return false;
+
+    // A stall shorter than answer_timeout() passes the age check, and its
+    // queued events come at once in any order: a timer could run the
+    // leader's work before the socket saying the session was killed while
+    // the process stood — and a standby already holding the role (T589).
+    // The socket is asked now instead — has the server closed its side? Not
+    // by reading: a killed session sends FATAL and then FIN, one read takes
+    // only the FATAL (libpq hands it to the notice processor while idle) and
+    // reports the connection alive. POLLRDHUP sees the FIN behind it, and
+    // does not read. In any state: the lock's own tick, woken in the same
+    // batch, may already have sent a query into the dead socket (Busy) — no
+    // answer comes after the server's FIN either way.
+    if (conn_ && conn_->fd() >= 0)
+    {
+        pollfd p{conn_->fd(), POLLIN | POLLRDHUP, 0};
+        if (::poll(&p, 1, 0) > 0 && (p.revents & (POLLRDHUP | POLLHUP | POLLERR)))
+        {
+            // Read what the server said last, up to the EOF, for the log;
+            // the connection is dropped right after, so nothing is owed to
+            // a query in flight. Reaching the EOF closes the socket inside
+            // libpq: fd() is -1 then and lose() could not take the number
+            // off the loop, so it is taken off here.
+            const int fd = conn_->fd();
+            const auto noop = [](const char*, const char*) {};
+            for (int i = 0; i < 4 && conn_->consume_notify(noop) >= 0; ++i) {}
+            if (conn_->fd() < 0)
+                loop_.remove_io(fd);
+            const std::string msg = conn_->error_message();
+            drop(msg.empty() ? std::string("connection closed by the server") : msg);
+            return false;
+        }
+    }
+
+    return std::chrono::steady_clock::now() - confirmed_ <= answer_timeout();
 }
 
 std::string PgLeaderLock::tag() const
