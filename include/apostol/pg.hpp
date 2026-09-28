@@ -7,6 +7,7 @@
 
 #include <libpq-fe.h>
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -247,6 +248,32 @@ public:
     bool         resetting() const { return resetting_; }
     bool         needs_flush() const { return needs_flush_; }
 
+    /// The handshake's time limit, taken at connect_start()/reset_start() from
+    /// the options libpq actually uses (PQconninfo: the connection string, the
+    /// environment, a service file): connect_timeout, below 2 s 2 s, as in
+    /// libpq; zero when connect_timeout is absent or 0 (no limit).
+    ///
+    /// It exists because the asynchronous PQconnectPoll does not honour
+    /// connect_timeout at all: a server that accepts TCP and never answers held
+    /// a connection in Connecting for good (T606). The limit is only kept here;
+    /// PgPool is what acts on it, through handshake_expired().
+    std::chrono::seconds handshake_limit() const { return handshake_limit_; }
+
+    /// Asked once per tick of PgPool's handshake watch. True when the
+    /// handshake has been past its limit at this tick AND at the previous one.
+    ///
+    /// The clock runs only once TCP is up. While PQstatus is
+    /// CONNECTION_STARTED the kernel bounds the connect, and a failed connect
+    /// is what makes libpq move on to the next address or host — cutting it
+    /// short kept every attempt on a first address that drops SYN (an IPv6
+    /// black hole) where libpq alone would have reached the second. Each such
+    /// move starts the clock again: the limit is per address, as in libpq.
+    ///
+    /// Two ticks, because after a stalled loop the socket's answer and the
+    /// watch's timer come in one epoll batch: a verdict on the first tick
+    /// would drop a connection whose answer is being read right then.
+    bool handshake_expired(std::chrono::steady_clock::time_point now);
+
     /// libpq's connection error text — without the error of a quiet statement
     /// that libpq keeps at its head until the next query is sent (see
     /// withhold_last_error()).
@@ -278,7 +305,13 @@ private:
 
     static void notice_processor(void* arg, const char* message);
 
+    /// Start the handshake clock from the options of the live PGconn.
+    void start_handshake_clock();
+
     std::unique_ptr<PGconn, decltype(&PQfinish)> conn_;
+    std::chrono::seconds                  handshake_limit_{0};
+    std::chrono::steady_clock::time_point handshake_deadline_{};
+    bool                                  handshake_late_{false};  // past the limit at the last tick
     std::string      conninfo_;
     PgConnState      state_{PgConnState::Connecting};
     PgQuery*         current_query_{nullptr};
@@ -484,6 +517,18 @@ private:
     /// with no retry — see start_listener()/on_listener_io()).
     void schedule_reconnect_timer();
 
+    // ── Handshake watch (T606) ────────────────────────────────────────────────
+    // PQconnectPoll keeps no time: a server that takes the TCP connection and
+    // never answers leaves the handshake waiting for an event that will not
+    // come, and heartbeat()/listener_is_dead() leave Connecting alone. One
+    // one-shot timer, armed whenever a handshake with a limit starts and
+    // re-armed while any is in flight, asks each one handshake_expired() once
+    // a second; an expired one is dropped as a failed connect — pool or
+    // listener alike, with the backoff.
+    void arm_handshake_watch();
+    void on_handshake_watch();
+    EventLoop::TimerId handshake_timer_{EventLoop::kInvalidTimer};
+
     // Pointer set of connections currently registered with EventLoop.
     // Used by on_io to decide whether it's safe to rearm a conn after a
     // handler may have destroyed it via replace_connection (which erases
@@ -503,8 +548,9 @@ private:
 
     /// True when the listener object has outlived its connection — libpq
     /// dropped the socket, or PQstatus says the connection is gone. False
-    /// while a handshake is still in flight, and false when there is no
-    /// listener at all (nothing to restart; see the callers).
+    /// while a handshake is still in flight (its limit is the handshake
+    /// watch's to judge), and false when there is no listener at all (nothing
+    /// to restart; see the callers).
     bool listener_is_dead() const;
 
     void on_listener_io(uint32_t events);

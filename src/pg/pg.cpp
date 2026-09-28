@@ -5,6 +5,9 @@
 #include <sys/epoll.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
+#include <string_view>
 
 namespace apostol
 {
@@ -295,6 +298,60 @@ bool PgConnection::connect_start()
 
     last_fd_ = PQsocket(raw);  // remembered for the log; fd() asks libpq itself
     resetting_ = false;
+    start_handshake_clock();
+    return true;
+}
+
+// Asked of the live PGconn, not parsed out of conninfo_: PQconninfo reports
+// what libpq will use, the environment (PGCONNECT_TIMEOUT) and a service file
+// included. libpq has already refused a value that is not a whole number
+// (PQconnectStart fails), so only the range is ours to guard.
+void PgConnection::start_handshake_clock()
+{
+    long timeout = 0;
+
+    if (PQconninfoOption* opts = conn_ ? PQconninfo(conn_.get()) : nullptr) {
+        for (const PQconninfoOption* o = opts; o->keyword; ++o) {
+            if (o->val && *o->val && std::string_view(o->keyword) == "connect_timeout") {
+                timeout = std::strtol(o->val, nullptr, 10);
+                break;
+            }
+        }
+        PQconninfoFree(opts);
+    }
+
+    handshake_late_ = false;
+    if (timeout <= 0) {
+        handshake_limit_    = std::chrono::seconds(0);
+        handshake_deadline_ = {};
+        return;
+    }
+    // libpq: "a value of 1 is interpreted as 2"; and it takes an int.
+    timeout = std::clamp(timeout, 2L, static_cast<long>(std::numeric_limits<int>::max()));
+
+    handshake_limit_    = std::chrono::seconds(timeout);
+    handshake_deadline_ = std::chrono::steady_clock::now() + handshake_limit_;
+}
+
+bool PgConnection::handshake_expired(std::chrono::steady_clock::time_point now)
+{
+    if (state_ != PgConnState::Connecting || handshake_limit_.count() <= 0)
+        return false;
+
+    if (conn_ && PQstatus(conn_.get()) == CONNECTION_STARTED) {
+        // TCP connect in flight: the kernel's to bound, not ours (see the header).
+        handshake_deadline_ = now + handshake_limit_;
+        handshake_late_     = false;
+        return false;
+    }
+
+    if (now <= handshake_deadline_)
+        return false;
+
+    if (!handshake_late_) {
+        handshake_late_ = true;  // judged on the next tick, if still here
+        return false;
+    }
     return true;
 }
 
@@ -322,6 +379,7 @@ bool PgConnection::reset_start()
     state_ = PgConnState::Connecting;
     resetting_ = true;
     last_fd_ = PQsocket(conn_.get());
+    start_handshake_clock();
     return true;
 }
 
@@ -554,6 +612,10 @@ PgPool::~PgPool()
         loop_.cancel_timer(reconnect_timer_);
         reconnect_timer_ = EventLoop::kInvalidTimer;
     }
+    if (handshake_timer_ != EventLoop::kInvalidTimer) {
+        loop_.cancel_timer(handshake_timer_);
+        handshake_timer_ = EventLoop::kInvalidTimer;
+    }
 
     if (lost_timer_ != EventLoop::kInvalidTimer) {
         loop_.cancel_timer(lost_timer_);
@@ -615,6 +677,8 @@ void PgPool::new_connection()
     loop_.add_io(raw->fd(), EPOLLIN | EPOLLOUT, [this, raw](uint32_t events) {
         on_io(*raw, events);
     });
+    if (raw->handshake_limit().count() > 0)
+        arm_handshake_watch();
 }
 
 void PgPool::on_io(PgConnection& conn, uint32_t events)
@@ -1116,6 +1180,8 @@ bool PgPool::try_reconnect(PgConnection& conn)
             on_io(conn, events);
         });
     }
+    if (conn.handshake_limit().count() > 0)
+        arm_handshake_watch();
 
     return true;
 }
@@ -1341,6 +1407,66 @@ void PgPool::schedule_reconnect_timer()
         /*repeat=*/false);
 }
 
+void PgPool::arm_handshake_watch()
+{
+    if (handshake_timer_ != EventLoop::kInvalidTimer)
+        return;  // already armed; it re-arms itself while a handshake is in flight
+
+    handshake_timer_ = loop_.add_timer(std::chrono::seconds(1),
+        [this] { on_handshake_watch(); },
+        /*repeat=*/false);
+}
+
+void PgPool::on_handshake_watch()
+{
+    handshake_timer_ = EventLoop::kInvalidTimer;
+    const auto now = std::chrono::steady_clock::now();
+
+    // A handshake past its limit is judged without reading the socket:
+    // libpq wants PQconnectPoll called only once the socket is ready for what
+    // it last asked, and the timer does not know that. Instead a verdict takes
+    // two ticks (handshake_expired()), so that an answer that arrived in the
+    // same wake-up as this timer is read by on_io() before it is judged.
+    //
+    // Every connection in Connecting is asked each tick — the question keeps
+    // its clock. Collected first: replace_connection() erases from conns_ and
+    // appends the replacement.
+    std::vector<PgConnection*> expired;
+    for (const auto& c : conns_)
+        if (c->handshake_expired(now))
+            expired.push_back(c.get());
+
+    for (PgConnection* c : expired) {
+        if (pg_logger_)
+            pg_logger_->error("{} Connect/Reset failed: handshake not finished in {}s",
+                             conn_tag(*c), c->handshake_limit().count());
+        record_connect_failure();
+        replace_connection(*c);
+    }
+
+    // As the FAILED branch of on_listener_io: nothing was shipped during the
+    // handshake, so pending_listens_ still holds every channel.
+    if (listener_ && listener_->handshake_expired(now)) {
+        if (pg_logger_)
+            pg_logger_->error("{} Listener Error: handshake not finished in {}s",
+                             conn_tag(*listener_), listener_->handshake_limit().count());
+        if (listener_->fd() >= 0)
+            loop_.remove_io(listener_->fd());
+        listener_.reset();
+        record_connect_failure();
+        schedule_reconnect_timer();
+    }
+
+    auto in_flight = [](const PgConnection& c) {
+        return c.state() == PgConnState::Connecting && c.handshake_limit().count() > 0;
+    };
+    bool waiting = listener_ && in_flight(*listener_);
+    for (const auto& c : conns_)
+        waiting = waiting || in_flight(*c);
+    if (waiting)
+        arm_handshake_watch();
+}
+
 std::size_t PgPool::outstanding() const
 {
     std::size_t n = 0;
@@ -1538,6 +1664,8 @@ void PgPool::start_listener()
     loop_.add_io(fd, EPOLLIN | EPOLLOUT, [this](uint32_t events) {
         on_listener_io(events);
     });
+    if (listener_->handshake_limit().count() > 0)
+        arm_handshake_watch();
 }
 
 bool PgPool::listener_is_dead() const

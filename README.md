@@ -302,6 +302,35 @@ role active and the rest waiting:
 name; `node_process_id()` adds `:<pid>`. Only a string counts: an application
 that keeps an object under `"node"` (cs: `{"code", "url"}`) is left alone.
 
+### A time limit on connecting to PostgreSQL
+
+The pool connects asynchronously, and libpq's asynchronous handshake keeps no
+time: `connect_timeout` is honoured only by the blocking `PQconnectdb`. A server
+that accepts the TCP connection and never answers — a hung host, a half-dead
+proxy — used to hold a pool connection or the LISTEN connection in the
+handshake for good. The pool keeps the limit itself:
+
+- The limit is `connect_timeout`, whatever libpq will use: `postgres.timeout`
+  in the config — on by default, the application's
+  `APP_DEFAULT_PG_CONNECT_TIMEOUT` (5 s in the template) — or
+  `PGCONNECT_TIMEOUT`, or a service file. Below 2 s it is 2 s, as in libpq. A
+  connection string with no `connect_timeout`, or 0 — no limit, as in libpq.
+- It counts from the moment TCP is up, per address, as in libpq. The TCP
+  connect itself is left to the kernel: when it fails — a first address that
+  drops SYN, an IPv6 black hole — libpq moves on to the next address or host,
+  and the clock starts again there.
+- Past the limit (checked once a second, the verdict on the second check in a
+  row) the connection is dropped as a failed connect —
+  `Connect/Reset failed: handshake not finished in Ns` or
+  `Listener Error: handshake not finished in Ns` in the PostgreSQL log — and
+  reconnects with the usual backoff. The LISTEN channels are subscribed again
+  once a server answers.
+- With several hosts, a **first** host that accepts TCP and stays silent is
+  not skipped: the asynchronous handshake cannot be moved on to the next host
+  from outside, so every attempt starts from the first again.
+  `load_balance_hosts=random` (libpq 16+) makes each attempt pick a host at
+  random, so the pool gets through to a live one.
+
 ## Build (standalone development)
 
 ```bash
