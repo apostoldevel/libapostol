@@ -9,6 +9,7 @@
 #include <limits>
 #include <system_error>
 
+#include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -131,10 +132,7 @@ void EventLoop::poll_once(int timeout_ms)
             {
                 if (it->second.seq > collected_at)
                     continue;
-
-                // Copy before calling: callback may remove_io(fd), invalidating 'it'
-                auto cb = it->second.callback;
-                cb(ev);
+                dispatch_io(fd, ev);
             }
         }
     }
@@ -191,6 +189,96 @@ bool registration_lost(int err) noexcept
 {
     return err == EBADF || err == ENOENT || err == EPERM;
 }
+}
+
+// An exception out of an I/O handler used to leave the loop and end the
+// process — a worker with every connection it served, for one bad frame on one
+// of them (T637). It is caught here, for this handler only: timers and signals
+// still unwind, a process may be counting on that to be restarted.
+//
+// The loop tells the holder, not the peer. The fd is not closed — it is the
+// holder's, and a number closed behind its back is the next socket's (T619) —
+// and not shut for writing: the peer would see the end before the holder
+// chose it (a leader lock released while its process still drains), and the
+// holder's own goodbye (TLS close_notify) would die of SIGPIPE. Its read side
+// is shut and the holder gets one more event — end of input, which it takes
+// for a lost peer and tears the connection down by its own road, closing the
+// fd itself. A holder that throws again, keeps the fd after that event, or
+// whose socket cannot be shut (not a socket, not connected) is taken off the
+// loop; its fd stays open until the holder closes it.
+void EventLoop::dispatch_io(int fd, uint32_t events)
+{
+    auto it = io_handlers_.find(fd);
+    // Copy before calling: callback may remove_io(fd), invalidating 'it'
+    auto cb = it->second.callback;
+    const uint64_t seq = it->second.seq;
+    const bool faulted = it->second.faulted;
+
+    try {
+        cb(events);
+    } catch (const std::exception& e) {
+        io_handler_threw(fd, seq, e.what());
+        return;
+    } catch (...) {
+        io_handler_threw(fd, seq, "unknown exception");
+        return;
+    }
+
+    if (!faulted)
+        return;
+    it = io_handlers_.find(fd);
+    if (it == io_handlers_.end() || it->second.seq != seq)
+        return;   // the holder let go, as it should
+    remove_io(fd);
+    if (Logger* log = g_diagnostics.load(std::memory_order_relaxed)) {
+        try {
+            log->error("I/O handler for fd={} kept it after end of input — taken off the loop", fd);
+        } catch (...) {}
+    }
+}
+
+void EventLoop::io_handler_threw(int fd, uint64_t seq, const char* what) noexcept
+{
+    Logger* log = g_diagnostics.load(std::memory_order_relaxed);
+    const char* outcome;
+    int err = 0;
+
+    auto it = io_handlers_.find(fd);
+    if (it == io_handlers_.end() || it->second.seq != seq) {
+        // Removed, or the number is someone else's by now: nothing here to act on.
+        outcome = "the handler had let go of it";
+    } else if (it->second.faulted) {
+        remove_io(fd);
+        outcome = "threw again on end of input — taken off the loop";
+    } else if (::shutdown(fd, SHUT_RD) < 0) {
+        err = errno;
+        remove_io(fd);
+        outcome = "its socket could not be shut — taken off the loop";
+    } else {
+        it->second.faulted = true;
+        // End of input is EPOLLIN|EPOLLRDHUP: a holder waiting for EPOLLOUT alone
+        // would never hear it. MOD also re-arms under ET, where the throw came
+        // before the handler's own rearm.
+        const uint32_t mask = it->second.events | EPOLLIN | EPOLLRDHUP;
+        bool armed = false;
+        try { armed = modify_io(fd, mask); } catch (...) {}
+        if (armed) {
+            outcome = "read side shut, the holder gets end of input";
+        } else {
+            remove_io(fd);
+            outcome = "read side shut, could not be re-armed — taken off the loop";
+        }
+    }
+
+    if (log) {
+        try {
+            if (err)
+                log->error("I/O handler for fd={} threw: {} — {} ({})", fd, what, outcome,
+                           std::system_category().message(err));
+            else
+                log->error("I/O handler for fd={} threw: {} — {}", fd, what, outcome);
+        } catch (...) {}
+    }
 }
 
 void EventLoop::set_diagnostics(Logger* logger) noexcept

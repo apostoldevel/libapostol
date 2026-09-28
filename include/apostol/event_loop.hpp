@@ -116,6 +116,8 @@ private:
     void rebuild_signal_fd();
     void dispatch_signals();
     void dispatch_timer(int timer_fd);
+    void dispatch_io(int fd, uint32_t events);
+    void io_handler_threw(int fd, uint64_t seq, const char* what) noexcept;
 
     int epoll_fd_{-1};
     int signal_fd_{-1};
@@ -128,11 +130,14 @@ private:
     // batch is collected before any of its handlers runs, so an event in it
     // for an entry newer than the batch was raised for whatever had the fd
     // number before (T619).
+    // faulted — the handler threw; the loop shut the socket's read side and
+    // lets one more event through for the holder to see end of input (T639).
     struct IOEntry
     {
         uint32_t events;
         IOCallback callback;
         uint64_t seq;
+        bool faulted{false};
     };
 
     struct TimerEntry
