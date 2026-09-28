@@ -11,6 +11,17 @@
 //       + abi::__cxa_demangle if addr2line is unavailable or returns "??").
 //   4. Re-raises the signal with SIG_DFL so the kernel generates a core dump.
 //
+// Death is guaranteed (T648). The report calls what may take a lock the
+// crashed code holds: a stack overflow lands inside malloc, and once the
+// process has had a thread (curl's resolver) malloc locks its arena — the
+// handler then waited on it forever, the worker never died, and the master,
+// which only restarts what it reaps, never knew. So the handler arms alarm()
+// first, and on expiry re-raises its own signal (the master logs 11, not 14;
+// the core is not lost); the raw frames go out before anything that
+// allocates or takes glibc's tz or locale locks; and what the first
+// backtrace() would load (libgcc_s, by dlopen and malloc) is loaded when the
+// handler is installed.
+//
 // Signal safety note:
 //   The crash handler deliberately uses functions that are NOT in the
 //   async-signal-safe set (popen, fprintf, abi::__cxa_demangle, ...).
@@ -45,6 +56,10 @@ namespace apostol
 
 static constexpr int    kMaxFrames    = 64;
 static constexpr size_t kAltStackSize = 65536; // 64 KiB — POSIX minimum is SIGSTKSZ
+// How long the report may take before its own signal is raised again with
+// the default action. 64 addr2line calls take about 1.5 s here; a report that
+// hangs on a lock never finishes.
+static constexpr unsigned kReportSeconds = 10;
 
 // ─── Per-process alternate signal stack ──────────────────────────────────────
 // Declared static so each translation unit that calls setup_crash_altstack()
@@ -187,8 +202,58 @@ static bool addr2line_resolve(void* addr,
 
 // ─── Crash handler ───────────────────────────────────────────────────────────
 
+// The signal's description without gettext: strsignal() translates, and under
+// any locale but C its first call allocates (T648).
+static const char* signal_name(int signo) noexcept
+{
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 32))
+    const char* d = ::sigdescr_np(signo);
+    return d ? d : "?";
+#else
+    return ::strsignal(signo);
+#endif
+}
+
+// The signal being reported, for the report's time limit to die of.
+static volatile sig_atomic_t g_crash_signo = 0;
+
+// The report ran out of time — hung on a lock the crash holds. Die of the
+// crash's own signal, as the report would have: default action, unblocked
+// (it is blocked while its handler runs), raised. Async-signal-safe only.
+static void crash_report_timeout(int)
+{
+    const int signo = g_crash_signo ? g_crash_signo : SIGKILL;
+    struct sigaction sa = {};
+    ::sigemptyset(&sa.sa_mask);
+    sa.sa_handler = SIG_DFL;
+    ::sigaction(signo, &sa, nullptr);
+    sigset_t set;
+    ::sigemptyset(&set);
+    ::sigaddset(&set, signo);
+    ::sigprocmask(SIG_UNBLOCK, &set, nullptr);
+    ::raise(signo);
+    ::_exit(128 + signo);   // not reached: the default action ends the process
+}
+
 static void crash_handler(int signo, siginfo_t* si, void* ctx)
 {
+    // ── Die whatever the report does ─────────────────────────────────────────
+    // A time limit on the report, unblocked in this thread (a thread may have
+    // it blocked by inheritance). All calls are async-signal-safe.
+    g_crash_signo = signo;
+    {
+        struct sigaction sa = {};
+        ::sigemptyset(&sa.sa_mask);
+        sa.sa_handler = crash_report_timeout;
+        sa.sa_flags   = SA_ONSTACK;
+        ::sigaction(SIGALRM, &sa, nullptr);
+        sigset_t set;
+        ::sigemptyset(&set);
+        ::sigaddset(&set, SIGALRM);
+        ::sigprocmask(SIG_UNBLOCK, &set, nullptr);
+        ::alarm(kReportSeconds);
+    }
+
     // ── Resolve binary path ───────────────────────────────────────────────────
     char binary[512] = {};
     {
@@ -229,6 +294,19 @@ static void crash_handler(int signo, siginfo_t* si, void* ctx)
 
     int e = STDERR_FILENO;
 
+    // ── Raw frames first ──────────────────────────────────────────────────────
+    // Before the timestamp (localtime_r takes glibc's tz lock) and the signal's
+    // name (strsignal goes through gettext and allocates under any locale but
+    // C): nothing here allocates. backtrace_symbols_fd may still wait on the
+    // loader's lock; the time limit above bounds that.
+    raw_write(e, "\n-----BEGIN CRASH REPORT-----\n");
+    if (log_fd >= 0) raw_write(log_fd, "\n-----BEGIN CRASH REPORT-----\n");
+    emit(e, log_fd, "Signal %d, pid %d, %s — raw backtrace (%d frames):\n",
+         signo, (int)::getpid(), proc_name, n_frames);
+    ::backtrace_symbols_fd(frames, n_frames, e);
+    if (log_fd >= 0)
+        ::backtrace_symbols_fd(frames, n_frames, log_fd);
+
     // ── Timestamp ─────────────────────────────────────────────────────────────
     char ts[32] = {};
     {
@@ -239,11 +317,8 @@ static void crash_handler(int signo, siginfo_t* si, void* ctx)
     }
 
     // ── Header ────────────────────────────────────────────────────────────────
-    raw_write(e, "\n-----BEGIN CRASH REPORT-----\n");
-    if (log_fd >= 0) raw_write(log_fd, "\n-----BEGIN CRASH REPORT-----\n");
-
-    emit(e, log_fd, "%s | crit | %s (pid=%d)\n", ts, proc_name, (int)::getpid());
-    emit(e, log_fd, "Signal             : %d (%s)\n", signo, ::strsignal(signo));
+    emit(e, log_fd, "\n%s | crit | %s (pid=%d)\n", ts, proc_name, (int)::getpid());
+    emit(e, log_fd, "Signal             : %d (%s)\n", signo, signal_name(signo));
     emit(e, log_fd, "Fault address      : %p\n",      si->si_addr);
     if (ip)
         emit(e, log_fd, "Instruction pointer: %p\n",  ip);
@@ -340,6 +415,17 @@ void install_crash_handler(std::string_view log_file) noexcept
 {
     set_crash_log_path(log_file);
     setup_crash_altstack();
+
+    // Load now what the handler's first backtrace() and localtime_r() would
+    // load then — by dlopen and malloc, under a lock the crash may hold (T648).
+    // Installed in the master before fork, so every child inherits it loaded.
+    {
+        void* frame[1];
+        ::backtrace(frame, 1);
+        time_t t = ::time(nullptr);
+        struct tm tm_buf;
+        ::localtime_r(&t, &tm_buf);
+    }
 
     struct sigaction sa = {};
     ::sigemptyset(&sa.sa_mask);
