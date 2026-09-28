@@ -96,7 +96,11 @@ void AppSettings::populate(const Config& cfg)
 
     leader          = cfg.get_bool("process.leader", leader);
     leader_interval = static_cast<int>(cfg.get_int("process.leader_interval", leader_interval));
-    node            = cfg.get_string("node", node);
+    // A string only. "node" is an object in applications that had the key
+    // first (cs: {"code", "url"}), and it is theirs: reading it as a string
+    // threw ConfigError and stopped them at start.
+    if (const auto& j = cfg.json(); j.contains("node") && j["node"].is_string())
+        node = cfg.get_string("node", node);
 
     user         = cfg.get_string("process.user",         user);
     group        = cfg.get_string("process.group",        group);

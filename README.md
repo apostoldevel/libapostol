@@ -296,7 +296,8 @@ role active and the rest waiting:
 
 `node` names this copy — `Application::node_id()`: the configured value, else
 `$NODE_NAME` (in Kubernetes, the pod name from the downward API), else the host
-name; `node_process_id()` adds `:<pid>`.
+name; `node_process_id()` adds `:<pid>`. Only a string counts: an application
+that keeps an object under `"node"` (cs: `{"code", "url"}`) is left alone.
 
 ## Build (standalone development)
 

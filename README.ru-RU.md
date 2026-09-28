@@ -295,7 +295,8 @@ Feature flags (`WITH_POSTGRESQL`, `WITH_SSL`, `WITH_CURL`) объявлены к
 
 `node` — имя этой копии, `Application::node_id()`: значение из конфига, иначе
 `$NODE_NAME` (в Kubernetes — имя пода из downward API), иначе имя хоста;
-`node_process_id()` добавляет `:<pid>`.
+`node_process_id()` добавляет `:<pid>`. Учитывается только строка: объект под
+`"node"` (у cs — `{"code", "url"}`) принадлежит приложению и не трогается.
 
 ## Сборка (standalone-разработка)
 
