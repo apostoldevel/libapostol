@@ -1125,6 +1125,20 @@ void PgPool::fail_inflight_query(PgConnection& conn, std::string_view reason)
     if (it != inflight_.end()) {
         auto owned = std::move(*it);
         inflight_.erase(it);
+
+        // Canceled: its caller has already been told the result will be thrown
+        // away (cancel(), pg.hpp: "result is silently discarded" — so even when
+        // PQcancel did not get through). Re-queued, it ran a second time on the new connection only for
+        // the answer to be discarded: dispatch_queue() drops a canceled query by
+        // canceled_ids_, and an in-flight cancel() never puts its id there — it
+        // marks the query instead (seen in T619, card T627).
+        if (owned->canceled()) {
+            if (pg_logger_)
+                pg_logger_->debug("Dropping canceled query {} after connection error: {}",
+                                  owned->id(), reason);
+            return;
+        }
+
         // Re-queue the query for retry instead of failing it permanently.
         //
         // The statement itself is not printed here. This runs at notice — the
