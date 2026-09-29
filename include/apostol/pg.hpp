@@ -66,6 +66,12 @@ public:
     /// secret would pass. None does today.
     void           withhold_statement();
 
+    /// An error result that carries only @p text — no connection's error
+    /// buffer, which for a quiet query may still quote the statement (T306).
+    /// What a caller without an error handler receives in on_result when its
+    /// statement is lost with the connection (PgPool::fail_inflight_query).
+    static PgResult lost(std::string text);
+
     int rows()    const;   // PQntuples
     int columns() const;   // PQnfields
 
@@ -88,6 +94,26 @@ private:
     std::string withheld_;   // non-empty: error_message() answers this instead
 };
 
+// ── PgRetry ───────────────────────────────────────────────────────────────────
+
+/// What the pool does with a query whose connection is lost after the query was
+/// sent whole — when the server may or may not have run it (T627).
+///
+///   never    — it is not sent again: the caller gets an error, "connection lost
+///              … may or may not have been executed" (on_exception, or a result
+///              that is not ok() when there is none). The default, and the only
+///              safe answer for a statement with an effect: repeated, it ran
+///              twice — a second row, a second charge — and the caller saw one
+///              success.
+///   if_lost  — it is sent again on a new connection, as the pool did for every
+///              query before T627. For statements whose repetition is harmless
+///              or wanted (a read, an idempotent write, a claim that expires),
+///              chosen at the call site where that is known.
+///
+/// A query not yet sent, or not sent whole, is always sent again: the server
+/// never had it. A canceled one never is.
+enum class PgRetry { never, if_lost };
+
 // ── PgQuery ───────────────────────────────────────────────────────────────────
 
 /// An asynchronous query with completion callbacks.
@@ -108,6 +134,9 @@ public:
 
     bool canceled() const      { return canceled_; }
     void mark_canceled()       { canceled_ = true; }
+
+    PgRetry retry() const          { return retry_; }
+    void    set_retry(PgRetry r)   { retry_ = r; }
 
     /// Nobody is waiting for this query any more: it still runs, but deliver() and
     /// fail() no longer call its handlers. Set by PgPool::detach() at shutdown.
@@ -136,6 +165,7 @@ private:
     bool             quiet_{false};
     bool             canceled_{false};
     bool             detached_{false};
+    PgRetry          retry_{PgRetry::never};
     ResultHandler    result_handler_;
     ExceptionHandler exception_handler_;
 };
@@ -294,14 +324,19 @@ public:
     /// Schedule a query. Calls on_result when done, on_error on failure.
     /// Set quiet=true to suppress Query/ResultStatus logging (e.g. heartbeat).
     /// Returns a QueryId that can be passed to cancel().
+    /// `retry` — what happens if the connection is lost once the query has gone
+    /// out: see PgRetry. The default is not to send it again.
     QueryId execute(std::string              sql,
                     PgQuery::ResultHandler    on_result,
                     PgQuery::ExceptionHandler on_exception = {},
-                    bool                      quiet = false);
+                    bool                      quiet = false,
+                    PgRetry                   retry = PgRetry::never);
 
     /// Cancel a running or queued query.
     /// For in-flight queries: sends PQcancel to PostgreSQL; result is silently discarded.
     /// For queued queries: removed from the queue without dispatching.
+    /// For a query lost with its connection and not yet reported: not reported.
+    /// A canceled query is never sent again after a connection loss.
     /// Returns true if the query was found and cancel was initiated.
     bool cancel(QueryId id);
 
@@ -384,8 +419,13 @@ private:
     /// Remove a dead connection from the pool and create a replacement.
     void replace_connection(PgConnection& conn);
 
-    /// Fail any in-flight query on this connection and re-queue it if retriable.
+    /// Take the in-flight query off a lost connection: re-queue it if it was not
+    /// sent whole or is PgRetry::if_lost, drop it if canceled, otherwise hand it
+    /// to lost_ to be failed from the loop.
     void fail_inflight_query(PgConnection& conn, std::string_view reason);
+
+    /// Tell the callers in lost_ — from the loop, on a clean stack.
+    void deliver_lost();
 
     /// Ensure at least min_conns_ healthy connections exist.
     void ensure_min_connections();
@@ -417,6 +457,19 @@ private:
     std::chrono::steady_clock::time_point next_connect_attempt_{};
     int                                    consecutive_connect_fails_{0};
     EventLoop::TimerId                     reconnect_timer_{EventLoop::kInvalidTimer};
+
+    // Sent whole, lost with the connection, not to be repeated: waiting for
+    // deliver_lost() to tell their callers. Kept here rather than in a bare timer
+    // so that outstanding() counts them and detach() reaches them — a failure
+    // delivered to a module after its on_stop() is exactly T659.
+    struct Lost
+    {
+        std::unique_ptr<PgQuery> query;
+        std::string              error;
+        PgResult                 result;   // for a caller without an error handler
+    };
+    std::vector<Lost>                      lost_;
+    EventLoop::TimerId                     lost_timer_{EventLoop::kInvalidTimer};
 
     void record_connect_success();
     void record_connect_failure();

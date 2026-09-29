@@ -156,7 +156,9 @@ void close_session(PgPool& pool, std::string_view token, SessionCloseHandler on_
             if (on_done)
                 on_done({CloseStatus::failed, std::string(error)});
         },
-        /*quiet=*/true);
+        // A repeat is harmless: a session already closed answers ERR-401-008,
+        // which read_session_close takes for "gone" — the outcome wanted (T627).
+        /*quiet=*/true, PgRetry::if_lost);
 }
 
 void close_session(PgPool& pool, std::string_view token, Logger* log, std::string_view tag)

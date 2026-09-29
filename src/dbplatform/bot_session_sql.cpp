@@ -142,15 +142,17 @@ void BotSession::refresh_if_needed()
 
 void BotSession::execute_action(const std::string& id, std::string_view action,
                                 PgQuery::ResultHandler    on_result,
-                                PgQuery::ExceptionHandler on_error)
+                                PgQuery::ExceptionHandler on_error,
+                                PgRetry                   retry)
 {
-    execute_action(session(), id, action, std::move(on_result), std::move(on_error));
+    execute_action(session(), id, action, std::move(on_result), std::move(on_error), retry);
 }
 
 void BotSession::execute_action(std::string_view session,
                                 const std::string& id, std::string_view action,
                                 PgQuery::ResultHandler    on_result,
-                                PgQuery::ExceptionHandler on_error)
+                                PgQuery::ExceptionHandler on_error,
+                                PgRetry                   retry)
 {
     // Two refusals, two texts — deliberately, and in this order.
     //
@@ -207,7 +209,7 @@ void BotSession::execute_action(std::string_view session,
         pq_quote_literal(action));
 
     // quiet: the statement carries the bot's session code.
-    pool_.execute(sql, std::move(on_result), std::move(on_error), /*quiet=*/true);
+    pool_.execute(sql, std::move(on_result), std::move(on_error), /*quiet=*/true, retry);
 }
 
 // ─── sign_out ────────────────────────────────────────────────────────────────

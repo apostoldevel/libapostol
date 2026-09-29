@@ -78,17 +78,21 @@ public:
     /// Execute api.authorize(session) + api.execute_object_action(id, action) under
     /// an explicit session. Use this whenever the object was found by enumerating:
     /// act in the scope you found it in, not in whichever one happens to be first.
+    /// `retry` as in PgPool::execute: by default an action lost with the connection
+    /// after it went out is reported, not sent again (T627).
     void execute_action(std::string_view session,
                         const std::string& id, std::string_view action,
                         PgQuery::ResultHandler    on_result,
-                        PgQuery::ExceptionHandler on_error);
+                        PgQuery::ExceptionHandler on_error,
+                        PgRetry                   retry = PgRetry::never);
 
     /// The same under the first session. Only correct when the caller has one scope
     /// or the object is known to live in it — otherwise api.authorize succeeds in
     /// the wrong scope and the action fails on an object it cannot see.
     void execute_action(const std::string& id, std::string_view action,
                         PgQuery::ResultHandler    on_result,
-                        PgQuery::ExceptionHandler on_error);
+                        PgQuery::ExceptionHandler on_error,
+                        PgRetry                   retry = PgRetry::never);
 
 #endif // WITH_DB_PLATFORM
 

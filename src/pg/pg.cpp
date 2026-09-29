@@ -127,6 +127,15 @@ const char* PgResult::error_message() const
     return PQresultErrorMessage(res_.get());
 }
 
+PgResult PgResult::lost(std::string text)
+{
+    // Without a connection PQmakeEmptyPGresult copies no error buffer: the
+    // only text the result carries is the one given here.
+    PgResult r(PQmakeEmptyPGresult(nullptr, PGRES_FATAL_ERROR));
+    r.withheld_ = std::move(text);
+    return r;
+}
+
 void PgResult::withhold_statement()
 {
     if (!res_ || ok())
@@ -362,6 +371,21 @@ bool PgConnection::send_query(const std::string& sql)
 {
     if (!connected())
         return false;
+    // Read what the server may already have said. A server that ended this
+    // session while it sat idle — a restart, pg_terminate_backend,
+    // idle_session_timeout — sent FATAL and closed; PQstatus does not know
+    // until something is read, and PQsendQuery into that socket succeeds. The
+    // query would then be lost on a connection that never carried it, and the
+    // pool, which does not repeat a query once sent (T627, PgRetry::never),
+    // would fail it. Found here, the query is not sent: the caller re-queues it.
+    //
+    // Twice: libpq's read takes what is there and returns, so the first call
+    // reads the FATAL and only the second meets the close behind it. On a
+    // live idle connection both are one recv() each that finds nothing.
+    if (PQconsumeInput(conn_.get()) == 0 || PQconsumeInput(conn_.get()) == 0 || !connected()) {
+        state_ = PgConnState::Error;
+        return false;
+    }
     if (PQsendQuery(conn_.get(), sql.c_str()) == 0)
         return false;
     // libpq cleared its error buffer for this query: nothing left to withhold.
@@ -529,6 +553,11 @@ PgPool::~PgPool()
     if (reconnect_timer_ != EventLoop::kInvalidTimer) {
         loop_.cancel_timer(reconnect_timer_);
         reconnect_timer_ = EventLoop::kInvalidTimer;
+    }
+
+    if (lost_timer_ != EventLoop::kInvalidTimer) {
+        loop_.cancel_timer(lost_timer_);
+        lost_timer_ = EventLoop::kInvalidTimer;
     }
 
     if (listener_ && listener_->fd() >= 0) {
@@ -902,6 +931,14 @@ bool PgPool::cancel(QueryId id)
         }
     }
 
+    // Lost with its connection and waiting to be told so: not told.
+    for (auto& l : lost_) {
+        if (l.query->id() == id) {
+            l.query->mark_canceled();
+            return true;
+        }
+    }
+
     // Not in-flight — mark for removal from queue
     canceled_ids_.insert(id);
     return true;
@@ -981,11 +1018,13 @@ void PgPool::dispatch_queue(PgConnection& conn)
 PgPool::QueryId PgPool::execute(std::string              sql,
                                 PgQuery::ResultHandler    on_result,
                                 PgQuery::ExceptionHandler on_exception,
-                                bool                      quiet)
+                                bool                      quiet,
+                                PgRetry                   retry)
 {
     auto q = std::make_unique<PgQuery>(std::move(sql), quiet);
     q->on_result(std::move(on_result));
     q->on_exception(std::move(on_exception));
+    q->set_retry(retry);
 
     auto qid = q->id();
 
@@ -1140,17 +1179,100 @@ void PgPool::fail_inflight_query(PgConnection& conn, std::string_view reason)
             return;
         }
 
-        // Re-queue the query for retry instead of failing it permanently.
-        //
-        // The statement itself is not printed here. This runs at notice — the
-        // default level — and the first eighty characters of a query are quite
+        // The statement itself is not printed in any line below. They run at
+        // notice and error, and the first eighty characters of a query are quite
         // enough to expose a secret: `api.login(E'service-…', E'<secret>'` fits
         // easily. Quiet queries are quiet for a reason, and a connection error is
-        // exactly when they get re-queued.
+        // exactly when they reach these lines.
+
+        // Part of it still in libpq's output buffer: the server never had the
+        // whole message, so it cannot have run it. Safe to send again.
+        if (conn.needs_flush()) {
+            if (pg_logger_)
+                pg_logger_->notice("Re-queuing query {} after connection error (not sent whole): {}",
+                                   owned->id(), reason);
+            queue_.push_back(std::move(owned));
+            return;
+        }
+
+        // Sent whole, and its caller said a repeat is harmless.
+        if (owned->retry() == PgRetry::if_lost) {
+            if (pg_logger_)
+                pg_logger_->notice("Re-queuing query {} after connection error (retry if lost): {}",
+                                   owned->id(), reason);
+            queue_.push_back(std::move(owned));
+            return;
+        }
+
+        // Sent whole: the server may have run it, committed it, and lost the
+        // connection only on the way back. Until T627 it was re-queued here
+        // regardless — and a statement with an effect ran twice: a second row,
+        // a second charge, api.*_fail twice. Whether it ran is unknowable from
+        // here, so it is not repeated: its caller is told, and decides. A
+        // connection the server had already closed before the query went out is
+        // caught in send_query(), before sending, and there the query is
+        // re-queued as it always was.
+        // One line: libpq's reason spans several ("server closed the connection
+        // unexpectedly\n\tThis probably means…"), and it goes into a log line
+        // and, through exec_sql, into an HTTP 500 body.
+        std::string one_line;
+        for (char c : reason) {
+            const bool space = c == '\n' || c == '\r' || c == '\t' || c == ' ';
+            if (!space)
+                one_line += c;
+            else if (!one_line.empty() && one_line.back() != ' ')
+                one_line += ' ';
+        }
+        while (!one_line.empty() && one_line.back() == ' ')
+            one_line.pop_back();
+
+        std::string error = fmt::format(
+            "connection lost while the statement was in the server's hands — it may or may not "
+            "have been executed, and is not repeated: {}", one_line);
+
         if (pg_logger_)
-            pg_logger_->notice("Re-queuing query {} after connection error: {}",
-                               owned->id(), reason);
-        queue_.push_back(std::move(owned));
+            pg_logger_->error("{} Query {} failed: {}", conn_tag(conn), owned->id(), error);
+
+        // The caller hears it from the loop, not from here: this runs in the
+        // middle of the pool's own handling of the loss — inside heartbeat()'s
+        // walk over conns_, before try_reconnect() — and a handler that calls
+        // execute() can grow conns_ under that walk.
+        PgResult result = PgResult::lost(error);
+        lost_.push_back(Lost{std::move(owned), std::move(error), std::move(result)});
+
+        if (lost_timer_ == EventLoop::kInvalidTimer)
+            lost_timer_ = loop_.add_timer(std::chrono::milliseconds(1),
+                [this] {
+                    lost_timer_ = EventLoop::kInvalidTimer;
+                    deliver_lost();
+                }, /*repeat=*/false);
+    }
+}
+
+void PgPool::deliver_lost()
+{
+    // One at a time, taken out of lost_ just before its handler runs, so that a
+    // cancel() or detach() from a handler still reaches the entries after it. A
+    // loss is never appended synchronously from a handler (execute() re-queues a
+    // query it could not send), so the loop ends.
+    while (!lost_.empty()) {
+        Lost l = std::move(lost_.front());
+        lost_.erase(lost_.begin());
+
+        // cancel() and detach() reach a query here as well; deliver() and fail()
+        // check detached() themselves, canceled() is checked here as on_io does.
+        if (l.query->canceled())
+            continue;
+
+        if (l.query->has_exception_handler()) {
+            l.query->fail(l.error);
+        } else {
+            // As with a failed statement (see on_io): a caller without an error
+            // handler still gets its call, with a result that is not ok().
+            std::vector<PgResult> results;
+            results.push_back(std::move(l.result));
+            l.query->deliver(std::move(results));
+        }
     }
 }
 
@@ -1231,6 +1353,10 @@ std::size_t PgPool::outstanding() const
         if (conn && conn->current_query() && !conn->current_query()->detached())
             ++n;
 
+    for (const auto& l : lost_)
+        if (!l.query->detached() && !l.query->canceled())
+            ++n;
+
     return n;
 }
 
@@ -1246,6 +1372,9 @@ void PgPool::detach() noexcept
 
     for (auto& q : inflight_)
         q->mark_detached();
+
+    for (auto& l : lost_)
+        l.query->mark_detached();
 
     mute_listeners();
 }
