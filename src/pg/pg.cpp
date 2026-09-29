@@ -231,13 +231,13 @@ PgQuery& PgQuery::on_exception(ExceptionHandler h)
 
 void PgQuery::deliver(std::vector<PgResult> results)
 {
-    if (result_handler_)
+    if (result_handler_ && !detached_)
         result_handler_(std::move(results));
 }
 
 void PgQuery::fail(std::string_view error)
 {
-    if (exception_handler_)
+    if (exception_handler_ && !detached_)
         exception_handler_(error);
 }
 
@@ -916,7 +916,7 @@ void PgPool::dispatch_queue(PgConnection& conn)
             if (pg_logger_)
                 pg_logger_->debug("Dropping canceled queued query {}", front->id());
             canceled_ids_.erase(front->id());
-            queue_.pop();
+            queue_.pop_front();
             continue;
         }
         break;
@@ -947,7 +947,7 @@ void PgPool::dispatch_queue(PgConnection& conn)
     // Owned by inflight_ before the connection points at it — see execute() (T650).
     PgQuery* raw_q = queue_.front().get();
     inflight_.push_back(std::move(queue_.front()));
-    queue_.pop();
+    queue_.pop_front();
     conn.set_current_query(raw_q);
 
     // If flush was incomplete, need EPOLLOUT to continue flushing. A socket
@@ -965,7 +965,7 @@ void PgPool::dispatch_queue(PgConnection& conn)
     conn.set_current_query(nullptr);
     auto query = std::move(inflight_.back());
     inflight_.pop_back();
-    queue_.push(std::move(query));
+    queue_.push_back(std::move(query));
     conn.set_state(PgConnState::Error);
     if (pg_logger_) {
         if (sent)
@@ -1041,7 +1041,7 @@ PgPool::QueryId PgPool::execute(std::string              sql,
     }
 
     // No ready connection — queue
-    queue_.push(std::move(q));
+    queue_.push_back(std::move(q));
 
     // Ensure we have enough connections to eventually drain the queue
     ensure_min_connections();
@@ -1135,7 +1135,7 @@ void PgPool::fail_inflight_query(PgConnection& conn, std::string_view reason)
         if (pg_logger_)
             pg_logger_->notice("Re-queuing query {} after connection error: {}",
                                owned->id(), reason);
-        queue_.push(std::move(owned));
+        queue_.push_back(std::move(owned));
     }
 }
 
@@ -1206,13 +1206,33 @@ void PgPool::schedule_reconnect_timer()
 
 std::size_t PgPool::outstanding() const
 {
-    std::size_t n = queue_.size();
+    std::size_t n = 0;
+
+    for (const auto& q : queue_)
+        if (!q->detached())
+            ++n;
 
     for (const auto& conn : conns_)
-        if (conn && conn->current_query())
+        if (conn && conn->current_query() && !conn->current_query()->detached())
             ++n;
 
     return n;
+}
+
+void PgPool::mute_listeners() noexcept
+{
+    listeners_muted_ = true;
+}
+
+void PgPool::detach() noexcept
+{
+    for (auto& q : queue_)
+        q->mark_detached();
+
+    for (auto& q : inflight_)
+        q->mark_detached();
+
+    mute_listeners();
 }
 
 std::size_t PgPool::healthy_count() const
@@ -1733,6 +1753,9 @@ void PgPool::dispatch_notify(const char* channel, const char* payload)
             conn_tag(*listener_), channel, listener_->backend_pid());
     }
 
+    if (listeners_muted_)
+        return;
+
     auto it = notify_handlers_.find(channel);
     if (it == notify_handlers_.end()) return;
 
@@ -1744,6 +1767,11 @@ void PgPool::dispatch_notify(const char* channel, const char* payload)
 
 void PgPool::dispatch_listen_ready()
 {
+    if (listeners_muted_) {
+        confirmed_listens_.clear();
+        return;
+    }
+
     // One channel at a time, taken out of the member set before its handlers
     // run: a handler may unlisten() a channel still waiting here (struck out,
     // so a later listen() of it waits for its own answer) or kill the

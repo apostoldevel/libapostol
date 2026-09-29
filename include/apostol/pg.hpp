@@ -11,7 +11,8 @@
 #include <functional>
 #include <memory>
 #include <optional>
-#include <queue>
+#include <deque>
+#include <queue>   // no longer used here; kept for consumers that got it through this header
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -108,6 +109,11 @@ public:
     bool canceled() const      { return canceled_; }
     void mark_canceled()       { canceled_ = true; }
 
+    /// Nobody is waiting for this query any more: it still runs, but deliver() and
+    /// fail() no longer call its handlers. Set by PgPool::detach() at shutdown.
+    bool detached() const      { return detached_; }
+    void mark_detached()       { detached_ = true; }
+
     void deliver(std::vector<PgResult> results);
     void fail   (std::string_view error);
 
@@ -129,6 +135,7 @@ private:
     std::string      sql_;
     bool             quiet_{false};
     bool             canceled_{false};
+    bool             detached_{false};
     ResultHandler    result_handler_;
     ExceptionHandler exception_handler_;
 };
@@ -338,10 +345,31 @@ public:
     std::size_t connection_count() const { return conns_.size(); }
     std::size_t queue_size()       const { return queue_.size(); }
 
-    /// Queries queued or already sent and awaiting a result. Zero means nothing is
-    /// outstanding — used to end a shutdown drain as soon as it is done rather than
-    /// waiting out a timeout.
+    /// Queries queued or already sent whose result somebody still waits for. Zero
+    /// means nothing is outstanding — used to end a shutdown drain as soon as it is
+    /// done rather than waiting out a timeout. Detached queries are not counted:
+    /// nobody waits for them, so there is nothing to drain them for.
     std::size_t outstanding() const;
+
+    /// Stop dispatching notifications and LISTEN confirmations, for good: a handler
+    /// registered by listen() — before this call or after it — is not called again.
+    /// For shutdown, before the drain of work in flight: a NOTIFY is new work, and
+    /// a drain that keeps receiving it never gets to zero.
+    void mute_listeners() noexcept;
+
+    /// Stop delivering any query asked for before this call: its handlers are no
+    /// longer called. A query already sent runs to its end on the server; a queued
+    /// one is sent only if a connection frees up before the pool is destroyed, so
+    /// none of them is guaranteed to run. Queries executed after this call are
+    /// delivered as usual. Implies mute_listeners().
+    ///
+    /// For shutdown, between the drain of work in flight and on_stop(): a module
+    /// tears down in on_stop() what its callbacks use, and a result that arrived
+    /// after that would be handed to the remains (T659 — TaskScheduler released its
+    /// BotSession in on_stop(), the drain delivered a late job result into it, and
+    /// the process died on a null pointer). The handlers themselves are kept, not
+    /// destroyed: what they captured goes with the pool, as it did before.
+    void detach() noexcept;
 
 private:
     void new_connection();
@@ -378,7 +406,7 @@ private:
     Logger*     pg_logger_{nullptr};
 
     std::vector<std::unique_ptr<PgConnection>> conns_;
-    std::queue<std::unique_ptr<PgQuery>>       queue_;
+    std::deque<std::unique_ptr<PgQuery>>       queue_;
     std::vector<std::unique_ptr<PgQuery>>      inflight_;     // queries currently executing
     std::unordered_set<uint64_t>               canceled_ids_; // queued queries pending cancel
 
@@ -434,6 +462,8 @@ private:
     std::unique_ptr<PgConnection>                               listener_;
     std::unordered_map<std::string, std::vector<NotifyHandler>> notify_handlers_;
     std::unordered_map<std::string, std::vector<ListenReadyHandler>> ready_handlers_;
+    // Set by mute_listeners(): no notification or LISTEN confirmation reaches a handler.
+    bool                                                        listeners_muted_{false};
     std::unordered_set<std::string>                             pending_listens_;
     // Shipped by send_pending_listens(), answer not read yet. Only the answer
     // makes a subscription real; the send alone does not.

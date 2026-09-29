@@ -46,7 +46,9 @@ public:
         (void)now;
     }
 
-    /// Called before EventLoop destruction.
+    /// Called before EventLoop destruction, after the work in flight has been
+    /// drained. Same guarantees as Module::on_stop(): no handler of a query sent
+    /// before this call runs after it; non-database callbacks are not cut off.
     virtual void on_stop() {}
 };
 

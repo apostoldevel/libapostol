@@ -132,17 +132,41 @@ public:
         named_pools_.clear();
     }
 
-    /// How long a shutdown waits for queries queued in on_stop() to finish.
-    static constexpr auto k_shutdown_drain = std::chrono::milliseconds(2000);
+    /// How long a shutdown waits for queries to finish — once for the work in
+    /// flight when the loop stopped, once more for what on_stop() queued. Both
+    /// together stay well inside the master's kill timeout (kill_timeout_secs_,
+    /// 5 s by default), which also has to cover on_stop() and stop_db().
+    static constexpr auto k_shutdown_drain = std::chrono::milliseconds(1500);
 
-    /// Pump @p loop briefly so that work queued by on_stop() actually runs.
+    /// Pump @p loop briefly so that outstanding queries actually finish.
     /// on_stop() is called after run() has returned, so without this a query it
     /// issues — closing a service session, say — is queued and then discarded.
     void drain_db(EventLoop& loop);
+
+    /// Mute every pool's listeners (PgPool::mute_listeners).
+    void quiesce_db() noexcept;
+
+    /// Detach every pool (PgPool::detach): nothing asked for so far is delivered.
+    void detach_db() noexcept;
 #else
     void stop_db() noexcept {} // no-op when built without PostgreSQL
     void drain_db(EventLoop&) {}
+    void quiesce_db() noexcept {}
+    void detach_db() noexcept {}
 #endif // WITH_POSTGRESQL
+
+    /// The shutdown order of every process kind, after the loop has stopped and
+    /// the heartbeats and HTTP dispatch have been latched off:
+    ///   0. quiesce — notifications are no longer dispatched (they are new work);
+    ///   1. drain — the work in flight finishes while the modules are intact;
+    ///   2. detach — whatever is still outstanding will not be delivered;
+    ///   3. @p on_stop — modules release what their callbacks used;
+    ///   4. drain — what on_stop() queued, and only that.
+    /// Until T659 it was on_stop() first and one drain after it, and the drain
+    /// handed results of earlier queries to modules already torn down: a
+    /// TaskScheduler job answering after SIGTERM reached a released BotSession
+    /// through a null pointer (SIGSEGV, fault 0xb0).
+    void stop_work(EventLoop& loop, const std::function<void()>& on_stop);
 
     // ── WebSocket handler ─────────────────────────────────────────────────────
 

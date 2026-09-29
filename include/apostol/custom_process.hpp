@@ -27,7 +27,9 @@ class Application;
 //   4. on_start(loop, app)  — user setup
 //   5. heartbeat timer (1s) — calls heartbeat() every second
 //   6. loop.run()           — event loop
-//   7. on_stop()            — user cleanup
+//   7. stop_work()          — heartbeat timers cancelled, notifications muted,
+//                             work in flight drained, pools detached, then
+//                             on_stop() (user cleanup), then its queries drained
 //   8. stop_db()            — destroy PgPool while EventLoop still alive
 //
 class CustomProcess
@@ -51,7 +53,10 @@ public:
         (void)now;
     }
 
-    /// Called before EventLoop destruction. Clean up resources.
+    /// Called before EventLoop destruction, after the work in flight has been
+    /// drained. Clean up resources. Same guarantees as Module::on_stop(): no
+    /// handler of a query sent before this call runs after it; non-database
+    /// callbacks are not cut off.
     virtual void on_stop() {}
 };
 

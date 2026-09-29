@@ -934,7 +934,9 @@ void Application::master_run()
 //
 // on_stop() runs after loop.run() has returned, so anything a module queues there —
 // a service session to close, a last write — sits in a queue nobody pumps again.
-// Give those queries a bounded chance to finish before the pool is destroyed.
+// Give those queries a bounded chance to finish before the pool is destroyed. The
+// same drain runs once before on_stop() as well, for the work already in flight
+// (stop_work, below).
 //
 // Bounded on purpose: a database that has stopped answering must not hold the
 // process from exiting. The drain ends as soon as nothing is outstanding, so a
@@ -973,7 +975,45 @@ void Application::drain_db(EventLoop& loop)
                       static_cast<long long>(k_shutdown_drain.count()));
 }
 
+void Application::quiesce_db() noexcept
+{
+    if (db_pool_)
+        db_pool_->mute_listeners();
+    for (auto& [name, pool] : named_pools_)
+        if (pool)
+            pool->mute_listeners();
+}
+
+void Application::detach_db() noexcept
+{
+    if (db_pool_)
+        db_pool_->detach();
+    for (auto& [name, pool] : named_pools_)
+        if (pool)
+            pool->detach();
+}
+
 #endif // WITH_POSTGRESQL
+
+// ─── stop_work ───────────────────────────────────────────────────────────────
+//
+// The drain before on_stop() is what keeps a late result away from a module that
+// has already released what the result's callback needs; the detach is what keeps
+// away a result later than that drain. Either alone leaves a window: without the
+// first drain an HTTP request in flight at SIGTERM would lose its answer to the
+// detach, and without the detach a query outlasting the drain would still reach
+// the module after on_stop() (T659). Notifications are muted before the first
+// drain, not at the detach: each one starts new work (WebSocketAPI answers a NOTIFY
+// with a query per session), and a drain that keeps being fed never reaches zero.
+
+void Application::stop_work(EventLoop& loop, const std::function<void()>& on_stop)
+{
+    quiesce_db();
+    drain_db(loop);
+    detach_db();
+    on_stop();
+    drain_db(loop);
+}
 
 void Application::single_run()
 {
@@ -1049,8 +1089,8 @@ void Application::single_run()
 
     loop.run();
 
-    module_manager_.on_stop();
-    drain_db(loop);
+    module_manager_.quiesce();
+    stop_work(loop, [this] { module_manager_.on_stop(); });
     stop_db();
     logger_->notice("{} single process exiting (pid={})", name_, ::getpid());
 }
@@ -1108,8 +1148,8 @@ void Application::worker_run()
 
     loop.run();
 
-    module_manager_.on_stop();
-    drain_db(loop);
+    module_manager_.quiesce();
+    stop_work(loop, [this] { module_manager_.on_stop(); });
     stop_db();
     logger_->notice("{} worker process exiting (pid={})", name_, ::getpid());
 }
@@ -1228,8 +1268,8 @@ void Application::helper_run()
     stopping = true;
 #endif
     if (started) {
-        module_manager_.on_stop();
-        drain_db(loop);
+        module_manager_.quiesce();
+        stop_work(loop, [this] { module_manager_.on_stop(); });
     }
     stop_db();
 #ifdef WITH_POSTGRESQL
@@ -1308,11 +1348,13 @@ void Application::custom_process_run(CustomProcess& proc)
             ? fmt::format("{}: {} process", name_, proc.title())
             : fmt::format("{}: {} process ({})", name_, proc.title(), names));
 
-        // 7. Heartbeat timer (1s). The id is kept because the drain below runs the loop
-        // again after on_stop(): a process whose session was released there would be
-        // asked to beat once more and would log back in, leaving behind the very
-        // session the drain exists to close. Modules are latched by ModuleManager;
-        // a custom process has no manager, so its timer is cancelled by hand.
+        // 7. Heartbeat timer (1s). The id is kept because the shutdown drains run the
+        // loop again, before on_stop() and after it: a beat during the first would
+        // start a new pass the drain then waits for, and a process whose session was
+        // released in on_stop() would, beating during the second, log back in and
+        // leave behind the very session the drain exists to close. Modules are
+        // latched by ModuleManager; a custom process has no manager, so its timer is
+        // cancelled by hand, before the first drain.
         heartbeat_timer = loop.add_timer(std::chrono::seconds(1),
             [&proc, &gate] {
                 // A leader past a stall: not before the lock is confirmed.
@@ -1328,7 +1370,7 @@ void Application::custom_process_run(CustomProcess& proc)
         // ("outbox") and ReportServer ("report") therefore had no way at all to
         // notice a lost subscription — the recovery path in PgPool existed but
         // had nothing to drive it. Cancelled next to the one above, and for the
-        // same reason: the drain re-runs the loop after on_stop().
+        // same reason: the shutdown drains re-run the loop.
         if (db_pool_)
             pool_heartbeat_timer = loop.add_timer(std::chrono::seconds(60),
                 [this] {
@@ -1362,13 +1404,14 @@ void Application::custom_process_run(CustomProcess& proc)
     loop.run();
     stopping = true;
 
-    // 9. Cleanup: on_stop() first, then stop_db() while EventLoop is still alive
+    // 9. Cleanup: the heartbeats go first, so that the drain before on_stop()
+    // finishes the work in flight instead of starting a new pass; then stop_work(),
+    // then stop_db() while EventLoop is still alive.
     if (started) {
-        proc.on_stop();
         loop.cancel_timer(heartbeat_timer);
         if (pool_heartbeat_timer != EventLoop::kInvalidTimer)
             loop.cancel_timer(pool_heartbeat_timer);
-        drain_db(loop);
+        stop_work(loop, [&proc] { proc.on_stop(); });
     }
     stop_db();
     // Last: the lock goes with its connection, and a standby elsewhere starts

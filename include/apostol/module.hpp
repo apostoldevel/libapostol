@@ -43,7 +43,12 @@ public:
     /// Called once when the worker event loop starts.
     virtual void on_start() {}
 
-    /// Called once when the worker event loop is about to stop.
+    /// Called once after the event loop has stopped and the work in flight has
+    /// been drained (Application::stop_work). From here on no handler of a query
+    /// sent before this call is invoked; a query sent from on_stop() itself is
+    /// delivered if it completes within the drain that follows. Callbacks that do
+    /// not come from the database — timers, sockets, SMTP, HTTP clients — are not
+    /// cut off by the framework: what they use must outlive them, or be closed here.
     virtual void on_stop() {}
 };
 
@@ -73,6 +78,12 @@ public:
 
     void on_start();
 
+    /// Latch without stopping anything: execute() refuses and heartbeat() does
+    /// nothing from here on, while the modules stay intact. A shutdown calls it
+    /// before draining the work already in flight, so that the drain finishes that
+    /// work instead of starting more (T659).
+    void quiesce() noexcept { stopped_ = true; }
+
     /// Stop every enabled module, and latch: after this, execute() refuses and
     /// heartbeat() does nothing.
     ///
@@ -84,7 +95,7 @@ public:
     /// logs in anew and leaves behind exactly the session the drain exists to close.
     void on_stop();
 
-    /// True once on_stop() has run.
+    /// True once quiesce() or on_stop() has run.
     bool stopped() const noexcept { return stopped_; }
 
     /// Comma-separated names of enabled modules (for process title).
