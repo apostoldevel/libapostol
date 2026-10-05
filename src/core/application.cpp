@@ -2218,7 +2218,7 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
                 listener->accept_drain(
                     [this, &loop](TcpConnection raw_conn)
                     {
-                        auto http_conn = std::make_shared<HttpConnection>(std::move(raw_conn), &loop);
+                        auto http_conn = std::make_shared<HttpConnection>(std::move(raw_conn), &loop, &logger());
                         int  conn_fd   = http_conn->fd();
 
                         loop.add_io(conn_fd, EPOLLIN | EPOLLRDHUP,

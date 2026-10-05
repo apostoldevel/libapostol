@@ -1,5 +1,6 @@
 #include "apostol/http.hpp"
 #include "apostol/event_loop.hpp"
+#include "apostol/logger.hpp"
 
 #include <llhttp.h>
 
@@ -754,9 +755,10 @@ static bool wants_websocket(const HttpRequest& req)
 
 // ─── HttpConnection ───────────────────────────────────────────────────────────
 
-HttpConnection::HttpConnection(TcpConnection conn, EventLoop* loop)
+HttpConnection::HttpConnection(TcpConnection conn, EventLoop* loop, Logger* logger)
     : conn_(std::move(conn))
     , loop_(loop)
+    , logger_(logger)
     , mask_(EPOLLIN | EPOLLRDHUP)   // what start_http_server registers
 {}
 
@@ -777,7 +779,11 @@ bool HttpConnection::on_readable(RequestHandler handler)
     // does with a client that aborts. The answer, should it come, finds the
     // connection closed and goes nowhere. Keeping the socket for it instead has
     // no bound: a cancelled query never calls back, and there is no idle timer.
-    if (owed() || stop_reading_) {
+    // Throttled counts too: its tail is still going out, but the peer that
+    // half-closed under it (EPOLLRDHUP is level-triggered and stays asserted)
+    // would spin this callback forever — under LT, an unread RDHUP fires again
+    // at once, round after round (T343).
+    if (owed() || stop_reading_ || throttled_) {
         closed_ = true;
         return false;
     }
@@ -818,7 +824,7 @@ bool HttpConnection::on_readable(RequestHandler handler)
             close_after_send_ = true;
             stop_reading_     = true;   // RFC 9112 §9.6: nothing after it is processed
         }
-        if (closed_ || owed() || stop_reading_)
+        if (closed_ || owed() || stop_reading_ || throttled_)
             parser_.hold();
     });
 
@@ -832,7 +838,7 @@ bool HttpConnection::on_readable(RequestHandler handler)
 
     char buf[8192];
 
-    while (!closed_ && !owed() && !stop_reading_ && pending_in_.empty()) {
+    while (!closed_ && !owed() && !stop_reading_ && !throttled_ && pending_in_.empty()) {
         ssize_t n = conn_.read(buf, sizeof(buf));
 
         if (n == 0) {
@@ -985,17 +991,36 @@ void HttpConnection::shutdown_and_drain() noexcept
 
 bool HttpConnection::resumable() const noexcept
 {
-    return !closed_ && !owed() && !stop_reading_ && !pending_in_.empty();
+    // Held bytes are fed when the callback next runs on an EPOLLOUT wake —
+    // but not under the write throttle (T343): feeding them would only grow
+    // the held tail. The flag clears on the drain below the low water, and
+    // the next wake resumes the parsing.
+    return !closed_ && !owed() && !stop_reading_ && !throttled_ && !pending_in_.empty();
 }
 
 void HttpConnection::response_started() noexcept
 {
     // During a dispatch this is the current request's answer going out at
     // once; afterwards it is the deferred one arriving.
-    if (dispatching_)
+    if (dispatching_) {
         answered_in_dispatch_ = true;
-    else
-        awaiting_ = false;
+        return;
+    }
+    // T343: an answer outside a dispatch, with no deferred answer awaited and
+    // no file in flight, owes nothing to the pipeline. A module sending one
+    // (a double answer for one request, an answer to a request it already
+    // answered) would have it taken for the debt of a pipelined request
+    // behind it. Count it, warn loudly — closing would punish a keep-alive
+    // client for its module's bug.
+    if (!awaiting_ && file_fd_ < 0) {
+        ++stray_answers_;
+        if (logger_)
+            logger_->warn("http: stray answer from a module on {}:{} "
+                          "(nothing owed on the connection; it may be taken for another request's debt)",
+                          conn_.peer_address(), conn_.peer_port());
+        return;
+    }
+    awaiting_ = false;
 }
 
 void HttpConnection::after_response()
@@ -1021,15 +1046,18 @@ void HttpConnection::after_response()
 
 void HttpConnection::send_response(const HttpResponse& resp)
 {
-    response_started();
-
+    // Closed first: a late answer on a dead connection is not a stray one.
     if (closed_) return;
+
+    response_started();
 
     std::string data = resp.serialize();
 
     // If there are already pending writes, just append
     if (write_pos_ < write_buf_.size() || file_fd_ >= 0) {
         write_buf_.append(data);
+        if (buffered_bytes() > kWriteHighWater)
+            throttled_ = true;   // T343: bound memory of a non-reading client
         after_response();
         return;
     }
@@ -1052,6 +1080,8 @@ void HttpConnection::send_response(const HttpResponse& resp)
             if (loop_) {
                 write_buf_.assign(ptr, rem);
                 write_pos_ = 0;
+                if (buffered_bytes() > kWriteHighWater)
+                    throttled_ = true;
                 after_response();
                 return;
             }
@@ -1104,6 +1134,8 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
     // If there are already pending writes, append headers and queue file
     if (write_pos_ < write_buf_.size() || file_fd_ >= 0) {
         write_buf_.append(headers);
+        if (buffered_bytes() > kWriteHighWater)
+            throttled_ = true;   // T343: headers behind a held tail count too
         // Can't queue two files — fallback to buffered read
         if (file_fd_ >= 0) {
             // Read entire file into write buffer (rare edge case)
@@ -1111,6 +1143,8 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
             [[maybe_unused]] ssize_t n = ::read(fd, buf.data(), file_size);
             ::close(fd);
             write_buf_.append(buf);
+            if (buffered_bytes() > kWriteHighWater)
+                throttled_ = true;
             after_response();
             return;
         }
@@ -1176,6 +1210,8 @@ bool HttpConnection::on_writable()
     }
 
     // All out: close if asked, otherwise drop EPOLLOUT and read again.
+    if (throttled_ && !has_pending_writes())
+        throttled_ = false;   // T343: the tail is gone — nothing to wait for
     after_response();
 
     return false;
@@ -1209,6 +1245,8 @@ bool HttpConnection::drain_buffer()
             return true;
         }
         write_pos_ += static_cast<std::size_t>(n);
+        if (throttled_ && buffered_bytes() <= kWriteLowWater)
+            throttled_ = false;   // T343: tail under the low water — read again
     }
     write_buf_.clear();
     write_pos_ = 0;
@@ -1254,8 +1292,11 @@ void HttpConnection::update_interest()
     if (!loop_ || closed_) return;
 
     uint32_t m = 0;
-    if (owed())
-        m = EPOLLRDHUP;              // not reading; only watch the peer leave
+    // Not reading, the peer still watched: owed and throttled alike leave
+    // EPOLLRDHUP on — it is the only sign of a client who left under an
+    // answer still going out (there is no idle timer).
+    if (owed() || throttled_)
+        m = EPOLLRDHUP;
     else if (!stop_reading_)
         m = EPOLLIN | EPOLLRDHUP;
     if (has_pending_writes() || resumable())

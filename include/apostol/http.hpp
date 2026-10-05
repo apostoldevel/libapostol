@@ -319,6 +319,8 @@ private:
 
 // ─── HttpConnection ──────────────────────────────────────────────────────────
 
+class Logger;
+
 /// Owns a TcpConnection and an HttpParser.
 /// Drive it with on_event() for every epoll event on its fd (as
 /// Application::start_http_server does): it reads, dispatches one request at a
@@ -334,8 +336,19 @@ class HttpConnection
 public:
     using RequestHandler = std::function<void(const HttpRequest&, HttpResponse&)>;
 
+    // Backpressure on a client that does not read its answers (T343): while
+    // the buffered tail is over kWriteHighWater the socket is not read (EPOLLIN
+    // off); reading resumes once the tail drains under kWriteLowWater. The
+    // kernel buffer fills, the client's own write blocks — memory spent on a
+    // connection is bounded by kWriteHighWater plus the answers of one parser
+    // pass, not by the client's request count.
+    static constexpr std::size_t kWriteHighWater = 256u << 10;
+    static constexpr std::size_t kWriteLowWater  = 64u << 10;
+
     /// @param loop  If non-null, enables async write buffering + sendfile.
-    explicit HttpConnection(TcpConnection conn, EventLoop* loop = nullptr);
+    /// @param logger  Warn sink for a module's stray answer (T343); may be null.
+    explicit HttpConnection(TcpConnection conn, EventLoop* loop = nullptr,
+                            Logger* logger = nullptr);
     ~HttpConnection();
 
     HttpConnection(const HttpConnection&)            = delete;
@@ -345,6 +358,13 @@ public:
 
     int fd() const noexcept { return conn_.fd(); }
     bool closed() const noexcept { return closed_; }
+
+    /// Buffered write tail in bytes (observability; T343 probe).
+    std::size_t buffered_bytes() const noexcept
+    { return write_buf_.size() - write_pos_; }
+
+    /// Answers sent with nothing owed on the connection (T343 detector).
+    std::size_t stray_answers() const noexcept { return stray_answers_; }
 
     /// Read available data, parse HTTP, and call @p handler for each complete
     /// request.  Sends the response synchronously via send_response().
@@ -384,6 +404,7 @@ private:
     TcpConnection conn_;
     HttpParser    parser_;
     EventLoop*    loop_{nullptr};
+    Logger*       logger_{nullptr};
     bool          closed_{false};
 
     // One request in work per connection (T314; RFC 9112 §9.3.2 wants answers
@@ -401,13 +422,16 @@ private:
     bool          answered_in_dispatch_{false};
     bool          close_after_send_{false};  // the request in work asked to close
     bool          stop_reading_{false};      // ... so nothing after it is parsed
+    bool          throttled_{false};         // write tail over kWriteHighWater (T343)
+    std::size_t   stray_answers_{0};         // answers sent with nothing owed (T343)
     std::string   pending_in_;               // read, not yet parsed
     uint32_t      mask_;                     // events last set on the loop
 
     /// An answer is owed: nothing further may be parsed.
     bool owed() const noexcept { return awaiting_ || file_fd_ >= 0; }
 
-    /// Bytes already read wait to be parsed and nothing stops them.
+    /// Bytes already read wait to be parsed and nothing stops them — except
+    /// the write throttle (T343), which waits for the tail to drain.
     bool resumable() const noexcept;
 
     void response_started() noexcept;
