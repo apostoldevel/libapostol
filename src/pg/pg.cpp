@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <string_view>
 
@@ -674,9 +675,18 @@ void PgPool::new_connection()
     conns_.push_back(std::move(conn));
     registered_conns_.insert(raw);
 
-    loop_.add_io(raw->fd(), EPOLLIN | EPOLLOUT, [this, raw](uint32_t events) {
-        on_io(*raw, events);
-    });
+    // A connection epoll refused is not kept (T767): left in Connecting with no
+    // events, nothing would ever finish or replace it, and healthy_count()
+    // would count it — ensure_min_connections() would not open another.
+    try {
+        loop_.add_io(raw->fd(), EPOLLIN | EPOLLOUT, [this, raw](uint32_t events) {
+            on_io(*raw, events);
+        });
+    } catch (...) {
+        registered_conns_.erase(raw);
+        conns_.pop_back();
+        throw;
+    }
     if (raw->handshake_limit().count() > 0)
         arm_handshake_watch();
 }
@@ -1120,7 +1130,20 @@ PgPool::QueryId PgPool::execute(std::string              sql,
             // whole statement, has not run it — on to the next connection, as
             // when send_query fails (connection probably died).
             const bool sent = c->send_query(raw_q->sql());
-            if (sent && (!c->needs_flush() || loop_.modify_io(c->fd(), EPOLLIN | EPOLLOUT)))
+            // modify_io may also throw — epoll out of memory (T767). The query
+            // is taken back below as on a lost socket and the exception passed
+            // on: the caller learns nothing went out, and may send it again
+            // without the pool flushing the tail of this copy behind it.
+            bool armed = false;
+            std::exception_ptr fault;
+            if (sent && c->needs_flush()) {
+                try {
+                    armed = loop_.modify_io(c->fd(), EPOLLIN | EPOLLOUT);
+                } catch (...) {
+                    fault = std::current_exception();
+                }
+            }
+            if (sent && (!c->needs_flush() || armed))
                 return qid;
 
             // Taken back and the connection marked before the log line: a
@@ -1131,23 +1154,37 @@ PgPool::QueryId PgPool::execute(std::string              sql,
             inflight_.pop_back();
             c->set_state(PgConnState::Error);
             if (pg_logger_) {
-                if (sent)
+                if (fault)
+                    pg_logger_->error("{} Socket fd={} could not be watched for writing, reconnecting",
+                                     conn_tag(*c), c->fd());
+                else if (sent)
                     pg_logger_->error("{} Socket fd={} is no longer watched, reconnecting",
                                      conn_tag(*c), c->fd());
                 else
                     pg_logger_->error("{} send_query failed (state={}): {}, reconnecting",
                                      conn_tag(*c), state, c->error_message());
             }
+            // Part of the statement has reached the server: the reset drops the
+            // session that holds it, so it is never run. If try_reconnect()
+            // itself throws (its own add_io — a second, independent epoll
+            // failure), that exception escapes in place of the fault: the
+            // query is already taken back either way, and the Error
+            // connection left without a registration is excluded from
+            // healthy_count(), so ensure_min_connections() replaces it.
             try_reconnect(*c);
+            if (fault)
+                std::rethrow_exception(fault);
             // Don't return — try next connection or queue
         }
     }
 
-    // No ready connection — queue
-    queue_.push_back(std::move(q));
-
-    // Ensure we have enough connections to eventually drain the queue
+    // No ready connection — queue. Connections first: opening one may throw
+    // (epoll, timerfd — T767), and a query already queued would then go out
+    // with the next connection while its caller, told it failed, sends it
+    // again. Nothing in here dispatches the queue, so the order is free.
     ensure_min_connections();
+
+    queue_.push_back(std::move(q));
 
     return qid;
 }
