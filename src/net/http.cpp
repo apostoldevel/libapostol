@@ -1294,8 +1294,12 @@ void HttpConnection::update_interest()
     uint32_t m = 0;
     // Not reading, the peer still watched: owed and throttled alike leave
     // EPOLLRDHUP on — it is the only sign of a client who left under an
-    // answer still going out (there is no idle timer).
-    if (owed() || throttled_)
+    // answer still going out (there is no idle timer). Not a connection that
+    // stopped reading for good (Connection: close): its client half-closing
+    // after the request is the usual way to say "that was all", and the tail
+    // is the answer still to be delivered. A client that is gone altogether
+    // still shows as EPOLLHUP/EPOLLERR or as a failed write.
+    if (owed() || (throttled_ && !stop_reading_))
         m = EPOLLRDHUP;
     else if (!stop_reading_)
         m = EPOLLIN | EPOLLRDHUP;
