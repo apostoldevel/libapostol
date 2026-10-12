@@ -374,7 +374,9 @@ public:
     bool cancel(QueryId id);
 
     /// Call periodically (e.g. every 60s from module heartbeat).
-    /// Checks connection health, reconnects dead connections, restores min_conns.
+    /// Checks connection health, reconnects dead connections, replaces those
+    /// left in Error with nothing to drive them, restores min_conns, and arms
+    /// the handshake watch if a handshake in flight has none.
     void heartbeat();
 
     // ── LISTEN / NOTIFY ───────────────────────────────────────────────────────
@@ -452,6 +454,16 @@ private:
     /// Remove a dead connection from the pool and create a replacement.
     void replace_connection(PgConnection& conn);
 
+    /// Register a pool connection's socket with the loop. When epoll refuses
+    /// (T789) the connection is put in Error before the exception goes on:
+    /// left as it was — Connecting, or Ready — nothing would drive it, yet
+    /// healthy_count() would count it. heartbeat() replaces it.
+    void watch(PgConnection& conn, uint32_t events);
+
+    /// watch() for on_io()'s handshake, where nothing above holds the
+    /// connection: refused, it is replaced at once. False — it is gone.
+    bool watch_or_replace(PgConnection& conn, uint32_t events);
+
     /// Take the in-flight query off a lost connection: re-queue it if it was not
     /// sent whole or is PgRetry::if_lost, drop it if canceled, otherwise hand it
     /// to lost_ to be failed from the loop.
@@ -524,9 +536,12 @@ private:
     // one-shot timer, armed whenever a handshake with a limit starts and
     // re-armed while any is in flight, asks each one handshake_expired() once
     // a second; an expired one is dropped as a failed connect — pool or
-    // listener alike, with the backoff.
-    void arm_handshake_watch();
+    // listener alike, with the backoff. A timer the loop refuses (T789) is
+    // logged, not thrown: the handshake goes on without its limit until the
+    // next start or heartbeat() arms the watch again.
+    void arm_handshake_watch() noexcept;
     void on_handshake_watch();
+    bool handshake_in_flight() const;   // a pool connection or the listener, with a limit
     EventLoop::TimerId handshake_timer_{EventLoop::kInvalidTimer};
 
     // Pointer set of connections currently registered with EventLoop.

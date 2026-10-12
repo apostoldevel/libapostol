@@ -740,10 +740,8 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                                       conn_tag(conn),
                                       conn.resetting() ? "Reconnected" : "Connected");
                 record_connect_success();
-                loop_.add_io(conn.fd(), EPOLLIN, [this, &conn](uint32_t ev) {
-                    on_io(conn, ev);
-                });
-                dispatch_queue(conn);
+                if (watch_or_replace(conn, EPOLLIN))
+                    dispatch_queue(conn);
             } else if (ps == PGRES_POLLING_FAILED) {
                 if (pg_logger_)
                     pg_logger_->error("{} Connect/Reset failed: {}",
@@ -756,9 +754,7 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                 uint32_t want = (ps == PGRES_POLLING_READING) ? EPOLLIN
                               : (ps == PGRES_POLLING_WRITING) ? EPOLLOUT
                               : (EPOLLIN | EPOLLOUT);
-                loop_.add_io(conn.fd(), want, [this, &conn](uint32_t ev) {
-                    on_io(conn, ev);
-                });
+                watch_or_replace(conn, want);
             }
             break;
         }
@@ -1168,9 +1164,12 @@ PgPool::QueryId PgPool::execute(std::string              sql,
             // session that holds it, so it is never run. If try_reconnect()
             // itself throws (its own add_io — a second, independent epoll
             // failure), that exception escapes in place of the fault: the
-            // query is already taken back either way, and the Error
-            // connection left without a registration is excluded from
-            // healthy_count(), so ensure_min_connections() replaces it.
+            // query is already taken back either way. The connection is then
+            // in Error with a socket nothing watches (watch(), T789): out of
+            // healthy_count(), so the next query opens another one, and
+            // replaced by heartbeat(). Not here: a module calling execute()
+            // from a result callback runs inside on_io() of a connection that
+            // may be this one, and on_io() goes on using it.
             try_reconnect(*c);
             if (fault)
                 std::rethrow_exception(fault);
@@ -1212,15 +1211,46 @@ bool PgPool::try_reconnect(PgConnection& conn)
     // kernel epoll registration is gone.  Always remove + re-add to be safe.
     if (old_fd >= 0)
         loop_.remove_io(old_fd);
-    if (new_fd >= 0) {
-        loop_.add_io(new_fd, EPOLLIN | EPOLLOUT, [this, &conn](uint32_t events) {
-            on_io(conn, events);
-        });
-    }
+    if (new_fd >= 0)
+        watch(conn, EPOLLIN | EPOLLOUT);
     if (conn.handshake_limit().count() > 0)
         arm_handshake_watch();
 
     return true;
+}
+
+void PgPool::watch(PgConnection& conn, uint32_t events)
+{
+    try {
+        loop_.add_io(conn.fd(), events, [this, &conn](uint32_t ev) {
+            on_io(conn, ev);
+        });
+    } catch (...) {
+        // No event will come for this socket. Error keeps it out of
+        // healthy_count() — the next query opens another connection at once —
+        // and heartbeat() replaces it (T789). Not replaced here: try_reconnect()
+        // runs inside a module's call to execute() too, and that may be inside
+        // on_io() of this very connection, which goes on using it.
+        conn.set_state(PgConnState::Error);
+        throw;
+    }
+}
+
+bool PgPool::watch_or_replace(PgConnection& conn, uint32_t events)
+{
+    // For on_io()'s handshake only: there the connection may be replaced on
+    // the spot, as its FAILED branch does — nothing above it holds the
+    // connection, and the queue does not wait for the next heartbeat().
+    try {
+        watch(conn, events);
+        return true;
+    } catch (const std::exception& e) {
+        if (pg_logger_)
+            pg_logger_->error("{} Socket fd={} could not be watched: {}, replacing",
+                             conn_tag(conn), conn.fd(), e.what());
+        replace_connection(conn);
+        return false;
+    }
 }
 
 void PgPool::replace_connection(PgConnection& conn)
@@ -1444,14 +1474,34 @@ void PgPool::schedule_reconnect_timer()
         /*repeat=*/false);
 }
 
-void PgPool::arm_handshake_watch()
+void PgPool::arm_handshake_watch() noexcept
 {
     if (handshake_timer_ != EventLoop::kInvalidTimer)
         return;  // already armed; it re-arms itself while a handshake is in flight
 
-    handshake_timer_ = loop_.add_timer(std::chrono::seconds(1),
-        [this] { on_handshake_watch(); },
-        /*repeat=*/false);
+    // A timer the loop refuses (timerfd, epoll — T789) is no reason to fail
+    // the connection that asked for it: thrown out of new_connection() or
+    // try_reconnect(), it told execute()'s caller that a query failed with a
+    // live connection under it; out of on_handshake_watch(), it left the
+    // loop. The handshake runs on its socket's events either way and only
+    // lacks its limit until the next start or heartbeat() arms the watch.
+    try {
+        handshake_timer_ = loop_.add_timer(std::chrono::seconds(1),
+            [this] { on_handshake_watch(); },
+            /*repeat=*/false);
+    } catch (const std::exception& e) {
+        if (pg_logger_) {
+            try {
+                pg_logger_->error("PgPool: handshake watch not armed: {}", e.what());
+            } catch (...) {}
+        }
+    } catch (...) {
+        if (pg_logger_) {
+            try {
+                pg_logger_->error("PgPool: handshake watch not armed: unknown exception");
+            } catch (...) {}
+        }
+    }
 }
 
 void PgPool::on_handshake_watch()
@@ -1494,14 +1544,21 @@ void PgPool::on_handshake_watch()
         schedule_reconnect_timer();
     }
 
+    if (handshake_in_flight())
+        arm_handshake_watch();
+}
+
+bool PgPool::handshake_in_flight() const
+{
     auto in_flight = [](const PgConnection& c) {
         return c.state() == PgConnState::Connecting && c.handshake_limit().count() > 0;
     };
-    bool waiting = listener_ && in_flight(*listener_);
+    if (listener_ && in_flight(*listener_))
+        return true;
     for (const auto& c : conns_)
-        waiting = waiting || in_flight(*c);
-    if (waiting)
-        arm_handshake_watch();
+        if (in_flight(*c))
+            return true;
+    return false;
 }
 
 std::size_t PgPool::outstanding() const
@@ -1572,8 +1629,35 @@ void PgPool::heartbeat()
         }
     }
 
+    // A connection still in Error here has nothing left to drive it: every
+    // path that sets Error goes on at once to try_reconnect() or
+    // replace_connection(), and Error remains only when the reset could not
+    // start (execute(), dispatch_queue() ignore try_reconnect()'s result), when
+    // the loop refused the new socket there (watch(), T789), or when a throw
+    // cut that path short. No event will come for it: libpq closed its socket,
+    // or the loop does not watch it. Collected first — replace_connection()
+    // erases from conns_. A query still on it is failed as lost, not dropped
+    // with it — none is today, every path takes it off first.
+    std::vector<PgConnection*> dead;
+    for (const auto& c : conns_)
+        if (c->state() == PgConnState::Error)
+            dead.push_back(c.get());
+    for (PgConnection* c : dead) {
+        if (pg_logger_)
+            pg_logger_->error("{} Left in Error with nothing to drive it, replacing",
+                             conn_tag(*c));
+        fail_inflight_query(*c, "connection lost");
+        replace_connection(*c);
+    }
+
     // Ensure min_conns
     ensure_min_connections();
+
+    // A handshake in flight — the listener's included — whose watch the loop
+    // refused (arm_handshake_watch) gets it now; already armed, this does
+    // nothing.
+    if (handshake_in_flight())
+        arm_handshake_watch();
 
     // Drain queue if there are ready connections
     for (auto& c : conns_) {
