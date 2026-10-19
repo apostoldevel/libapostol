@@ -125,6 +125,37 @@ void AppSettings::populate(const Config& cfg)
 
     pg_pool_min = static_cast<int>(cfg.get_int("postgres.pool.min", pg_pool_min));
     pg_pool_max = static_cast<int>(cfg.get_int("postgres.pool.max", pg_pool_max));
+
+    // Outbound address filter (T970). An entry that does not parse refuses the
+    // file: a filter quietly missing one rule is either wider or narrower than
+    // the operator wrote.
+    std::vector<std::string> fetch_allow;
+    if (const auto& j = cfg.json(); j.contains("fetch") && j["fetch"].is_object()
+                                    && j["fetch"].contains("allow")) {
+        const auto& a = j["fetch"]["allow"];
+        if (!a.is_array())
+            throw ConfigError("fetch.allow: expected an array of strings");
+        for (const auto& v : a) {
+            if (!v.is_string())
+                throw ConfigError("fetch.allow: expected an array of strings");
+            fetch_allow.push_back(v.get<std::string>());
+        }
+    }
+    // An allow list with the switch left out reads as "the filter is on" and is
+    // not: say which one is meant.
+    // Nor with a switch that only looks set ("${FETCH_DENY_INTERNAL}" unset).
+    bool deny_internal = false;
+    if (fetch_allow.empty())
+        deny_internal = cfg.get_bool("fetch.deny_internal", false);
+    else if (!cfg.has("fetch.deny_internal"))
+        throw ConfigError("fetch.allow is set but fetch.deny_internal is not: set it to true or false");
+    else
+        deny_internal = cfg.get_bool("fetch.deny_internal");   // throws on empty, null, non-bool
+    try {
+        fetch_policy = FetchAddressPolicy::parse(deny_internal, fetch_allow);
+    } catch (const std::invalid_argument& e) {
+        throw ConfigError(e.what());
+    }
 }
 
 // ─── build_pg_conninfo() ─────────────────────────────────────────────────────

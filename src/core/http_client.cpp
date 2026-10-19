@@ -1,6 +1,8 @@
 #include "apostol/http_client.hpp"
+#include "apostol/fetch_policy.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <fmt/format.h>
 
 namespace apostol
@@ -26,7 +28,12 @@ HttpClient::HttpClient(EventLoop& loop)
     : loop_(loop)
 {}
 
-HttpClient::~HttpClient() = default;
+HttpClient::~HttpClient()
+{
+    // A refusal not yet reported must not call back into an owner that is gone.
+    for (auto id : refusal_timers_)
+        loop_.cancel_timer(id);
+}
 
 // ─── URL Parsing ─────────────────────────────────────────────────────────────
 
@@ -38,6 +45,9 @@ HttpClient::ParsedUrl HttpClient::parse_url(std::string_view url)
     auto scheme_end = url.find("://");
     if (scheme_end != std::string_view::npos) {
         result.scheme = std::string(url.substr(0, scheme_end));
+        // Case-insensitive (RFC 3986): "HTTPS" takes port 443 and TLS too.
+        std::transform(result.scheme.begin(), result.scheme.end(), result.scheme.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         url.remove_prefix(scheme_end + 3);
     } else {
         result.scheme = "http";
@@ -118,6 +128,25 @@ void HttpClient::request(std::string_view method, std::string_view url_str,
 {
     auto url = parse_url(url_str);
 
+    // HTTP(S) only: any other scheme went out as plain HTTP to its host:port —
+    // gopher://169.254.169.254:80/ became a request to the metadata service
+    // (T970). Reported from the loop, like the other errors of this client —
+    // 1 ms, not 0: a zero timerfd is disarmed and never fires. The timer is
+    // cancelled with the client.
+    if (url.scheme != "http" && url.scheme != "https") {
+        auto id = std::make_shared<EventLoop::TimerId>(EventLoop::kInvalidTimer);
+        *id = loop_.add_timer(std::chrono::milliseconds(1),
+            [this, id, on_error = std::move(on_error), scheme = url.scheme] {
+                refusal_timers_.erase(
+                    std::remove(refusal_timers_.begin(), refusal_timers_.end(), *id),
+                    refusal_timers_.end());
+                if (on_error)
+                    on_error(fmt::format("unsupported URL scheme '{}'", scheme));
+            }, false);
+        refusal_timers_.push_back(*id);
+        return;
+    }
+
     auto req = std::make_unique<PendingRequest>(loop_);
     auto* ptr = req.get();
 
@@ -133,6 +162,14 @@ void HttpClient::request(std::string_view method, std::string_view url_str,
     if (tls_enabled_ || url.scheme == "https")
         ptr->tcp.enable_tls(tls_verify_);
 #endif
+
+    // Outbound address filter (fetch.deny_internal): the resolved address is
+    // checked before connect(). No redirects here — one address per request.
+    if (auto policy = FetchAddressPolicy::process_default(); policy && policy->enabled()) {
+        ptr->tcp.set_address_check([policy, host = url.host](const sockaddr* addr) {
+            return policy->check(addr, host);
+        });
+    }
 
     // Capture serialized request for on_connect
     auto serialized = serialize_request(method, url.host, url.path, body, headers);

@@ -83,6 +83,16 @@ public:
     void set_connect_timeout(std::chrono::milliseconds ms) { connect_timeout_ = ms; }
     void set_idle_timeout(std::chrono::milliseconds ms)    { idle_timeout_ = ms; }
 
+    // ── Address check ───────────────────────────────────────────────────────
+
+    /// Called with the resolved address before connect(); a non-empty result
+    /// refuses the connection with that message (on_error). Used by HttpClient
+    /// for the outbound address filter (T970).
+    void set_address_check(std::function<std::string(const struct sockaddr*)> check)
+    {
+        address_check_ = std::move(check);
+    }
+
     // ── TLS ─────────────────────────────────────────────────────────────────
 #ifdef WITH_SSL
     /// Enable TLS. Call before connect() for implicit TLS.
@@ -135,6 +145,7 @@ private:
     std::deque<WriteChunk> output_;
 
     // Callbacks
+    std::function<std::string(const struct sockaddr*)> address_check_;
     std::function<void()>                    on_connect_;
     std::function<void(const char*, size_t)> on_data_;
     std::function<void()>                    on_close_;

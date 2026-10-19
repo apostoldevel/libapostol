@@ -1,6 +1,7 @@
 #pragma once
 
 #include "apostol/config.hpp"
+#include "apostol/fetch_policy.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -96,6 +97,10 @@ struct AppSettings
     std::string pg_conninfo_kernel;
     int         pg_pool_min{1};
     int         pg_pool_max{5};
+
+    // ── Outbound fetch ────────────────────────────────────────────────────
+    // fetch.deny_internal + fetch.allow (T970); see fetch_policy.hpp.
+    FetchAddressPolicy fetch_policy;
 
     // ── Constructor: resolve default paths from prefix ────────────────────
     AppSettings();

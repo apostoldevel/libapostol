@@ -1,11 +1,14 @@
 #ifdef WITH_CURL
 
 #include "apostol/curl_client.hpp"
+#include "apostol/fetch_policy.hpp"
 
 #include <algorithm>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+
+#include <sys/socket.h>
 
 namespace apostol
 {
@@ -23,6 +26,11 @@ struct CurlClient::Transfer
     DoneHandler  on_done;
     FailHandler  on_fail;
     WriteHandler on_write;
+
+    // Outbound address filter (T970): a snapshot of the process policy, so a
+    // reload mid-transfer does not change the rules under it; null when off.
+    std::shared_ptr<const FetchAddressPolicy> policy;
+    std::string  refused;       // why the filter refused a connection, if it did
 
     ~Transfer()
     {
@@ -105,6 +113,14 @@ void CurlClient::perform(std::string_view url,
         if (xfer->on_fail)
             xfer->on_fail(static_cast<int>(proto_rc), curl_easy_strerror(proto_rc));
         return;
+    }
+
+    // Outbound address filter: checked for every connection libcurl opens —
+    // the first URL, each redirect target, each address a name resolves to.
+    if (auto policy = FetchAddressPolicy::process_default(); policy && policy->enabled()) {
+        xfer->policy = std::move(policy);
+        curl_easy_setopt(xfer->easy, CURLOPT_OPENSOCKETFUNCTION, &CurlClient::open_socket_callback);
+        curl_easy_setopt(xfer->easy, CURLOPT_OPENSOCKETDATA, xfer.get());
     }
 
     // URL
@@ -390,6 +406,49 @@ size_t CurlClient::header_callback(char* buffer, size_t size, size_t nitems, voi
     return total;
 }
 
+// ─── open_socket_callback ───────────────────────────────────────────────────
+
+curl_socket_t CurlClient::open_socket_callback(void* clientp, curlsocktype /*purpose*/,
+                                               struct curl_sockaddr* address)
+{
+    auto* xfer = static_cast<Transfer*>(clientp);
+
+    if (xfer->policy) {
+        // Called from libcurl's C frames: nothing may escape. A failure here
+        // (allocation) refuses the connection — the filter fails closed.
+        try {
+            // The host of the URL being connected: after a redirect libcurl has
+            // already moved the effective URL to the target. Parsed by libcurl's
+            // own URL parser, so the host is the one it dials. Unparsable — no
+            // host, and only an address entry of fetch.allow can let it through.
+            std::string host;
+            char* url = nullptr;
+            if (curl_easy_getinfo(xfer->easy, CURLINFO_EFFECTIVE_URL, &url) == CURLE_OK && url) {
+                if (CURLU* u = curl_url()) {
+                    char* h = nullptr;
+                    if (curl_url_set(u, CURLUPART_URL, url, 0) == CURLUE_OK
+                        && curl_url_get(u, CURLUPART_HOST, &h, 0) == CURLUE_OK && h) {
+                        host = h;
+                        curl_free(h);
+                    }
+                    curl_url_cleanup(u);
+                }
+            }
+
+            auto why = xfer->policy->check(&address->addr, host);
+            if (!why.empty()) {
+                xfer->refused = std::move(why);
+                return CURL_SOCKET_BAD;     // libcurl tries the next address, then fails
+            }
+        } catch (...) {
+            return CURL_SOCKET_BAD;
+        }
+        xfer->refused.clear();          // an address got through: an older refusal is not the story
+    }
+
+    return ::socket(address->family, address->socktype | SOCK_CLOEXEC, address->protocol);
+}
+
 // ─── check_multi_info ───────────────────────────────────────────────────────
 
 void CurlClient::check_multi_info()
@@ -423,9 +482,14 @@ void CurlClient::check_multi_info()
             if (xfer->on_done)
                 xfer->on_done(std::move(resp));
         } else {
-            if (xfer->on_fail)
-                xfer->on_fail(static_cast<int>(code),
-                              curl_easy_strerror(code));
+            // A refusal by the address filter says so; libcurl itself would
+            // only report "Couldn't connect to server".
+            if (xfer->on_fail) {
+                if (code == CURLE_COULDNT_CONNECT && !xfer->refused.empty())
+                    xfer->on_fail(static_cast<int>(code), xfer->refused);
+                else
+                    xfer->on_fail(static_cast<int>(code), curl_easy_strerror(code));
+            }
         }
 
         delete xfer;

@@ -641,6 +641,10 @@ void Application::apply_config(StagedConfig&& staged)
     providers_ = std::move(staged.providers);
     sites_     = std::move(staged.sites);
 
+    // Every CurlClient of this process — and of the children forked from it —
+    // takes its outbound address filter from here (T970).
+    FetchAddressPolicy::set_process_default(settings_.fetch_policy);
+
     // The locale into effect — here, so that a start and both reloads do it
     // alike (the single process's SIGHUP never did). Mirrors v1
     // DefaultLocale.SetLocale.

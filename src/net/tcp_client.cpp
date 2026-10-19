@@ -54,6 +54,14 @@ void TcpClient::connect(std::string_view host, uint16_t port)
     if (state_ == TcpClientState::Error)
         return;
 
+    if (address_check_) {
+        auto why = address_check_(reinterpret_cast<const sockaddr*>(&peer_addr_));
+        if (!why.empty()) {
+            enter_error(why);
+            return;
+        }
+    }
+
     do_connect();
 }
 
