@@ -87,6 +87,26 @@ void CurlClient::perform(std::string_view url,
     // Store Transfer* for retrieval in callbacks
     curl_easy_setopt(xfer->easy, CURLOPT_PRIVATE, xfer.get());
 
+    // Protocols: HTTP(S) only, for the URL and for every redirect target.
+    // libcurl's default also allows gopher/dict/ftp/file/... — an SSRF primitive
+    // when the URL comes from the database (http.fetch). Fail closed if refused.
+#if LIBCURL_VERSION_NUM >= 0x075500   // 7.85.0: *_PROTOCOLS_STR, bitmask deprecated
+    auto proto_rc = curl_easy_setopt(xfer->easy, CURLOPT_PROTOCOLS_STR, "http,https");
+    if (proto_rc == CURLE_OK)
+        proto_rc = curl_easy_setopt(xfer->easy, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+    auto proto_rc = curl_easy_setopt(xfer->easy, CURLOPT_PROTOCOLS,
+                                     static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+    if (proto_rc == CURLE_OK)
+        proto_rc = curl_easy_setopt(xfer->easy, CURLOPT_REDIR_PROTOCOLS,
+                                    static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
+    if (proto_rc != CURLE_OK) {
+        if (xfer->on_fail)
+            xfer->on_fail(static_cast<int>(proto_rc), curl_easy_strerror(proto_rc));
+        return;
+    }
+
     // URL
     std::string url_str(url);
     curl_easy_setopt(xfer->easy, CURLOPT_URL, url_str.c_str());
