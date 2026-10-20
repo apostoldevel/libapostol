@@ -1,4 +1,7 @@
 #include "apostol/settings.hpp"
+#ifdef WITH_POSTGRESQL
+#include "apostol/pg.hpp"
+#endif
 
 #include <fmt/format.h>
 #include <cstdlib>
@@ -125,6 +128,27 @@ void AppSettings::populate(const Config& cfg)
 
     pg_pool_min = static_cast<int>(cfg.get_int("postgres.pool.min", pg_pool_min));
     pg_pool_max = static_cast<int>(cfg.get_int("postgres.pool.max", pg_pool_max));
+
+    // Session settings reset before every pool query (PgPool::set_reset).
+    // Left out — the default; [] — none. A name that is not one refuses the
+    // file: it is spliced into SQL.
+    if (const auto& j = cfg.json(); j.contains("postgres") && j["postgres"].is_object()
+                                    && j["postgres"].contains("reset")) {
+        const auto& a = j["postgres"]["reset"];
+        if (!a.is_array())
+            throw ConfigError("postgres.reset: expected an array of strings");
+        pg_reset.clear();
+        for (const auto& v : a) {
+            if (!v.is_string())
+                throw ConfigError("postgres.reset: expected an array of strings");
+            auto name = v.get<std::string>();
+#ifdef WITH_POSTGRESQL
+            if (!PgPool::valid_reset_name(name))
+                throw ConfigError(fmt::format("postgres.reset: '{}' is not a custom configuration parameter name (prefix.name) or \"all\"", name));
+#endif
+            pg_reset.push_back(std::move(name));
+        }
+    }
 
     // Outbound address filter (T970). An entry that does not parse refuses the
     // file: a filter quietly missing one rule is either wider or narrower than

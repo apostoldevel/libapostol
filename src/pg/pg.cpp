@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <exception>
 #include <limits>
+#include <stdexcept>
 #include <string_view>
 
 namespace apostol
@@ -589,6 +590,101 @@ PgPool::PgPool(EventLoop& loop, std::string conninfo,
     , max_conns_(max_conns)
     , pg_logger_(pg_logger)
 {
+    set_reset({"current.area"});
+}
+
+namespace {
+
+/// "all", any case — RESET ALL.
+bool is_reset_all(std::string_view name)
+{
+    if (name.size() != 3)
+        return false;
+    for (std::size_t i = 0; i < 3; ++i)
+        if ((name[i] | 0x20) != "all"[i])
+            return false;
+    return true;
+}
+
+} // namespace
+
+bool PgPool::valid_reset_name(std::string_view name)
+{
+    if (is_reset_all(name))
+        return true;
+    // A custom parameter: two or more dot-separated identifiers. A plain name is
+    // a server parameter, and RESET of one the role may not set, or the server
+    // does not know, fails — and with it every query of the pool.
+    std::size_t parts = 0;
+    while (true) {
+        const auto dot  = name.find('.');
+        const auto part = name.substr(0, dot);
+        if (part.empty() || part.size() > 63)   // NAMEDATALEN - 1: longer is cut
+            return false;
+        const char f = part.front();
+        if (!((f >= 'a' && f <= 'z') || (f >= 'A' && f <= 'Z') || f == '_'))
+            return false;
+        for (char c : part)
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'))
+                return false;
+        ++parts;
+        if (dot == std::string_view::npos)
+            break;
+        name.remove_prefix(dot + 1);
+    }
+    return parts >= 2;
+}
+
+void PgPool::set_reset(const std::vector<std::string>& names)
+{
+    // Spliced into SQL: only a name that cannot carry anything else, each part
+    // quoted so that a keyword ("user", "all") is a name. Parameter names are
+    // matched without regard to case, quoted or not.
+    std::string sql;
+    for (const auto& n : names) {
+        if (!valid_reset_name(n))
+            throw std::invalid_argument(fmt::format("not a custom configuration parameter name: '{}'", n));
+        if (is_reset_all(n)) {
+            sql += "RESET ALL; ";
+            continue;
+        }
+        std::string quoted;
+        std::string_view rest(n);
+        while (true) {
+            const auto dot = rest.find('.');
+            quoted += fmt::format("\"{}\"", rest.substr(0, dot));
+            if (dot == std::string_view::npos)
+                break;
+            quoted += '.';
+            rest.remove_prefix(dot + 1);
+        }
+        sql += fmt::format("RESET {}; ", quoted);
+    }
+    reset_names_ = names;
+    reset_sql_   = std::move(sql);
+    reset_count_ = names.size();
+}
+
+bool PgPool::send_query(PgConnection& conn, const PgQuery& q)
+{
+    // An empty statement is answered "empty query", which the caller has always
+    // got as a failure; behind the reset it would be a success with no rows.
+    const bool blank = q.sql().find_first_not_of(" \t\r\n;") == std::string::npos;
+    const bool reset = !reset_sql_.empty() && !blank;
+    const bool sent  = reset ? conn.send_query(reset_sql_ + q.sql())
+                             : conn.send_query(q.sql());
+    conn.set_reset_results(sent && reset ? reset_count_ : 0);
+    return sent;
+}
+
+void PgPool::strip_reset_results(PgConnection& conn, std::vector<PgResult>& results)
+{
+    std::size_t n = std::min(conn.reset_results(), results.size());
+    conn.set_reset_results(0);
+    std::size_t ok = 0;
+    while (ok < n && results[ok].ok())
+        ++ok;
+    results.erase(results.begin(), results.begin() + static_cast<std::ptrdiff_t>(ok));
 }
 
 std::string PgPool::conn_tag(const PgConnection& conn) const
@@ -830,6 +926,11 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                 break;
             }
 
+            // The reset sent ahead of the query (set_reset()) is not the
+            // caller's: a complete batch is handed over without its results.
+            if (!results.empty())
+                strip_reset_results(conn, results);
+
             if (results.empty()) {
                 // collect_results() accumulates partial results internally
                 // and only returns them when all statements are complete
@@ -1061,7 +1162,7 @@ void PgPool::dispatch_queue(PgConnection& conn)
     // the loop no longer watches (T607) would leave the rest unsent for good;
     // the server has not got the whole statement, so it has not run it —
     // re-queued as when send_query fails.
-    const bool sent = conn.send_query(raw_q->sql());
+    const bool sent = send_query(conn, *raw_q);
     if (sent && (!conn.needs_flush() || loop_.modify_io(conn.fd(), EPOLLIN | EPOLLOUT)))
         return;
 
@@ -1125,7 +1226,7 @@ PgPool::QueryId PgPool::execute(std::string              sql,
             // the rest would never go out, and the server, not having the
             // whole statement, has not run it — on to the next connection, as
             // when send_query fails (connection probably died).
-            const bool sent = c->send_query(raw_q->sql());
+            const bool sent = send_query(*c, *raw_q);
             // modify_io may also throw — epoll out of memory (T767). The query
             // is taken back below as on a lost socket and the exception passed
             // on: the caller learns nothing went out, and may send it again

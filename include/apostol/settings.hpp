@@ -97,6 +97,9 @@ struct AppSettings
     std::string pg_conninfo_kernel;
     int         pg_pool_min{1};
     int         pg_pool_max{5};
+    // postgres.reset — custom session settings ("prefix.name") reset before
+    // every pool query (PgPool::set_reset); "all" — RESET ALL; [] — none.
+    std::vector<std::string> pg_reset{"current.area"};
 
     // ── Outbound fetch ────────────────────────────────────────────────────
     // fetch.deny_internal + fetch.allow (T970); see fetch_policy.hpp.

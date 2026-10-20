@@ -2096,6 +2096,7 @@ PgPool& Application::setup_db(EventLoop& loop, std::string conninfo,
 
     db_pool_ = std::make_unique<PgPool>(loop, std::move(conninfo),
         min_conns, max_conns, pg_logger_.get());
+    db_pool_->set_reset(settings_.pg_reset);
     db_pool_->start();
     return *db_pool_;
 }
@@ -2140,6 +2141,7 @@ PgPool& Application::db_pool(std::string_view role)
         static_cast<std::size_t>(settings_.pg_pool_min),
         static_cast<std::size_t>(settings_.pg_pool_max),
         pg_logger_.get());
+    pool->set_reset(settings_.pg_reset);
     pool->start();
 
     auto& ref = *pool;

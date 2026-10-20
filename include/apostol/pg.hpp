@@ -289,6 +289,11 @@ public:
     PgQuery* current_query() const        { return current_query_; }
     void     set_current_query(PgQuery* q){ current_query_ = q; }
 
+    /// Results at the head of the next batch that belong to the reset sent
+    /// ahead of the query (PgPool::set_reset()), not to the query itself.
+    std::size_t reset_results() const          { return reset_results_; }
+    void        set_reset_results(std::size_t n){ reset_results_ = n; }
+
     // ── libpq conninfo accessors (valid after connect) ───────────────────────
     const char* pg_host()     const { return conn_ ? PQhost(conn_.get())       : ""; }
     const char* pg_port()     const { return conn_ ? PQport(conn_.get())       : ""; }
@@ -315,6 +320,7 @@ private:
     std::string      conninfo_;
     PgConnState      state_{PgConnState::Connecting};
     PgQuery*         current_query_{nullptr};
+    std::size_t      reset_results_{0};
     int              last_fd_{-1};
     bool             resetting_{false};
     bool             needs_flush_{false};
@@ -351,6 +357,33 @@ public:
 
     /// Open min_conns connections and register them with the event loop.
     void start();
+
+    /// Session settings returned to their start-of-session value before every
+    /// query on a pool connection, so that a setting one query leaves on the
+    /// session (set_config(name, value, false)) is not seen by the next query
+    /// that happens to get the same connection. Each entry is a custom
+    /// configuration parameter name ("prefix.name"); "all" means RESET ALL —
+    /// which also clears what the database code keeps on the session on purpose
+    /// (a session cached per connection, for one): use it only where nothing does.
+    ///
+    /// Sent in the same round trip, ahead of the query ("RESET <name>; <sql>"),
+    /// and its results are taken off before the query's own are delivered. The
+    /// query therefore runs in one implicit transaction with the reset:
+    /// statements that refuse a transaction block — VACUUM, CREATE DATABASE, a
+    /// procedure that commits — fail; send those from a pool with an empty list.
+    ///
+    /// Default {"current.area"}, the per-request scope db-platform keeps in a
+    /// session setting. Empty — nothing is sent. Applies to queries sent after
+    /// the call. An empty statement goes without it. The LISTEN connection is
+    /// never reset.
+    /// Throws std::invalid_argument for an entry that is not a parameter name.
+    void set_reset(const std::vector<std::string>& names);
+    const std::vector<std::string>& reset() const { return reset_names_; }
+
+    /// True if `name` is accepted by set_reset(): "all", or a custom parameter
+    /// name — two or more dot-separated parts of letters, digits and '_', each
+    /// starting with a letter or '_' and at most 63 bytes long.
+    static bool valid_reset_name(std::string_view name);
 
     using QueryId = uint64_t;
 
@@ -446,6 +479,14 @@ private:
     void on_io(PgConnection& conn, uint32_t events);
     void dispatch_queue(PgConnection& conn);
 
+    /// Send `q` on `conn` behind the reset (set_reset()) and note on the
+    /// connection how many results at the head of the batch are the reset's.
+    bool send_query(PgConnection& conn, const PgQuery& q);
+
+    /// Take the reset's results off the head of a complete batch. A reset that
+    /// failed stays: the query behind it did not run, and its caller learns why.
+    static void strip_reset_results(PgConnection& conn, std::vector<PgResult>& results);
+
     /// Attempt to reconnect a connection via PQresetStart.
     /// Handles fd change (remove old epoll, add new).
     /// Returns true if reset was initiated successfully.
@@ -489,6 +530,10 @@ private:
     std::size_t min_conns_;
     std::size_t max_conns_;
     Logger*     pg_logger_{nullptr};
+
+    std::vector<std::string> reset_names_;
+    std::string              reset_sql_;     // "RESET a; RESET b; " — prefix of every query
+    std::size_t              reset_count_{0}; // statements in reset_sql_
 
     std::vector<std::unique_ptr<PgConnection>> conns_;
     std::deque<std::unique_ptr<PgQuery>>       queue_;
