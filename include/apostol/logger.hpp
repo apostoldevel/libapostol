@@ -46,6 +46,17 @@ private:
     bool is_tty_{false};
 };
 
+// A log file shared by every process of the application: the master opens
+// error.log before fork() and the workers inherit the target, each process
+// opens postgres.log after it. Rotation is therefore decided from the file,
+// not from what this process has written: under a shared flock() on
+// <path>.lock every write first follows the path to the file it names now
+// (reopening when another process has rotated it, or logrotate has moved it —
+// also with max_size 0) and checks the real size; the rotation itself —
+// renaming the file away and creating a new one — runs under the exclusive
+// lock, so no process writes into a file that is being rotated, and one
+// rotation yields one backup. Compression runs outside the lock, from a
+// staging name. Where the lock cannot be taken, size rotation is off.
 struct FileTarget : LogTarget
 {
     static constexpr std::uint64_t k_default_max_size = APP_DEFAULT_LOG_MAX_SIZE;
@@ -66,8 +77,13 @@ struct FileTarget : LogTarget
     void set_compress(bool c) noexcept { compress_ = c; }
 
 private:
-    void rotate();
+    std::string rotate();
+    void finish_rotation(const std::string& staged);
+    void shift_backups(const char* ext);
     void open_file();
+    bool try_open_file();
+    void follow_path();
+    int lock_fd();
     static bool compress_file(const std::string& src, const std::string& dst);
 
     std::string path_;
@@ -76,6 +92,12 @@ private:
     bool compress_;
     int fd_{-1};
     std::size_t current_size_{0};
+    std::uint64_t dev_{0};  // identity of the file fd_ is open on
+    std::uint64_t ino_{0};
+    int lock_fd_{-1};       // <path>.lock, flock()ed; per process
+    int lock_pid_{0};
+    int lock_errno_{0};
+    bool lock_warned_{false};
 };
 
 struct SyslogTarget : LogTarget
