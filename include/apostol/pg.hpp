@@ -87,6 +87,11 @@ public:
     /// true if status == PGRES_TUPLES_OK or PGRES_COMMAND_OK.
     bool ok() const;
 
+    /// The SQLSTATE of an error result ("23505", or one a function raised with
+    /// ERRCODE); "" for a success and for a result made without a server (lost()).
+    /// The one way to tell one error from another without parsing its text.
+    const char* sqlstate() const;
+
     /// Access the raw handle (for advanced use only; do not call PQclear on it).
     PGresult* handle() const { return res_.get(); }
 
@@ -243,6 +248,12 @@ public:
     /// defect of this shape stays catchable by its number, the way this one was.
     int          last_fd()   const { return last_fd_; }
     bool         connected() const;
+
+    /// A query is in flight and its answer — or the next part of it — is already
+    /// in libpq's buffer: PQgetResult would not block. After a PQconsumeInput
+    /// that read it (consume_notify() reads whatever came), no epoll event
+    /// announces it any more; the caller has to look.
+    bool         answer_buffered() const;
     PgConnState  state()     const { return state_; }
     void         set_state(PgConnState s) { state_ = s; }
     bool         resetting() const { return resetting_; }
@@ -478,10 +489,44 @@ public:
     /// Unsubscribe from a channel (removes all callbacks for that channel).
     void unlisten(std::string_view channel);
 
+    /// Run a statement on the LISTEN connection itself rather than on a pool
+    /// connection — for what has to ride the subscription: a heartbeat whose
+    /// answer proves the listener alive, a registration that records the
+    /// listener's backend pid (pg_backend_pid() there is the listener's).
+    ///
+    /// One at a time, in the order given, when the listener is idle; a LISTEN
+    /// waiting to be shipped goes first. Starts the listener if there is none.
+    /// Counted by outstanding() — a shutdown drain waits for it — and therefore
+    /// bounded by @p answer_within when there is one. Not reset (set_reset()),
+    /// not repeated: the
+    /// statement in flight when the listener is lost is failed as one lost with
+    /// its connection, from the loop; the ones still waiting go out on the next
+    /// listener. After detach() its handlers are not called.
+    ///
+    /// @p answer_within > 0: with no answer by then the listener is given up as
+    /// dead and replaced. The time runs from the send, and while the statement
+    /// waits behind one without a limit (a LISTEN, the application_name of a
+    /// new listener), from the moment it is asked: a server silent on what
+    /// precedes it would never get to it. That is the point of sending a heartbeat here — a
+    /// listener the network has cut without a word (a black hole, a failover)
+    /// hears nothing and libpq does not know; only a question it fails to
+    /// answer tells.
+    void listener_execute(std::string               sql,
+                          PgQuery::ResultHandler    on_result,
+                          PgQuery::ExceptionHandler on_exception = {},
+                          bool                      quiet = false,
+                          std::chrono::seconds      answer_within = {});
+
+    /// application_name of the LISTEN connection, set on every listener once
+    /// it connects (by a statement on it — the connection string may be a URI).
+    /// Empty — not set. Says in pg_stat_activity whose subscription it is.
+    void set_listener_name(std::string name);
+
     std::size_t connection_count() const { return conns_.size(); }
     std::size_t queue_size()       const { return queue_.size(); }
 
-    /// Queries queued or already sent whose result somebody still waits for. Zero
+    /// Queries queued or already sent — on the pool or on the listener
+    /// (listener_execute()) — whose result somebody still waits for. Zero
     /// means nothing is outstanding — used to end a shutdown drain as soon as it is
     /// done rather than waiting out a timeout. Detached queries are not counted:
     /// nobody waits for them, so there is nothing to drain them for.
@@ -498,6 +543,10 @@ public:
     /// one is sent only if a connection frees up before the pool is destroyed, so
     /// none of them is guaranteed to run. Queries executed after this call are
     /// delivered as usual. Implies mute_listeners().
+    ///
+    /// Queries executed after this call go out ahead of the ones it detached: what
+    /// on_stop() sends (a deregistration, a sign-out) is not left behind work that
+    /// nobody waits for, when every connection is busy.
     ///
     /// For shutdown, between the drain of work in flight and on_stop(): a module
     /// tears down in on_stop() what its callbacks use, and a result that arrived
@@ -673,6 +722,32 @@ private:
     void dispatch_notify(const char* channel, const char* payload);
     void dispatch_listen_ready();
 
+    /// A channel to listen on, or a listener_execute() statement waiting: the
+    /// listener has to exist.
+    bool wants_listener() const { return !notify_handlers_.empty() || !listener_queue_.empty(); }
+
+    /// The listener is Ready: ship what waits for it — a LISTEN first, else the
+    /// next listener_execute() statement. Does nothing on a busy listener.
+    void listener_send_next();
+
+    /// The answer to the statement in flight on the listener: hand it over.
+    void deliver_listener_query(std::vector<PgResult> results);
+
+    /// The listener is lost with a statement in flight: fail it from the loop.
+    void fail_listener_query(std::string_view reason);
+
+    void arm_listener_answer(std::chrono::seconds limit);
+    void cancel_listener_answer();
+
+    /// The listener is busy with a statement nobody set a limit for — a LISTEN
+    /// batch, the SET application_name of a new listener — and a statement
+    /// with a limit waits behind it: the shortest such limit runs from now.
+    void watch_listener_queue();
+
+    /// Queue a query: after detach(), one somebody waits for goes ahead of the
+    /// detached ones.
+    void enqueue(std::unique_ptr<PgQuery> q);
+
     std::unique_ptr<PgConnection>                               listener_;
     std::unordered_map<std::string, std::vector<NotifyHandler>> notify_handlers_;
     std::unordered_map<std::string, std::vector<ListenReadyHandler>> ready_handlers_;
@@ -702,6 +777,25 @@ private:
     // that ran handlers whether the listener it held is still the same one —
     // a pointer comparison cannot, since a new object may reuse the address.
     std::uint64_t                                               listener_gen_{0};
+
+    // listener_execute(): waiting, and the one in flight (at most one; the
+    // listener answers one statement at a time).
+    struct ListenerQuery
+    {
+        std::unique_ptr<PgQuery> query;
+        std::chrono::seconds     answer_within{0};
+    };
+    std::deque<ListenerQuery>                                   listener_queue_;
+    std::unique_ptr<PgQuery>                                    listener_query_;
+    EventLoop::TimerId                                          listener_answer_timer_{EventLoop::kInvalidTimer};
+    // Notification handlers running: consume_notify() is iterating the
+    // listener's PGconn, and nothing may replace the listener under it.
+    int                                                         notify_depth_{0};
+    // Bumped by every answer the listener reads: tells watch_listener_queue()
+    // whether the server said anything while it waited.
+    std::uint64_t                                               listener_answers_{0};
+    std::string                                                 listener_name_;
+    bool                                                        detached_{false};
 };
 
 } // namespace apostol

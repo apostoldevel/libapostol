@@ -223,6 +223,12 @@ bool PgResult::ok() const
     return s == PGRES_TUPLES_OK || s == PGRES_COMMAND_OK;
 }
 
+const char* PgResult::sqlstate() const
+{
+    const char* code = res_ ? PQresultErrorField(res_.get(), PG_DIAG_SQLSTATE) : nullptr;
+    return code ? code : "";
+}
+
 // ── PgQuery ───────────────────────────────────────────────────────────────────
 
 PgQuery::PgQuery(std::string sql, bool quiet)
@@ -397,6 +403,11 @@ PostgresPollingStatusType PgConnection::reset_poll()
         state_ = PgConnState::Error;
 
     return ps;
+}
+
+bool PgConnection::answer_buffered() const
+{
+    return conn_ && state_ == PgConnState::Busy && PQisBusy(conn_.get()) == 0;
 }
 
 bool PgConnection::connected() const
@@ -726,6 +737,7 @@ PgPool::~PgPool()
         loop_.cancel_timer(stall_timer_);
         stall_timer_ = EventLoop::kInvalidTimer;
     }
+    cancel_listener_answer();
 
     if (listener_ && listener_->fd() >= 0) {
         if (pg_logger_)
@@ -1187,7 +1199,7 @@ void PgPool::dispatch_queue(PgConnection& conn)
     conn.set_current_query(nullptr);
     auto query = std::move(inflight_.back());
     inflight_.pop_back();
-    queue_.push_back(std::move(query));
+    enqueue(std::move(query));
     conn.set_state(PgConnState::Error);
     if (pg_logger_) {
         if (sent)
@@ -1298,9 +1310,27 @@ PgPool::QueryId PgPool::execute(std::string              sql,
     // again. Nothing in here dispatches the queue, so the order is free.
     ensure_min_connections();
 
-    queue_.push_back(std::move(q));
+    enqueue(std::move(q));
 
     return qid;
+}
+
+void PgPool::enqueue(std::unique_ptr<PgQuery> q)
+{
+    // Before detach() nothing in the queue is detached, and the order is the
+    // order of the calls. After it, the queue holds work nobody waits for any
+    // more, and a connection that frees up would take that first — on_stop()'s
+    // own statements, which do have somebody waiting, would queue behind it,
+    // and with every connection held by a slow query they would not get out
+    // before the pool is destroyed. Their fate is not changed otherwise: a
+    // detached query still goes out if there is time.
+    if (detached_ && !q->detached()) {
+        auto first = std::find_if(queue_.begin(), queue_.end(),
+            [](const std::unique_ptr<PgQuery>& x) { return x->detached(); });
+        queue_.insert(first, std::move(q));
+        return;
+    }
+    queue_.push_back(std::move(q));
 }
 
 // ── PgPool — Reconnect & Health ───────────────────────────────────────────────
@@ -1440,7 +1470,7 @@ void PgPool::fail_inflight_query(PgConnection& conn, std::string_view reason)
             if (pg_logger_)
                 pg_logger_->notice("Re-queuing query {} after connection error (not sent whole): {}",
                                    owned->id(), reason);
-            queue_.push_back(std::move(owned));
+            enqueue(std::move(owned));
             return;
         }
 
@@ -1449,7 +1479,7 @@ void PgPool::fail_inflight_query(PgConnection& conn, std::string_view reason)
             if (pg_logger_)
                 pg_logger_->notice("Re-queuing query {} after connection error (retry if lost): {}",
                                    owned->id(), reason);
-            queue_.push_back(std::move(owned));
+            enqueue(std::move(owned));
             return;
         }
 
@@ -1592,7 +1622,7 @@ void PgPool::schedule_reconnect_timer()
             // listener_ may have died on the same outage that triggered this
             // timer (or failed independently at startup, see start_listener());
             // restart it if there's still something to LISTEN for.
-            if (!listener_ && !notify_handlers_.empty())
+            if (!listener_ && wants_listener())
                 start_listener();
         },
         /*repeat=*/false);
@@ -1701,6 +1731,15 @@ std::size_t PgPool::outstanding() const
         if (!l.query->detached() && !l.query->canceled())
             ++n;
 
+    // A listener statement too: what on_stop() sends there (a deregistration)
+    // is waited for by the drain after it, like a pool query.
+    for (const auto& lq : listener_queue_)
+        if (!lq.query->detached())
+            ++n;
+
+    if (listener_query_ && !listener_query_->detached())
+        ++n;
+
     return n;
 }
 
@@ -1720,6 +1759,13 @@ void PgPool::detach() noexcept
     for (auto& l : lost_)
         l.query->mark_detached();
 
+    for (auto& lq : listener_queue_)
+        lq.query->mark_detached();
+
+    if (listener_query_)
+        listener_query_->mark_detached();
+
+    detached_ = true;
     mute_listeners();
 }
 
@@ -1917,11 +1963,11 @@ void PgPool::heartbeat()
     if (listener_) {
         if (listener_is_dead())
             restart_listener("heartbeat found the listener dead");
-    } else if (!notify_handlers_.empty()) {
-        // Subscriptions outstanding and no listener object at all.
+    } else if (wants_listener()) {
+        // Subscriptions or listener statements outstanding and no listener object at all.
         if (pg_logger_)
-            pg_logger_->error("PgPool: {} LISTEN channel(s) with no listener — restarting",
-                             notify_handlers_.size());
+            pg_logger_->error("PgPool: {} LISTEN channel(s), {} listener statement(s) with no listener — restarting",
+                             notify_handlers_.size(), listener_queue_.size());
         start_listener();
     }
 }
@@ -1946,6 +1992,12 @@ void PgPool::listen(const std::string& channel, NotifyHandler cb, ListenReadyHan
 
     if (is_new_channel || (wants_ready && !answer_coming))
         pending_listens_.insert(channel);
+
+    // From a notification handler, consume_notify() is iterating the listener:
+    // replacing it here freed the connection under that loop. on_listener_io
+    // ships the LISTEN when the batch is read.
+    if (notify_depth_ > 0)
+        return;
 
     if (!listener_) {
         start_listener();
@@ -1985,6 +2037,182 @@ void PgPool::unlisten(std::string_view channel)
     // If listener is busy/connecting, callbacks are already removed from
     // notify_handlers_ so notifications won't be dispatched even if UNLISTEN
     // hasn't been sent yet.
+}
+
+void PgPool::listener_execute(std::string               sql,
+                              PgQuery::ResultHandler    on_result,
+                              PgQuery::ExceptionHandler on_exception,
+                              bool                      quiet,
+                              std::chrono::seconds      answer_within)
+{
+    auto q = std::make_unique<PgQuery>(std::move(sql), quiet);
+    q->on_result(std::move(on_result));
+    q->on_exception(std::move(on_exception));
+    // Asked after detach(): somebody waits for it, as for execute().
+    listener_queue_.push_back(ListenerQuery{std::move(q), answer_within});
+
+    if (notify_depth_ > 0)
+        return;   // from a notification handler: on_listener_io ships it when the batch is read
+
+    if (!listener_) {
+        start_listener();
+    } else if (listener_is_dead()) {
+        restart_listener("listener_execute() found the listener dead");
+    } else if (listener_->state() == PgConnState::Ready) {
+        listener_send_next();
+    } else {
+        // connecting or busy — sent when the listener is next idle
+        watch_listener_queue();
+    }
+}
+
+void PgPool::set_listener_name(std::string name)
+{
+    listener_name_ = std::move(name);
+}
+
+void PgPool::listener_send_next()
+{
+    if (!listener_ || listener_->state() != PgConnState::Ready || listener_query_)
+        return;
+
+    if (!pending_listens_.empty()) {
+        send_pending_listens();
+        return;
+    }
+
+    if (listener_queue_.empty())
+        return;
+
+    ListenerQuery lq = std::move(listener_queue_.front());
+    listener_queue_.pop_front();
+
+    if (pg_logger_ && !lq.query->quiet())
+        pg_logger_->debug("{} Listener Query: {}", conn_tag(*listener_), lq.query->sql());
+
+    // Held before it goes out: the answer, or the loss of the listener, is
+    // what releases it.
+    listener_query_ = std::move(lq.query);
+
+    if (!listener_->send_query(listener_query_->sql())) {   // listener → Busy
+        // The server has not got it: it goes first on the next listener.
+        listener_queue_.push_front(ListenerQuery{std::move(listener_query_), lq.answer_within});
+        restart_listener("send_query failed while shipping a listener statement");
+        return;
+    }
+
+    if (lq.answer_within.count() > 0)
+        arm_listener_answer(lq.answer_within);
+}
+
+void PgPool::deliver_listener_query(std::vector<PgResult> results)
+{
+    cancel_listener_answer();
+    auto q = std::move(listener_query_);
+
+    // A quiet statement's error text may quote the statement: reduced before
+    // the log line and the handlers see it, as on_io does.
+    if (q->quiet())
+        for (auto& r : results)
+            r.withhold_statement();
+
+    // As on_io does for a pool query: a failed statement goes to the error
+    // handler, and a caller without one gets the results and reads ok().
+    auto bad = std::find_if(results.begin(), results.end(),
+        [](const PgResult& r) { return !r.ok(); });
+
+    if (bad != results.end() && pg_logger_ && listener_)
+        pg_logger_->error("{} Listener Query {} failed: {}", conn_tag(*listener_), q->id(),
+                          result_error_text(*bad));
+
+    if (bad == results.end() || !q->has_exception_handler())
+        q->deliver(std::move(results));
+    else
+        q->fail(result_error_text(*bad));
+}
+
+void PgPool::fail_listener_query(std::string_view reason)
+{
+    cancel_listener_answer();
+    if (!listener_query_)
+        return;
+
+    std::string error = fmt::format(
+        "the LISTEN connection was lost while the statement was in the server's hands — it may "
+        "or may not have been executed, and is not repeated: {}", reason);
+
+    if (pg_logger_)
+        pg_logger_->error("Listener Query {} failed: {}", listener_query_->id(), error);
+
+    // From the loop, as for a pool query (deliver_lost): this runs inside the
+    // pool's own handling of the loss.
+    PgResult result = PgResult::lost(error);
+    lost_.push_back(Lost{std::move(listener_query_), std::move(error), std::move(result)});
+
+    if (lost_timer_ == EventLoop::kInvalidTimer)
+        lost_timer_ = loop_.add_timer(std::chrono::milliseconds(1),
+            [this] {
+                lost_timer_ = EventLoop::kInvalidTimer;
+                deliver_lost();
+            }, /*repeat=*/false);
+}
+
+void PgPool::arm_listener_answer(std::chrono::seconds limit)
+{
+    cancel_listener_answer();
+    const auto id = listener_query_ ? listener_query_->id() : 0;
+    try {
+        listener_answer_timer_ = loop_.add_timer(limit,
+            [this, id, limit] {
+                listener_answer_timer_ = EventLoop::kInvalidTimer;
+                if (listener_query_ && listener_query_->id() == id)
+                    restart_listener(fmt::format("no answer to a listener statement in {}s", limit.count()));
+            }, /*repeat=*/false);
+    } catch (const std::exception& e) {
+        // Refused by the loop: the statement goes on without its limit.
+        if (pg_logger_)
+            pg_logger_->error("PgPool: listener answer watch not armed: {}", e.what());
+    }
+}
+
+void PgPool::watch_listener_queue()
+{
+    if (listener_answer_timer_ != EventLoop::kInvalidTimer)
+        return;   // the statement in flight has its own limit
+    if (!listener_ || listener_->state() != PgConnState::Busy)
+        return;   // idle sends at once; a handshake has its own watch
+
+    std::chrono::seconds limit{0};
+    for (const auto& lq : listener_queue_)
+        if (lq.answer_within.count() > 0 && (limit.count() == 0 || lq.answer_within < limit))
+            limit = lq.answer_within;
+    if (limit.count() == 0)
+        return;
+
+    const auto gen     = listener_gen_;
+    const auto answers = listener_answers_;
+    try {
+        listener_answer_timer_ = loop_.add_timer(limit,
+            [this, gen, answers, limit] {
+                listener_answer_timer_ = EventLoop::kInvalidTimer;
+                if (listener_ && listener_gen_ == gen && listener_answers_ == answers &&
+                    listener_->state() == PgConnState::Busy)
+                    restart_listener(fmt::format("no answer on the listener in {}s, a statement waiting", limit.count()));
+                else
+                    watch_listener_queue();   // it answered: watch what it is busy with now
+            }, /*repeat=*/false);
+    } catch (const std::exception& e) {
+        if (pg_logger_)
+            pg_logger_->error("PgPool: listener queue watch not armed: {}", e.what());
+    }
+}
+
+void PgPool::cancel_listener_answer()
+{
+    if (listener_answer_timer_ != EventLoop::kInvalidTimer) {
+        loop_.cancel_timer(listener_answer_timer_);
+        listener_answer_timer_ = EventLoop::kInvalidTimer;
+    }
 }
 
 void PgPool::start_listener()
@@ -2048,6 +2276,10 @@ void PgPool::restart_listener(std::string_view reason)
     const std::string why(reason);
     const std::size_t channels = notify_handlers_.size();
 
+    // The statement in flight on it is lost with it; the ones waiting go out on
+    // the next listener.
+    fail_listener_query(why);
+
     if (listener_) {
         // conn_tag() carries the fd, so a dead listener logs fd=-1 — the
         // visible proof that libpq closed the socket under us and that no
@@ -2106,7 +2338,7 @@ void PgPool::restart_listener(std::string_view reason)
     // Safe to call unconditionally (no hot-loop risk): start_listener() itself
     // checks next_connect_attempt_ and defers via schedule_reconnect_timer()
     // when a connect attempt would be premature or fails again.
-    if (!notify_handlers_.empty())
+    if (wants_listener())
         start_listener();
 }
 
@@ -2204,8 +2436,15 @@ void PgPool::on_listener_io(uint32_t events)
                 loop_.add_io(listener_->fd(), EPOLLIN, [this](uint32_t ev) {
                     on_listener_io(ev);
                 });
-                if (!pending_listens_.empty())
-                    send_pending_listens();
+                // Every new listener names itself first; a statement, because
+                // the connection string may be a URI and cannot simply be
+                // appended to.
+                if (!listener_name_.empty()) {
+                    auto q = std::make_unique<PgQuery>(
+                        "SET application_name = " + pq_quote_literal(listener_name_), true);
+                    listener_queue_.push_front(ListenerQuery{std::move(q), {}});
+                }
+                // ships below, at the end of this handler (listener_send_next)
             } else if (ps == PGRES_POLLING_FAILED) {
                 if (pg_logger_)
                     pg_logger_->error("{} Listener Error: {}", conn_tag(*listener_), listener_->error_message());
@@ -2229,7 +2468,8 @@ void PgPool::on_listener_io(uint32_t events)
         }
 
         case PgConnState::Busy: {
-            // Waiting for LISTEN/UNLISTEN command response
+            // Waiting for LISTEN/UNLISTEN command response — or for the answer
+            // to a listener_execute() statement
             auto results = listener_->collect_results();
             if (results.empty()) {
                 // collect_results() may have found the socket dead and moved
@@ -2243,6 +2483,26 @@ void PgPool::on_listener_io(uint32_t events)
                     return;
                 }
                 break;  // still in progress
+            }
+            ++listener_answers_;
+
+            if (listener_query_) {
+                // A handler may call anything that replaces the listener; the
+                // rest of this handler is for the one it saw.
+                const auto gen = listener_gen_;
+                deliver_listener_query(std::move(results));
+                if (!listener_ || listener_gen_ != gen)
+                    return;
+                if (listener_->consume_notify([this](const char* ch, const char* payload) {
+                        dispatch_notify(ch, payload);
+                    }) < 0)
+                {
+                    restart_listener("PQconsumeInput failed right after a listener statement");
+                    return;
+                }
+                if (!listener_ || listener_gen_ != gen)
+                    return;
+                break;
             }
 
             bool all_ok = true;
@@ -2354,9 +2614,9 @@ void PgPool::on_listener_io(uint32_t events)
                 restart_listener("PQconsumeInput failed on an idle listener");
                 return;
             }
-            // Send any pending listens accumulated while we were processing
-            if (!pending_listens_.empty())
-                send_pending_listens();
+            // Pending listens accumulated while we were processing go out
+            // below (listener_send_next) — if a handler did not send a
+            // statement of its own already: the listener may be Busy now.
             break;
         }
 
@@ -2367,6 +2627,28 @@ void PgPool::on_listener_io(uint32_t events)
             // than touch a connection this handler just replaced.
             return;
     }
+
+    // Whatever left the listener idle — a handshake done, an answer read, a
+    // notification — what waits for it goes out now.
+    if (listener_ && listener_->state() == PgConnState::Ready) {
+        const auto gen = listener_gen_;
+        listener_send_next();
+        if (!listener_ || listener_gen_ != gen)
+            return;
+    }
+
+    // A statement shipped from inside this handler — a LISTEN, an UNLISTEN, a
+    // listener statement a callback sent — may have been answered already, and
+    // the consume_notify() above read that answer into libpq's buffer: the
+    // socket is empty, and no event will come for it. Left there, the listener
+    // stayed Busy for good — every statement after it waited, the heartbeat
+    // included. Read it now, as the event would have.
+    if (listener_ && listener_->answer_buffered()) {
+        on_listener_io(EPOLLIN);
+        return;   // the call above rearms, or replaced the listener
+    }
+
+    watch_listener_queue();
 
     // Under APOSTOL_EPOLL_ET every fd is armed with EPOLLONESHOT and must be
     // rearmed after each event. Skip when the handler destroyed or replaced
@@ -2394,6 +2676,7 @@ void PgPool::dispatch_notify(const char* channel, const char* payload)
 
     // Copy the handler list — callbacks may mutate notify_handlers_ via unlisten()
     auto handlers = it->second;
+    struct Depth { int& d; explicit Depth(int& x) : d(x) { ++d; } ~Depth() { --d; } } depth(notify_depth_);
     for (const auto& cb : handlers)
         cb(channel, payload ? payload : "");
 }

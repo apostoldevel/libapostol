@@ -133,6 +133,7 @@ if(WITH_POSTGRESQL)
         target_sources(apostol PRIVATE
             src/dbplatform/bot_session_sql.cpp
             src/dbplatform/service_token_sql.cpp
+            src/dbplatform/notify_subscriber.cpp
         )
     endif()
 endif()
