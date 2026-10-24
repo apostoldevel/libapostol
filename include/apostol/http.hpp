@@ -218,6 +218,9 @@ public:
     /// the same way (feed() returns false) though nothing is wrong with it.
     bool malformed() const noexcept { return malformed_; }
 
+    /// A request has begun and is not complete yet: part of it is read.
+    bool in_message() const noexcept { return in_message_; }
+
 private:
     // llhttp parser state — allocated to keep llhttp out of public headers
     std::unique_ptr<llhttp_t>          parser_;
@@ -230,6 +233,7 @@ private:
     bool          error_{false};
     bool          malformed_{false};
     bool          hold_{false};
+    bool          in_message_{false};
     std::size_t   consumed_{0};
     std::string   error_msg_;
 
@@ -238,6 +242,7 @@ private:
     void flush_header();  // move current_field_/value_ into current_.headers
 
     // llhttp C callbacks — must be static because they're called from C
+    static int cb_on_message_begin   (llhttp_t*);
     static int cb_on_url             (llhttp_t*, const char* at, std::size_t len);
     static int cb_on_header_field    (llhttp_t*, const char* at, std::size_t len);
     static int cb_on_header_value    (llhttp_t*, const char* at, std::size_t len);
@@ -395,6 +400,19 @@ public:
     /// True if there is buffered data or an active file transfer.
     bool has_pending_writes() const noexcept;
 
+    /// An answer is owed on this connection or is still going out — or, after
+    /// stop_keep_alive(), the connection is still open: what kept it open is a
+    /// request to answer. A shutdown that closed it now would drop that answer.
+    bool busy() const noexcept
+    { return !closed_ && (owed() || has_pending_writes() || draining_); }
+
+    /// End keep-alive, for a process that stops: the answer in work is the last
+    /// one on this connection, and a request already sent and not yet parsed is
+    /// still answered — with "Connection: close" — and then the connection
+    /// closes. An idle connection is closed at once (half-close first, as any
+    /// close here). Returns true when this call closed the connection.
+    bool stop_keep_alive();
+
     /// Transfer ownership of the underlying TCP connection out of this
     /// HttpConnection. After this call do not call on_readable() or
     /// send_response() — the HttpConnection is in an empty/released state.
@@ -423,6 +441,7 @@ private:
     bool          close_after_send_{false};  // the request in work asked to close
     bool          stop_reading_{false};      // ... so nothing after it is parsed
     bool          throttled_{false};         // write tail over kWriteHighWater (T343)
+    bool          draining_{false};          // stop_keep_alive(): each answer is the last
     std::size_t   stray_answers_{0};         // answers sent with nothing owed (T343)
     std::string   pending_in_;               // read, not yet parsed
     uint32_t      mask_;                     // events last set on the loop

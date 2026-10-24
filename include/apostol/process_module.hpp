@@ -46,6 +46,14 @@ public:
         (void)now;
     }
 
+    /// The process starts to stop: take nothing new, finish what is started.
+    /// The heartbeat is no longer called. Same contract as Module::on_stopping().
+    virtual void on_stopping() {}
+
+    /// True while work started before on_stopping() is not finished; the stop
+    /// waits for it within "process.stop_timeout". Same as Module::busy().
+    virtual bool busy() const { return false; }
+
     /// Called before EventLoop destruction, after the work in flight has been
     /// drained. Same guarantees as Module::on_stop(): no handler of a query sent
     /// before this call runs after it; non-database callbacks are not cut off.
@@ -80,6 +88,16 @@ public:
     void heartbeat(std::chrono::system_clock::time_point now) override
     {
         module_->heartbeat(now);
+    }
+
+    void on_stopping() override
+    {
+        module_->on_stopping();
+    }
+
+    bool busy() const override
+    {
+        return module_->busy();
     }
 
     void on_stop() override

@@ -366,6 +366,44 @@ A failed connect moves the backoff (1, 2, 4 … 32 s) one step per round of
 attempts, not per connection: a pool and its listener that meet one dead
 server together count it once.
 
+### Stopping without dropping the work in flight
+
+On `SIGTERM` the master sends `SIGTERM` to its children and `SIGKILL` to those
+still running after `process.stop_timeout` seconds (default `5`; `1`–`3600`,
+checked with the file). A child, on `SIGTERM`, `SIGQUIT` and on the `SIGQUIT` of a
+reload:
+
+1. stops taking work: the listening socket leaves its loop (the master closes
+   its own copy as well, so a new connection is refused at once once every
+   stopping process has let go of it), idle keep-alive connections are closed,
+   every open one closes after its next answer, which carries
+   `Connection: close`; a WebSocket upgrade gets `503`. The modules are told by
+   `on_stopping()` — take nothing new, finish what is started — and their
+   `heartbeat()` is no longer called;
+2. runs its loop until nothing is in flight — no query of a pool outstanding, no
+   answer owed on an HTTP connection, no module reporting `busy()` — or until
+   `stop_timeout` less 3.5 s runs out (never under 1.5 s); requests on the
+   connections still open are served meanwhile;
+3. then, as before: modules latched, pools detached, `on_stop()`, a last drain
+   of what `on_stop()` queued.
+
+At the default 5 s the work in flight gets 1.5 s, as it always has. Where the
+platform waits longer before its own kill — a container's stop grace period,
+`terminationGracePeriodSeconds` — set `stop_timeout` a little under that and
+above the longest piece of work a module may have started (an outbound call, a
+send). A process that did not finish in time logs what it was waiting for:
+`work in flight did not finish in N ms (queries: …, HTTP answers: …, busy
+modules: …)`.
+
+The wait is only as good as what it waits for: a deferred answer a module never
+sends holds the stop to its end. Under 5 s the floor of 1.5 s and the last drain
+can outlast the master's `SIGKILL`. A reload (`SIGHUP`) during a stop is ignored.
+
+A module counts its own work in `busy()` — an outbound HTTP call, an SMTP send,
+a step on a timer; queries and HTTP answers are counted by the framework. The
+same pair, `on_stopping()` and `busy()`, is on `ProcessModule` and
+`CustomProcess`.
+
 ## Build (standalone development)
 
 ```bash

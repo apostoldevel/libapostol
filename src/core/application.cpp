@@ -847,22 +847,29 @@ void Application::master_run()
     //   3. SIGCHLD handler will cancel the timer and stop the loop if children
     //      exit before the deadline; otherwise the timer sends SIGKILL.
     auto fast_stop = [this, &loop, &kill_timer_id](const signalfd_siginfo&) {
+        // A second SIGTERM while the children finish their work: the kill
+        // timer already runs, and the children ignore a second stop signal.
+        if (kill_timer_id != EventLoop::kInvalidTimer)
+        {
+            logger_->notice("shutdown already in progress — signal ignored");
+            return;
+        }
         fast_shutdown();
         if (children_.empty())
         {
             loop.stop();
             return;
         }
-        // Arm kill escalation timer (5 s default — mirrors v1 ~1.55 s deadline but
-        // more generous to allow workers to finish in-flight requests).
+        // Arm the kill escalation timer: "process.stop_timeout", 5 s by default.
+        // The children spend it finishing the work in flight (stop_work).
         kill_timer_id = loop.add_timer(
-            std::chrono::seconds(kill_timeout_secs_),
+            std::chrono::seconds(settings_.stop_timeout),
             [this, &loop, &kill_timer_id]() {
                 kill_timer_id = EventLoop::kInvalidTimer;
                 if (children_.empty())
                     return;
                 logger_->warn("shutdown timeout ({} s) — sending SIGKILL to {} child(ren)",
-                              kill_timeout_secs_, children_.size());
+                              settings_.stop_timeout, children_.size());
                 for (auto& child : children_)
                     ::kill(child.pid, SIGKILL);
                 // Proactively reap: zombies won't generate new SIGCHLD.
@@ -939,8 +946,8 @@ void Application::master_run()
 // on_stop() runs after loop.run() has returned, so anything a module queues there —
 // a service session to close, a last write — sits in a queue nobody pumps again.
 // Give those queries a bounded chance to finish before the pool is destroyed. The
-// same drain runs once before on_stop() as well, for the work already in flight
-// (stop_work, below).
+// work already in flight is finished before on_stop() by finish_work(), on its own
+// budget (stop_work, below).
 //
 // Bounded on purpose: a database that has stopped answering must not hold the
 // process from exiting. The drain ends as soon as nothing is outstanding, so a
@@ -1001,22 +1008,126 @@ void Application::detach_db() noexcept
 
 // ─── stop_work ───────────────────────────────────────────────────────────────
 //
-// The drain before on_stop() is what keeps a late result away from a module that
-// has already released what the result's callback needs; the detach is what keeps
-// away a result later than that drain. Either alone leaves a window: without the
-// first drain an HTTP request in flight at SIGTERM would lose its answer to the
-// detach, and without the detach a query outlasting the drain would still reach
-// the module after on_stop() (T659). Notifications are muted before the first
-// drain, not at the detach: each one starts new work (WebSocketAPI answers a NOTIFY
-// with a query per session), and a drain that keeps being fed never reaches zero.
+// Finishing the work before on_stop() is what keeps a late result away from a
+// module that has already released what the result's callback needs; the detach is
+// what keeps away a result later than that. Either alone leaves a window: without
+// the finish an HTTP request in flight at SIGTERM would lose its answer to the
+// detach, and without the detach a query outlasting the finish would still reach
+// the module after on_stop() (T659). Notifications are muted before the finish,
+// not at the detach: each one starts new work (WebSocketAPI answers a NOTIFY with a
+// query per session), and a wait that keeps being fed never reaches zero. For the
+// same reason the listening socket leaves the loop and keep-alive ends first
+// (stop_http_server): the finish waits for the connections already open, and only
+// for them.
 
-void Application::stop_work(EventLoop& loop, const std::function<void()>& on_stop)
+std::chrono::milliseconds Application::stop_budget() const noexcept
+{
+    const auto total = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::seconds(settings_.stop_timeout));
+    return std::max(total - k_shutdown_reserve,
+                    std::chrono::milliseconds(k_shutdown_drain));
+}
+
+bool Application::finish_work(EventLoop& loop,
+                              const std::function<bool()>& busy,
+                              const std::function<std::string()>& busy_names)
+{
+    auto queries = [this]() -> std::size_t {
+#ifdef WITH_POSTGRESQL
+        std::size_t n = db_pool_ ? db_pool_->outstanding() : 0;
+        for (const auto& [name, pool] : named_pools_)
+            if (pool)
+                n += pool->outstanding();
+        return n;
+#else
+        return 0;
+#endif
+    };
+    auto done = [&] { return queries() == 0 && http_busy() == 0 && !(busy && busy()); };
+
+    // Best effort by definition, and every step of it — a module's busy()
+    // included — inside the try: an exception here must not skip the rest of
+    // the stop (stop_work), which is what keeps late results away from
+    // modules that have released what their callbacks use.
+    try {
+        if (done())
+            return true;
+
+        const auto budget  = stop_budget();
+        const auto started = std::chrono::steady_clock::now();
+        const bool finished = loop.run_for(budget, done);
+        const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started);
+
+        if (!logger_)
+            return finished;
+
+        if (finished) {
+            logger_->notice("{} shutdown: work in flight finished in {} ms",
+                            name_, static_cast<long long>(took.count()));
+        } else {
+            // The SIGKILL is the master's; what is left here is cut off by
+            // detach_db() and on_stop(). Name it, so that a stop timeout too
+            // short for the work reads as that in the log. Cut short before the
+            // time — a second SIGTERM stopped the loop — it says so instead.
+            std::string modules = busy && busy() && busy_names ? busy_names() : std::string{};
+            logger_->warn("{} shutdown: work in flight {} {} ms "
+                          "(queries: {}, HTTP answers: {}, busy modules: {}) — process.stop_timeout is {} s",
+                          name_, took < budget ? "cut short after" : "did not finish in",
+                          static_cast<long long>(took < budget ? took.count() : budget.count()),
+                          queries(), http_busy(), modules.empty() ? "none" : modules,
+                          settings_.stop_timeout);
+        }
+        return finished;
+    } catch (const std::exception& e) {
+        if (logger_)
+            logger_->warn("{} shutdown: finishing the work in flight failed: {}", name_, e.what());
+        return false;
+    }
+}
+
+void Application::stop_work(EventLoop& loop,
+                            const std::function<bool()>& busy,
+                            const std::function<std::string()>& busy_names,
+                            const std::function<void()>& quiesce,
+                            const std::function<void()>& on_stop)
 {
     quiesce_db();
-    drain_db(loop);
+    finish_work(loop, busy, busy_names);
+    quiesce();
     detach_db();
     on_stop();
     drain_db(loop);
+}
+
+EventLoop::SignalCallback Application::stop_signal(EventLoop& loop)
+{
+    // The first SIGTERM or SIGQUIT stops the loop, and the process runs it again
+    // to finish the work in flight (stop_work). A second one must not cut that
+    // short: a service manager that signals the whole process group and the
+    // master forwarding its own SIGTERM make two of them for every child. The
+    // bound is the master's SIGKILL.
+    return [this, &loop](const signalfd_siginfo& si) {
+        if (stop_signalled_)
+        {
+            logger_->notice("{}: signal {} ignored — already stopping", name_, si.ssi_signo);
+            return;
+        }
+        stop_signalled_ = true;
+        loop.stop();
+    };
+}
+
+void Application::stop_modules(EventLoop& loop)
+{
+    module_manager_.stopping([this](const Module& m, const std::exception& e) {
+        logger_->error("{} module '{}' on_stopping failed: {}", name_, m.name(), e.what());
+    });
+    stop_work(loop,
+              [this] { return module_manager_.busy(); },
+              [this] { return module_manager_.busy_names(); },
+              [this] { module_manager_.quiesce(); },
+              [this] { module_manager_.on_stop(); });
 }
 
 void Application::single_run()
@@ -1030,10 +1141,18 @@ void Application::single_run()
     EventLoop loop;
     worker_loop_ = &loop;
 
-    loop.add_signal(SIGTERM, [&loop](const signalfd_siginfo&) { loop.stop(); });
+    loop.add_signal(SIGTERM, stop_signal(loop));
+    // SIGINT stops at once, the second time as well: a developer's Ctrl-C.
     loop.add_signal(SIGINT,  [&loop](const signalfd_siginfo&) { loop.stop(); });
-    loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
+    loop.add_signal(SIGQUIT, stop_signal(loop));
     loop.add_signal(SIGHUP, [this](const signalfd_siginfo&) {
+        // During the stop (the loop runs again to finish the work in flight)
+        // a reload would have the modules reconfigure and start anew.
+        if (http_stopping_ || module_manager_.stopping_started())
+        {
+            logger_->notice("SIGHUP ignored — the process is stopping");
+            return;
+        }
         logger_->notice("SIGHUP — reconfiguring");
         // A reload that cannot be read leaves the process running on what it
         // already has. The ConfigError went uncaught out of a signal callback on
@@ -1093,8 +1212,8 @@ void Application::single_run()
 
     loop.run();
 
-    module_manager_.quiesce();
-    stop_work(loop, [this] { module_manager_.on_stop(); });
+    stop_http_server(loop);
+    stop_modules(loop);
     stop_db();
     logger_->notice("{} single process exiting (pid={})", name_, ::getpid());
 }
@@ -1117,8 +1236,8 @@ void Application::worker_run()
     EventLoop loop;
     worker_loop_ = &loop;
 
-    loop.add_signal(SIGTERM, [&loop](const signalfd_siginfo&) { loop.stop(); });
-    loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
+    loop.add_signal(SIGTERM, stop_signal(loop));
+    loop.add_signal(SIGQUIT, stop_signal(loop));
     loop.add_signal(SIGUSR1, [this](const signalfd_siginfo&) {
         logger_->notice("SIGUSR1 — worker reopening logs");
         logger_->reopen();
@@ -1152,8 +1271,8 @@ void Application::worker_run()
 
     loop.run();
 
-    module_manager_.quiesce();
-    stop_work(loop, [this] { module_manager_.on_stop(); });
+    stop_http_server(loop);
+    stop_modules(loop);
     stop_db();
     logger_->notice("{} worker process exiting (pid={})", name_, ::getpid());
 }
@@ -1172,8 +1291,8 @@ void Application::helper_run()
 
     EventLoop loop;
 
-    loop.add_signal(SIGTERM, [&loop](const signalfd_siginfo&) { loop.stop(); });
-    loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
+    loop.add_signal(SIGTERM, stop_signal(loop));
+    loop.add_signal(SIGQUIT, stop_signal(loop));
     loop.add_signal(SIGUSR1, [this](const signalfd_siginfo&) {
         logger_->notice("SIGUSR1 — helper reopening logs");
         logger_->reopen();
@@ -1271,10 +1390,9 @@ void Application::helper_run()
 #ifdef WITH_POSTGRESQL
     stopping = true;
 #endif
-    if (started) {
-        module_manager_.quiesce();
-        stop_work(loop, [this] { module_manager_.on_stop(); });
-    }
+    close_listener();
+    if (started)
+        stop_modules(loop);
     stop_db();
 #ifdef WITH_POSTGRESQL
     // Last: the lock goes with its connection, and a standby elsewhere starts
@@ -1306,8 +1424,8 @@ void Application::custom_process_run(CustomProcess& proc)
     // 4. EventLoop + signal handlers
     EventLoop loop;
 
-    loop.add_signal(SIGTERM, [&loop](const signalfd_siginfo&) { loop.stop(); });
-    loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
+    loop.add_signal(SIGTERM, stop_signal(loop));
+    loop.add_signal(SIGQUIT, stop_signal(loop));
     loop.add_signal(SIGUSR1, [this](const signalfd_siginfo&) {
         logger_->notice("SIGUSR1 — process reopening logs");
         logger_->reopen();
@@ -1352,13 +1470,13 @@ void Application::custom_process_run(CustomProcess& proc)
             ? fmt::format("{}: {} process", name_, proc.title())
             : fmt::format("{}: {} process ({})", name_, proc.title(), names));
 
-        // 7. Heartbeat timer (1s). The id is kept because the shutdown drains run the
-        // loop again, before on_stop() and after it: a beat during the first would
-        // start a new pass the drain then waits for, and a process whose session was
-        // released in on_stop() would, beating during the second, log back in and
-        // leave behind the very session the drain exists to close. Modules are
-        // latched by ModuleManager; a custom process has no manager, so its timer is
-        // cancelled by hand, before the first drain.
+        // 7. Heartbeat timer (1s). The id is kept because a shutdown runs the loop
+        // again, before on_stop() and after it: a beat while the work in flight is
+        // finished would start a new pass the finish then waits for, and a process
+        // whose session was released in on_stop() would, beating during the last
+        // drain, log back in and leave behind the very session the drain exists to
+        // close. Modules are latched by ModuleManager; a custom process has no
+        // manager, so its timer is cancelled by hand, before on_stopping().
         heartbeat_timer = loop.add_timer(std::chrono::seconds(1),
             [&proc, &gate] {
                 // A leader past a stall: not before the lock is confirmed.
@@ -1408,14 +1526,24 @@ void Application::custom_process_run(CustomProcess& proc)
     loop.run();
     stopping = true;
 
-    // 9. Cleanup: the heartbeats go first, so that the drain before on_stop()
-    // finishes the work in flight instead of starting a new pass; then stop_work(),
-    // then stop_db() while EventLoop is still alive.
+    // 9. Cleanup: the heartbeats go first, so that finishing the work in flight
+    // does not start a new pass; then on_stopping(), stop_work(), then stop_db()
+    // while EventLoop is still alive.
+    close_listener();
     if (started) {
         loop.cancel_timer(heartbeat_timer);
         if (pool_heartbeat_timer != EventLoop::kInvalidTimer)
             loop.cancel_timer(pool_heartbeat_timer);
-        stop_work(loop, [&proc] { proc.on_stop(); });
+        try {
+            proc.on_stopping();
+        } catch (const std::exception& e) {
+            logger_->error("{} process '{}' on_stopping failed: {}", name_, proc.name(), e.what());
+        }
+        stop_work(loop,
+                  [&proc] { return proc.busy(); },
+                  [&proc] { return std::string(proc.name()); },
+                  [] {},
+                  [&proc] { proc.on_stop(); });
     }
     stop_db();
     // Last: the lock goes with its connection, and a standby elsewhere starts
@@ -1779,6 +1907,12 @@ void Application::fast_shutdown()
     logger_->notice("fast shutdown requested");
     shutting_down_ = true;
 
+    // Nothing respawns from here on, so the listening socket has no further use
+    // here; closed, it goes once the stopping children have closed their copies
+    // (stop_http_server), and a new connection is refused at once instead of
+    // waiting in a backlog nobody accepts from.
+    close_listener();
+
     // Proactively reap any zombie children first (they won't generate new SIGCHLD).
     reap_children();
 
@@ -1797,6 +1931,8 @@ void Application::graceful_shutdown()
     shutting_down_ = true;
     graceful_ = true;
 
+    close_listener();   // as in fast_shutdown()
+
     // Proactively reap any zombie children first (they won't generate new SIGCHLD).
     reap_children();
 
@@ -1812,6 +1948,15 @@ void Application::graceful_shutdown()
 
 bool Application::rolling_restart()
 {
+    // Stopping: nothing is to be started any more, and the listening socket is
+    // closed already — a worker forked now would bind a socket of its own and
+    // serve past the stop, and under SIGQUIT the master would wait for it.
+    if (shutting_down_)
+    {
+        logger_->notice("reload ignored — the server is stopping");
+        return false;
+    }
+
     // The same reading as a start (read_config): the file, validate(), oauth2/
     // and sites/ into locals, swapped in one step only when all of it is good.
     // The new processes fork from this master, so what it holds is what they
@@ -2177,6 +2322,61 @@ Logger& Application::stream_logger()
     return *stream_logger_;
 }
 
+// ─── Stop: HTTP side ─────────────────────────────────────────────────────────
+
+void Application::close_listener() noexcept
+{
+    // In the master: its own socket. In a child: the copy fork() left it, which
+    // only the master needs (TcpListener owns it); the processes still holding
+    // the socket keep it open.
+    master_listener_.reset();
+    listen_fd_ = -1;
+}
+
+void Application::stop_http_server(EventLoop& loop)
+{
+    if (http_stopping_)
+        return;
+    http_stopping_ = true;
+
+    // The listener first: no connection is accepted by a process that stops. A
+    // worker's is borrowed from the master's socket and leaves the loop only;
+    // the single process owns its own, closed with the callback.
+    if (http_listen_fd_ >= 0) {
+        loop.remove_io(http_listen_fd_);
+        http_listen_fd_ = -1;
+    }
+    close_listener();
+
+    std::size_t closed = 0, open = 0;
+    for (auto& w : http_conns_) {
+        auto conn = w.lock();   // held across the call: closing drops the loop's reference
+        if (!conn || conn->closed())
+            continue;
+        if (conn->stop_keep_alive())
+            ++closed;
+        else
+            ++open;
+    }
+    std::erase_if(http_conns_, [](const auto& w) {
+        auto c = w.lock();
+        return !c || c->closed();
+    });
+
+    if (logger_ && (closed || open))
+        logger_->notice("{} stopping: {} idle connection(s) closed, {} to close after their answer",
+                        name_, closed, open);
+}
+
+std::size_t Application::http_busy() const
+{
+    std::size_t n = 0;
+    for (const auto& w : http_conns_)
+        if (auto c = w.lock(); c && c->busy())
+            ++n;
+    return n;
+}
+
 // ─── WebSocket handler ────────────────────────────────────────────────────────
 
 void Application::set_ws_handler(WsHandler h)
@@ -2215,6 +2415,7 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
     // still works because LT re-fires until the queue empties, but the
     // drain shape is harmless and keeps one code path.
     int listen_fd = listener->fd();
+    http_listen_fd_ = listen_fd;
     loop.add_io(listen_fd, EPOLLIN,
         [this, &loop, listener, listen_fd](uint32_t)
         {
@@ -2228,6 +2429,12 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
                     {
                         auto http_conn = std::make_shared<HttpConnection>(std::move(raw_conn), &loop, &logger());
                         int  conn_fd   = http_conn->fd();
+
+                        if (http_conns_.size() >= http_conns_sweep_at_) {
+                            std::erase_if(http_conns_, [](const auto& w) { return w.expired(); });
+                            http_conns_sweep_at_ = std::max<std::size_t>(64, 2 * http_conns_.size());
+                        }
+                        http_conns_.push_back(http_conn);
 
                         loop.add_io(conn_fd, EPOLLIN | EPOLLRDHUP,
                             [this, &loop, http_conn, conn_fd](uint32_t events)
@@ -2246,6 +2453,16 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
 
                                             if (ws_handler_ && is_ws_upgrade(req))
                                             {
+                                                // A session that would start as the process stops:
+                                                // refused, so that its client connects to another.
+                                                if (http_stopping_)
+                                                {
+                                                    resp.set_status(503, "Service Unavailable")
+                                                        .set_header("Retry-After", "1")
+                                                        .set_body("Server is stopping");
+                                                    return;
+                                                }
+
                                                 // Refusal BEFORE the handshake: resp goes out below
                                                 // as ordinary HTTP. A filter that refused and left
                                                 // the status at 2xx forgot to set it — an upgrade
@@ -2274,8 +2491,19 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
                                             }
 
                                             if (!module_manager_.execute(req, resp))
-                                                resp.set_status(404, "Not Found")
-                                                    .set_body("404 Not Found");
+                                            {
+                                                // Modules stopped (a request read after the time to
+                                                // finish ran out): not "no such resource" — the
+                                                // client may retry elsewhere.
+                                                if (module_manager_.stopped())
+                                                    resp.set_status(503, "Service Unavailable")
+                                                        .set_header("Retry-After", "1")
+                                                        .set_close(true)
+                                                        .set_body("Server is stopping");
+                                                else
+                                                    resp.set_status(404, "Not Found")
+                                                        .set_body("404 Not Found");
+                                            }
                                         });
 
                                     if (upgraded)

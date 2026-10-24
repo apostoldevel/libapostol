@@ -628,9 +628,16 @@ int HttpParser::cb_on_body(llhttp_t* p, const char* at, std::size_t len)
     return 0;
 }
 
+int HttpParser::cb_on_message_begin(llhttp_t* p)
+{
+    self(p)->in_message_ = true;
+    return 0;
+}
+
 int HttpParser::cb_on_message_complete(llhttp_t* p)
 {
     HttpParser* hp = self(p);
+    hp->in_message_ = false;
     if (hp->handler_)
         hp->handler_(std::move(hp->current_));
 
@@ -663,6 +670,7 @@ HttpParser::HttpParser()
 {
     llhttp_settings_init(settings_.get());
 
+    settings_->on_message_begin    = cb_on_message_begin;
     settings_->on_url              = cb_on_url;
     settings_->on_header_field     = cb_on_header_field;
     settings_->on_header_value     = cb_on_header_value;
@@ -682,6 +690,7 @@ HttpParser::HttpParser(HttpParser&& o) noexcept
     , current_(std::move(o.current_))
     , current_field_(std::move(o.current_field_))
     , current_value_(std::move(o.current_value_))
+    , in_message_(o.in_message_)
     , handler_(std::move(o.handler_))
 {
     // Fix userdata pointer — the parser stores a raw pointer to this
@@ -697,6 +706,7 @@ HttpParser& HttpParser::operator=(HttpParser&& o) noexcept
         current_       = std::move(o.current_);
         current_field_ = std::move(o.current_field_);
         current_value_ = std::move(o.current_value_);
+        in_message_    = o.in_message_;
         handler_       = std::move(o.handler_);
         if (parser_)
             parser_->data = this;
@@ -755,6 +765,14 @@ static bool wants_websocket(const HttpRequest& req)
 
 // ─── HttpConnection ───────────────────────────────────────────────────────────
 
+static bool says_close(const HttpResponse& resp)
+{
+    for (const auto& [name, value] : resp.headers())
+        if (::strcasecmp(name.c_str(), "Connection") == 0 && ::strcasecmp(value.c_str(), "close") == 0)
+            return true;
+    return false;
+}
+
 HttpConnection::HttpConnection(TcpConnection conn, EventLoop* loop, Logger* logger)
     : conn_(std::move(conn))
     , loop_(loop)
@@ -812,7 +830,7 @@ bool HttpConnection::on_readable(RequestHandler handler)
         // --http2) is an ordinary request answered over HTTP/1.1, and its
         // connection stays open.
         const bool ws_refused = !closed_ && wants_websocket(req);
-        if (ws_refused && !resp.is_deferred())
+        if ((ws_refused || draining_) && !resp.is_deferred())
             resp.set_close(true);
         // Skip response if the handler upgraded to WebSocket (release_tcp() was called)
         // or if the handler marked it as deferred (async PG response)
@@ -820,7 +838,7 @@ bool HttpConnection::on_readable(RequestHandler handler)
             send_response(resp);
         if (resp.is_deferred() && !answered_in_dispatch_)
             awaiting_ = true;
-        if (!req.keep_alive() || ws_refused) {
+        if (!req.keep_alive() || ws_refused || draining_) {
             close_after_send_ = true;
             stop_reading_     = true;   // RFC 9112 §9.6: nothing after it is processed
         }
@@ -1051,7 +1069,16 @@ void HttpConnection::send_response(const HttpResponse& resp)
 
     response_started();
 
-    std::string data = resp.serialize();
+    // A process that stops (stop_keep_alive): every answer is the last on the
+    // connection — say so in it, deferred ones included, not only by closing.
+    // Copied only then: the copy carries the body.
+    std::string data;
+    if (draining_ && !says_close(resp)) {
+        HttpResponse last = resp;
+        data = last.set_close(true).serialize();
+    } else {
+        data = resp.serialize();
+    }
 
     // If there are already pending writes, just append
     if (write_pos_ < write_buf_.size() || file_fd_ >= 0) {
@@ -1128,8 +1155,9 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: {}\r\n"
         "Content-Length: {}\r\n"
+        "{}"
         "\r\n",
-        mime_type, file_size);
+        mime_type, file_size, draining_ ? "Connection: close\r\n" : "");
 
     // If there are already pending writes, append headers and queue file
     if (write_pos_ < write_buf_.size() || file_fd_ >= 0) {
@@ -1318,6 +1346,39 @@ void HttpConnection::update_interest()
             // read or write it again.
             closed_ = true;
     }
+}
+
+bool HttpConnection::stop_keep_alive()
+{
+    if (closed_)
+        return true;
+
+    draining_ = true;
+
+    // An answer owed or going out: it is the last. What is pipelined behind it
+    // is not read — RFC 9112 §9.6; its client retries it elsewhere.
+    if (owed() || has_pending_writes()) {
+        close_after_send_ = true;
+        stop_reading_     = true;
+        return false;
+    }
+
+    // A request already read and held, or on its way in — bytes in the socket
+    // the loop has not reported yet: it is answered, with "Connection: close"
+    // (the dispatch sees draining_). Closing instead would take it for an idle
+    // connection and drop a request its client had every right to send.
+    // A request partly read — its head or body already in the parser, the rest
+    // still to come — is kept as well.
+    char probe;
+    if (!pending_in_.empty() || parser_.in_message() ||
+        ::recv(conn_.fd(), &probe, 1, MSG_PEEK | MSG_DONTWAIT) > 0)
+        return false;
+
+    shutdown_and_drain();
+    closed_ = true;
+    if (loop_)
+        loop_->remove_io(conn_.fd());
+    return true;
 }
 
 TcpConnection HttpConnection::release_tcp()

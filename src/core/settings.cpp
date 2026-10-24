@@ -103,6 +103,7 @@ void AppSettings::populate(const Config& cfg)
 
     leader          = cfg.get_bool("process.leader", leader);
     leader_interval = static_cast<int>(cfg.get_int("process.leader_interval", leader_interval));
+    stop_timeout    = static_cast<int>(cfg.get_int("process.stop_timeout", stop_timeout));
     // A string only. "node" is an object in applications that had the key
     // first (cs: {"code", "url"}), and it is theirs: reading it as a string
     // threw ConfigError and stopped them at start.
@@ -393,6 +394,10 @@ std::vector<ValidationError> AppSettings::validate() const
     if (leader_interval < 1 || leader_interval > 3600)
         err("process.leader_interval",
             fmt::format("process.leader_interval must be 1..3600 seconds, got {}", leader_interval));
+
+    if (stop_timeout < 1 || stop_timeout > 3600)
+        err("process.stop_timeout",
+            fmt::format("process.stop_timeout must be 1..3600 seconds, got {}", stop_timeout));
 
     if (pg_stall_timeout < 0)
         err("postgres.stall_timeout",

@@ -113,7 +113,8 @@ void EventLoop::poll_once(int timeout_ms)
         // not a flag, so a nested run_for() cannot hide its registrations.
         const uint64_t collected_at = registration_seq_;
 
-        for (int i = 0; i < n && running_; ++i)
+        int i = 0;
+        for (; i < n && running_; ++i)
         {
             int fd = events[i].data.fd;
             uint32_t ev = events[i].events;
@@ -135,6 +136,22 @@ void EventLoop::poll_once(int timeout_ms)
                 dispatch_io(fd, ev);
             }
         }
+
+#ifdef APOSTOL_EPOLL_ET
+        // Stopped mid-batch: the I/O events still ahead were taken off by
+        // EPOLLONESHOT when the kernel reported them, and no handler will arm
+        // them again. A process that runs the loop once more after stop() — a
+        // shutdown finishing its work in flight — would wait for them to the
+        // end of its time. Arm them again: EPOLL_CTL_MOD reports whatever is
+        // pending to the next epoll_wait. A registration newer than the batch
+        // is armed already.
+        for (; i < n; ++i)
+        {
+            const int fd = events[i].data.fd;
+            if (auto it = io_handlers_.find(fd); it != io_handlers_.end() && it->second.seq <= collected_at)
+                rearm_io(fd);
+        }
+#endif
     }
 }
 

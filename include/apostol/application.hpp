@@ -52,7 +52,8 @@ class TcpListener;  // forward declaration for master_listener_
 //   3. loop.run()
 //
 // Signals handled by master:
-//   SIGTERM / SIGINT  → fast shutdown (SIGTERM to all children → exit)
+//   SIGTERM / SIGINT  → fast shutdown (SIGTERM to all children; SIGKILL to the
+//                       ones left after "process.stop_timeout" seconds)
 //   SIGQUIT           → graceful shutdown (SIGQUIT to children, wait for exit)
 //   SIGHUP            → reload config + rolling restart of workers
 //   SIGWINCH          → gracefully stop workers (keep master running)
@@ -132,12 +133,6 @@ public:
         named_pools_.clear();
     }
 
-    /// How long a shutdown waits for queries to finish — once for the work in
-    /// flight when the loop stopped, once more for what on_stop() queued. Both
-    /// together stay well inside the master's kill timeout (kill_timeout_secs_,
-    /// 5 s by default), which also has to cover on_stop() and stop_db().
-    static constexpr auto k_shutdown_drain = std::chrono::milliseconds(1500);
-
     /// Pump @p loop briefly so that outstanding queries actually finish.
     /// on_stop() is called after run() has returned, so without this a query it
     /// issues — closing a service session, say — is queued and then discarded.
@@ -155,18 +150,68 @@ public:
     void detach_db() noexcept {}
 #endif // WITH_POSTGRESQL
 
-    /// The shutdown order of every process kind, after the loop has stopped and
-    /// the heartbeats and HTTP dispatch have been latched off:
+    /// How long a shutdown waits for what on_stop() queued — and, at the least,
+    /// for the work in flight when the loop stopped (stop_budget()).
+    static constexpr auto k_shutdown_drain = std::chrono::milliseconds(1500);
+
+    /// What "process.stop_timeout" keeps back for the end of a stop: the drain
+    /// after on_stop(), on_stop() itself, stop_db(), the exit. At the default
+    /// 5 s the work in flight gets k_shutdown_drain, as before the key existed.
+    static constexpr auto k_shutdown_reserve = std::chrono::milliseconds(3500);
+
+    /// How long a child finishes the work in flight before its modules are
+    /// stopped: "process.stop_timeout" less k_shutdown_reserve, never under
+    /// k_shutdown_drain. Under 5 s that floor outlasts the master's SIGKILL.
+    std::chrono::milliseconds stop_budget() const noexcept;
+
+    /// The shutdown order of every process kind, after the loop has stopped, the
+    /// heartbeats have been latched off and the modules told (on_stopping):
     ///   0. quiesce — notifications are no longer dispatched (they are new work);
-    ///   1. drain — the work in flight finishes while the modules are intact;
-    ///   2. detach — whatever is still outstanding will not be delivered;
-    ///   3. @p on_stop — modules release what their callbacks used;
-    ///   4. drain — what on_stop() queued, and only that.
+    ///   1. finish — the loop runs until nothing is in flight — no query of a
+    ///      pool outstanding, no answer owed on an HTTP connection, @p busy
+    ///      false — or until stop_budget() runs out; the modules are intact and
+    ///      execute() still serves the connections already open;
+    ///   2. @p quiesce — execute() refuses from here on;
+    ///   3. detach — whatever is still outstanding will not be delivered;
+    ///   4. @p on_stop — modules release what their callbacks used;
+    ///   5. drain — what on_stop() queued, and only that.
     /// Until T659 it was on_stop() first and one drain after it, and the drain
     /// handed results of earlier queries to modules already torn down: a
     /// TaskScheduler job answering after SIGTERM reached a released BotSession
     /// through a null pointer (SIGSEGV, fault 0xb0).
-    void stop_work(EventLoop& loop, const std::function<void()>& on_stop);
+    void stop_work(EventLoop& loop,
+                   const std::function<bool()>& busy,
+                   const std::function<std::string()>& busy_names,
+                   const std::function<void()>& quiesce,
+                   const std::function<void()>& on_stop);
+
+    /// SIGTERM/SIGQUIT handler of a child: stops @p loop the first time, ignores
+    /// (and logs) every later one — the stop then runs the loop again.
+    EventLoop::SignalCallback stop_signal(EventLoop& loop);
+
+    /// stop_work() for the modules of module_manager_ (worker, single, helper):
+    /// on_stopping() first, then the stages above.
+    void stop_modules(EventLoop& loop);
+
+    /// Stage 1 of stop_work(), on its own: run @p loop until nothing is in
+    /// flight or stop_budget() runs out. False when the time ran out.
+    bool finish_work(EventLoop& loop,
+                     const std::function<bool()>& busy,
+                     const std::function<std::string()>& busy_names);
+
+    /// Stop taking HTTP work, for a process that stops: the listening socket
+    /// leaves the loop (and a worker closes its copy of the master's — the
+    /// socket stays open for the processes that keep it), idle keep-alive
+    /// connections are closed, and each open one closes after its next answer.
+    /// A WebSocket upgrade is refused from here on (503).
+    void stop_http_server(EventLoop& loop);
+
+    /// HTTP connections with an answer owed or still going out.
+    std::size_t http_busy() const;
+
+    /// Close this process's copy of the master's listening socket (in the
+    /// master: the socket itself). Nothing listens on it here afterwards.
+    void close_listener() noexcept;
 
     // ── WebSocket handler ─────────────────────────────────────────────────────
 
@@ -400,6 +445,13 @@ private:
     SiteConfigs              sites_;
     ModuleManager            module_manager_;
     uint16_t                 http_port_{0};
+    int                      http_listen_fd_{-1};   // the listener registered in the loop
+    bool                     http_stopping_{false}; // stop_http_server() has run
+    bool                     stop_signalled_{false}; // stop_signal() has stopped the loop
+    // Connections of this process, for a stop: the loop's I/O callback owns
+    // each one. Expired entries are swept as connections are accepted.
+    std::vector<std::weak_ptr<HttpConnection>> http_conns_;
+    std::size_t              http_conns_sweep_at_{64};
 
 #ifdef WITH_POSTGRESQL
     // The logger before the pools on purpose: members die in reverse order,
@@ -424,10 +476,6 @@ private:
     bool shutting_down_{false};
     bool graceful_{false}; // true → wait for workers before exiting
 
-    // Seconds to wait for workers to exit after SIGTERM before sending SIGKILL.
-    // Mirrors v1 ~1.55 s deadline (50→100→200→400→800 ms doubling).
-    // Can be changed by subclass before run() if needed.
-    int kill_timeout_secs_{5};
 
     // Respawn state, per child name. It has to be per child, not per application:
     // once it gates log suppression (below), a global storm would hide a second

@@ -79,6 +79,12 @@ struct AppSettings
     bool leader          {false};
     int  leader_interval {5};   // seconds between asking (standby) and probing (leader)
 
+    // "process.stop_timeout" — seconds from SIGTERM to the master's SIGKILL of
+    // the children still running. A child spends it finishing the work in flight
+    // (Application::stop_work); on a deployment that waits longer before its own
+    // kill (a container's stop grace period), set it a little under that.
+    int  stop_timeout    {5};
+
     // ── Identity ──────────────────────────────────────────────────────────
     // "node" — this copy's name for node_id(); empty → $NODE_NAME → host name.
     std::string node;

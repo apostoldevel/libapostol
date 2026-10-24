@@ -27,9 +27,11 @@ class Application;
 //   4. on_start(loop, app)  — user setup
 //   5. heartbeat timer (1s) — calls heartbeat() every second
 //   6. loop.run()           — event loop
-//   7. stop_work()          — heartbeat timers cancelled, notifications muted,
-//                             work in flight drained, pools detached, then
-//                             on_stop() (user cleanup), then its queries drained
+//   7. stop_work()          — heartbeat timers cancelled, on_stopping(),
+//                             notifications muted, work in flight finished
+//                             (busy() and the pool, within process.stop_timeout),
+//                             pools detached, then on_stop() (user cleanup),
+//                             then its queries drained
 //   8. stop_db()            — destroy PgPool while EventLoop still alive
 //
 class CustomProcess
@@ -52,6 +54,14 @@ public:
     {
         (void)now;
     }
+
+    /// The process starts to stop: take nothing new, finish what is started.
+    /// The heartbeat is no longer called. Same contract as Module::on_stopping().
+    virtual void on_stopping() {}
+
+    /// True while work started before on_stopping() is not finished; the stop
+    /// waits for it within "process.stop_timeout". Same as Module::busy().
+    virtual bool busy() const { return false; }
 
     /// Called before EventLoop destruction, after the work in flight has been
     /// drained. Clean up resources. Same guarantees as Module::on_stop(): no
