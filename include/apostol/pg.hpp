@@ -473,6 +473,9 @@ public:
     /// hangs, for as long as the kernel keeps the connection.
     /// Until the request is done the query's connection takes no other query:
     /// a request arriving after its query finished would cancel the next one.
+    /// A request that fails after its packet may have left (the server took the
+    /// connection and went silent, or the connection failed) could still arrive: the
+    /// connection is reset instead, a new backend the request does not name.
     /// The outcome is logged, not reported: delivered, failed, or given up. A
     /// request still on its way when the pool ends goes with it, and the
     /// query may run to its end on the server.
@@ -705,6 +708,7 @@ private:
         std::string        tag;     // conn_tag() of the connection the query runs on
         PgConnection*      target{nullptr};  // that connection; nullptr once it is replaced
         int                fd{-1};  // registered with the loop, -1 — not
+        bool               sent{false};  // its packet may have left: connected, or awaiting the server
         EventLoop::TimerId timer{EventLoop::kInvalidTimer};
         std::chrono::seconds limit{0};
     };
@@ -714,8 +718,9 @@ private:
     bool start_cancel(PgConnection& conn, uint64_t id, std::string& error);
     /// The cancel connection's socket is ready for what PQcancelPoll asked.
     void on_cancel_io(CancelRequest* cr);
-    /// Done, failed or given up: taken off the loop and destroyed, its
-    /// connection free to take queries again, logged.
+    /// Done, failed or given up: taken off the loop and destroyed, logged; its
+    /// connection free to take queries again, or reset when the request may
+    /// still arrive.
     /// @p timed_out — given up by its timer.
     void end_cancel(CancelRequest* cr, bool ok, std::string_view error, bool timed_out = false);
     /// Taken off the loop and destroyed, nothing else.

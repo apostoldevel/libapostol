@@ -4,6 +4,7 @@
 #include <fmt/format.h>
 #include <poll.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -1167,6 +1168,27 @@ bool PgPool::cancel(QueryId id)
 
 #ifdef LIBPQ_HAS_ASYNC_CANCEL
 
+// The socket is connected: the next PQcancelPoll may write the request into
+// it (with sslmode=disable it does, at once).
+static bool cancel_socket_connected(int fd) noexcept
+{
+    sockaddr_storage sa{};
+    socklen_t        len = sizeof(sa);
+    return fd >= 0 && ::getpeername(fd, reinterpret_cast<sockaddr*>(&sa), &len) == 0;
+}
+
+// What the exception being handled says. Inside a catch only.
+static std::string current_exception_text()
+{
+    try {
+        throw;
+    } catch (const std::exception& e) {
+        return e.what();
+    } catch (...) {
+        return "unknown exception";
+    }
+}
+
 // PQcancel connects to the server and waits for it on the calling thread: a
 // server that takes the connection and does not answer — a paused process, a
 // stuck proxy — held the loop, and every connection it serves, until the
@@ -1199,6 +1221,8 @@ bool PgPool::start_cancel(PgConnection& conn, uint64_t id, std::string& error)
 
         raw->timer = loop_.add_timer(raw->limit, [this, raw] {
             raw->timer = EventLoop::kInvalidTimer;
+            if (cancel_socket_connected(raw->fd))
+                raw->sent = true;
             end_cancel(raw, false, {}, /*timed_out=*/true);
         }, /*repeat=*/false);
 
@@ -1228,11 +1252,15 @@ void PgPool::on_cancel_io(CancelRequest* cr)
     // before, whatever is there registered after — as on_io() does for a
     // handshake.
     if (cr->fd >= 0) {
+        if (cancel_socket_connected(cr->fd))
+            cr->sent = true;
         loop_.remove_io(cr->fd);
         cr->fd = -1;
     }
 
     const auto ps = PQcancelPoll(cr->conn.get());
+    if (ps == PGRES_POLLING_READING)
+        cr->sent = true;   // waiting for the server: something has gone out
 
     if (ps == PGRES_POLLING_OK) {
         end_cancel(cr, true, {});
@@ -1258,7 +1286,7 @@ void PgPool::on_cancel_io(CancelRequest* cr)
 }
 
 // Called from the request's own timer, which the loop does not guard: the
-// request is gone and its connection free before anything here may throw.
+// request is gone before anything here may throw, and nothing thrown leaves.
 void PgPool::end_cancel(CancelRequest* cr, bool ok, std::string_view error, bool timed_out)
 {
     // The error text may be libpq's, owned by the request.
@@ -1270,22 +1298,11 @@ void PgPool::end_cancel(CancelRequest* cr, bool ok, std::string_view error, bool
     tag.swap(cr->tag);
     const uint64_t      id     = cr->query_id;
     const auto          limit  = cr->limit;
+    const bool          sent   = cr->sent;
     PgConnection* const target = cr->target;
     drop_cancel(cr);
 
-    if (target && target->cancel_pending() == id) {
-        target->set_cancel_pending(0);
-        try {
-            dispatch_queue(*target);
-        } catch (const std::exception& e) {
-            if (pg_logger_)
-                pg_logger_->error("{} Dispatch after the cancel of query {} failed: {}", tag, id, e.what());
-        }
-    }
-
-    if (!pg_logger_)
-        return;
-    try {
+    if (pg_logger_) try {
         if (ok) {
             // Delivered: the server got the request. Whether the query was
             // still running then, only its own result tells.
@@ -1299,6 +1316,47 @@ void PgPool::end_cancel(CancelRequest* cr, bool ok, std::string_view error, bool
             pg_logger_->error("{} Cancel of query {} failed: {}", tag, id, why);
         }
     } catch (...) {}
+
+    // Failed after its packet may have left — given up on a server that took
+    // the connection and went silent, or the connection failed on the way — the
+    // request can still reach the backend, whenever the server or a proxy in
+    // between gets to it, and cancel whatever runs there then. The backend is
+    // given up instead: a reset is a new one, which the request does not name.
+    // Its query, if still running, is the canceled one: dropped unreported.
+    // Failed before (refused, no connection), nothing went out: the
+    // connection takes queries again.
+    if (target && target->cancel_pending() == id) {
+        try {
+            if (!ok && sent) {
+                if (pg_logger_) try {
+                    pg_logger_->notice("{} Cancel of query {} may still arrive — reconnecting", tag, id);
+                } catch (...) {}
+                fail_inflight_query(*target, "reconnected: a cancel request may still arrive");
+                if (!try_reconnect(*target))
+                    replace_connection(*target);
+            } else {
+                target->set_cancel_pending(0);
+                dispatch_queue(*target);
+            }
+        } catch (...) {
+            // Never left marked for good: it would take no query again. Its
+            // packet may have left — then not freed but given up as broken
+            // (heartbeat() replaces it): the old backend must not take the
+            // next query. Looked up, as the throw may have come after the
+            // connection was replaced.
+            for (auto& c : conns_) {
+                if (c.get() != target || c->cancel_pending() != id)
+                    continue;
+                if (!ok && sent)
+                    c->set_state(PgConnState::Error);
+                else
+                    c->set_cancel_pending(0);
+            }
+            if (pg_logger_) try {
+                pg_logger_->error("{} After the cancel of query {}: {}", tag, id, current_exception_text());
+            } catch (...) {}
+        }
+    }
 }
 
 void PgPool::drop_cancel(CancelRequest* cr) noexcept
