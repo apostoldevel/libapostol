@@ -380,6 +380,7 @@ PostgresPollingStatusType PgConnection::connect_poll()
 bool PgConnection::reset_start()
 {
     pending_results_.clear();
+    cancel_pending_ = 0;
     if (!PQresetStart(conn_.get())) {
         state_ = PgConnState::Error;
         return false;
@@ -738,6 +739,18 @@ PgPool::~PgPool()
         stall_timer_ = EventLoop::kInvalidTimer;
     }
     cancel_listener_answer();
+
+#ifdef LIBPQ_HAS_ASYNC_CANCEL
+    // A cancel still on its way goes with the pool: its query's result has
+    // nobody to reach any more.
+    for (auto& cr : cancels_) {
+        if (cr->fd >= 0)
+            loop_.remove_io(cr->fd);
+        if (cr->timer != EventLoop::kInvalidTimer)
+            loop_.cancel_timer(cr->timer);
+    }
+    cancels_.clear();
+#endif
 
     if (listener_ && listener_->fd() >= 0) {
         if (pg_logger_)
@@ -1111,11 +1124,21 @@ bool PgPool::cancel(QueryId id)
     if (id == 0)
         return false;
 
-    // Check in-flight queries — send PQcancel to PostgreSQL
+    // Check in-flight queries — ask PostgreSQL to cancel it
     for (auto& conn : conns_) {
         if (conn->current_query() && conn->current_query()->id() == id) {
             conn->current_query()->mark_canceled();
             std::string err;
+#ifdef LIBPQ_HAS_ASYNC_CANCEL
+            // One request on its way is enough; a repeated cancel() after it
+            // failed sends another.
+            if (conn->cancel_pending() == id)
+                return true;
+            bool ok = start_cancel(*conn, id, err);
+            if (!ok && pg_logger_)
+                pg_logger_->error("{} Cancel of query {} not started: {}",
+                                 conn_tag(*conn), id, err);
+#else
             bool ok = conn->cancel(err);
             if (pg_logger_) {
                 if (ok)
@@ -1124,6 +1147,7 @@ bool PgPool::cancel(QueryId id)
                     pg_logger_->error("{} PQcancel failed for query {}: {}",
                                      conn_tag(*conn), id, err);
             }
+#endif
             return ok;
         }
     }
@@ -1140,6 +1164,154 @@ bool PgPool::cancel(QueryId id)
     canceled_ids_.insert(id);
     return true;
 }
+
+#ifdef LIBPQ_HAS_ASYNC_CANCEL
+
+// PQcancel connects to the server and waits for it on the calling thread: a
+// server that takes the connection and does not answer — a paused process, a
+// stuck proxy — held the loop, and every connection it serves, until the
+// kernel gave up (157 s measured). Here the request is a connection of
+// its own on the loop, given up by a timer: libpq does not time a
+// non-blocking cancel by itself.
+bool PgPool::start_cancel(PgConnection& conn, uint64_t id, std::string& error)
+{
+    // Whatever throws on the way — allocation, the loop refusing the timer or
+    // the socket — leaves nothing behind: not started.
+    CancelRequest* raw = nullptr;
+    try {
+        auto cr = std::make_unique<CancelRequest>();
+        cr->conn.reset(conn.cancel_conn());
+        if (!cr->conn) {
+            error = conn.fd() < 0 ? "no connection" : "PQcancelCreate failed";
+            return false;
+        }
+        if (PQcancelStatus(cr->conn.get()) == CONNECTION_BAD || !PQcancelStart(cr->conn.get())) {
+            error = PQcancelErrorMessage(cr->conn.get());
+            return false;
+        }
+        cr->query_id = id;
+        cr->tag      = conn_tag(conn);
+        cr->target   = &conn;
+        cr->limit    = conn.handshake_limit().count() > 0 ? conn.handshake_limit()
+                                                         : std::chrono::seconds(10);
+        raw = cr.get();
+        cancels_.push_back(std::move(cr));
+
+        raw->timer = loop_.add_timer(raw->limit, [this, raw] {
+            raw->timer = EventLoop::kInvalidTimer;
+            end_cancel(raw, false, {}, /*timed_out=*/true);
+        }, /*repeat=*/false);
+
+        // libpq: after PQcancelStart, poll as if PQcancelPoll had last answered
+        // PGRES_POLLING_WRITING.
+        const int fd = PQcancelSocket(raw->conn.get());
+        if (fd < 0)
+            throw std::runtime_error("no socket");
+        loop_.add_io(fd, EPOLLOUT, [this, raw](uint32_t) { on_cancel_io(raw); });
+        raw->fd = fd;
+    } catch (const std::exception& e) {
+        if (raw)
+            drop_cancel(raw);
+        error = e.what();
+        return false;
+    }
+
+    conn.set_cancel_pending(id);
+    if (pg_logger_)
+        pg_logger_->notice("{} Cancel of query {} requested", raw->tag, id);
+    return true;
+}
+
+void PgPool::on_cancel_io(CancelRequest* cr)
+{
+    // libpq may close the socket and open another inside one poll: taken off
+    // before, whatever is there registered after — as on_io() does for a
+    // handshake.
+    if (cr->fd >= 0) {
+        loop_.remove_io(cr->fd);
+        cr->fd = -1;
+    }
+
+    const auto ps = PQcancelPoll(cr->conn.get());
+
+    if (ps == PGRES_POLLING_OK) {
+        end_cancel(cr, true, {});
+        return;
+    }
+    if (ps == PGRES_POLLING_FAILED) {
+        end_cancel(cr, false, PQcancelErrorMessage(cr->conn.get()));
+        return;
+    }
+
+    const int fd = PQcancelSocket(cr->conn.get());
+    if (fd < 0) {
+        end_cancel(cr, false, "no socket");
+        return;
+    }
+    try {
+        loop_.add_io(fd, ps == PGRES_POLLING_READING ? EPOLLIN : EPOLLOUT,
+                     [this, cr](uint32_t) { on_cancel_io(cr); });
+        cr->fd = fd;
+    } catch (const std::exception& e) {
+        end_cancel(cr, false, e.what());
+    }
+}
+
+// Called from the request's own timer, which the loop does not guard: the
+// request is gone and its connection free before anything here may throw.
+void PgPool::end_cancel(CancelRequest* cr, bool ok, std::string_view error, bool timed_out)
+{
+    // The error text may be libpq's, owned by the request.
+    std::string why;
+    try {
+        why.assign(error);
+    } catch (...) {}
+    std::string         tag;
+    tag.swap(cr->tag);
+    const uint64_t      id     = cr->query_id;
+    const auto          limit  = cr->limit;
+    PgConnection* const target = cr->target;
+    drop_cancel(cr);
+
+    if (target && target->cancel_pending() == id) {
+        target->set_cancel_pending(0);
+        try {
+            dispatch_queue(*target);
+        } catch (const std::exception& e) {
+            if (pg_logger_)
+                pg_logger_->error("{} Dispatch after the cancel of query {} failed: {}", tag, id, e.what());
+        }
+    }
+
+    if (!pg_logger_)
+        return;
+    try {
+        if (ok) {
+            // Delivered: the server got the request. Whether the query was
+            // still running then, only its own result tells.
+            pg_logger_->notice("{} Cancel of query {} delivered", tag, id);
+        } else {
+            // libpq's text ends with a newline, and may span several lines.
+            while (!why.empty() && (why.back() == '\n' || why.back() == ' '))
+                why.pop_back();
+            if (timed_out)
+                why = fmt::format("no answer within {} s, given up", limit.count());
+            pg_logger_->error("{} Cancel of query {} failed: {}", tag, id, why);
+        }
+    } catch (...) {}
+}
+
+void PgPool::drop_cancel(CancelRequest* cr) noexcept
+{
+    if (cr->fd >= 0)
+        loop_.remove_io(cr->fd);
+    if (cr->timer != EventLoop::kInvalidTimer)
+        loop_.cancel_timer(cr->timer);
+
+    std::erase_if(cancels_, [cr](const std::unique_ptr<CancelRequest>& p) { return p.get() == cr; });
+}
+
+#endif // LIBPQ_HAS_ASYNC_CANCEL
 
 void PgPool::dispatch_queue(PgConnection& conn)
 {
@@ -1163,6 +1335,11 @@ void PgPool::dispatch_queue(PgConnection& conn)
     // to have returned NULL.  collect_results() accumulates partial results
     // and only returns them when all statements are complete (state == Ready).
     if (conn.state() != PgConnState::Ready)
+        return;
+
+    // A cancel request still on its way would hit the next query:
+    // end_cancel() dispatches here when it is done.
+    if (conn.cancel_pending())
         return;
 
     // Verify connection is actually alive before dispatching
@@ -1227,7 +1404,7 @@ PgPool::QueryId PgPool::execute(std::string              sql,
 
     // Find a ready connection (mirrors v1 GetReadyConnection)
     for (auto& c : conns_) {
-        if (c->state() == PgConnState::Ready) {
+        if (c->state() == PgConnState::Ready && !c->cancel_pending()) {
             // P0 Fix: verify actual PQstatus before using (v1 checks Connected())
             if (!c->connected()) {
                 if (pg_logger_)
@@ -1410,6 +1587,14 @@ void PgPool::replace_connection(PgConnection& conn)
     // rearm check against a dangling pointer, could observe a false
     // "registered" state.
     registered_conns_.erase(&conn);
+
+#ifdef LIBPQ_HAS_ASYNC_CANCEL
+    // A cancel on its way to this backend outlives the connection; it has
+    // nothing to dispatch on when done.
+    for (auto& cr : cancels_)
+        if (cr->target == &conn)
+            cr->target = nullptr;
+#endif
 
     // Find and erase this connection from conns_
     auto it = std::find_if(conns_.begin(), conns_.end(),
@@ -1934,10 +2119,10 @@ void PgPool::drop_stalled(std::chrono::steady_clock::time_point now)
             pg_logger_->error("{} Query in flight: {}, dropping the connection without cancel",
                              conn_tag(*c), reason);
 
-        // No PQcancel: it connects to the server synchronously, and an address
-        // that has stopped answering holds the loop for as long as the kernel
-        // tries. The session, if it is still alive over there, ends when
-        // the server notices the socket gone.
+        // No cancel request: the session, if it is still alive over there,
+        // ends when the server notices the socket gone. And before libpq 17 a
+        // cancel connects to the server synchronously — an address that has
+        // stopped answering held the loop for as long as the kernel tried.
         fail_inflight_query(*c, reason);
         if (!try_reconnect(*c))
             replace_connection(*c);

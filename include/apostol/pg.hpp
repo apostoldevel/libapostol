@@ -213,7 +213,18 @@ public:
 
     /// Cancel the currently running query via PQcancel (out-of-band signal).
     /// On failure, writes the error into errbuf and returns false.
+    ///
+    /// Blocking: PQcancel opens a new connection to the server and waits for
+    /// it to close, on the calling thread. PgPool::cancel() uses it only where
+    /// libpq has no non-blocking cancel (before 17).
     bool cancel(std::string& errbuf);
+
+#ifdef LIBPQ_HAS_ASYNC_CANCEL
+    /// A cancel request for the query running here, not started yet
+    /// (PQcancelCreate): the caller drives it with PQcancelStart/PQcancelPoll
+    /// and frees it with PQcancelFinish. nullptr when there is no connection.
+    PGcancelConn* cancel_conn() const { return conn_ ? PQcancelCreate(conn_.get()) : nullptr; }
+#endif
 
     /// Consume input and collect all completed results.
     /// Call when fd becomes readable in Busy state.
@@ -297,6 +308,13 @@ public:
     std::uint64_t round() const          { return round_; }
     void          set_round(std::uint64_t r) { round_ = r; }
 
+    /// The query whose cancel request is on its way to this connection's
+    /// backend (PgPool::cancel()), 0 — none. While it is, the connection takes
+    /// no query: a request arriving after its query finished would cancel the
+    /// next one. A reset is a new backend, which the request does not name.
+    std::uint64_t cancel_pending() const               { return cancel_pending_; }
+    void          set_cancel_pending(std::uint64_t id) { cancel_pending_ = id; }
+
     /// libpq's connection error text — without the error of a quiet statement
     /// that libpq keeps at its head until the next query is sent (see
     /// withhold_last_error()).
@@ -342,6 +360,7 @@ private:
     bool                                  handshake_late_{false};  // past the limit at the last tick
     std::chrono::steady_clock::time_point heard_{};
     std::uint64_t                         round_{0};
+    std::uint64_t                         cancel_pending_{0};
     std::string      conninfo_;
     PgConnState      state_{PgConnState::Connecting};
     PgQuery*         current_query_{nullptr};
@@ -415,8 +434,9 @@ public:
     ///
     /// The silence counts from the moment the query went out and starts again
     /// with every read that finds input; checked once a second. A connection
-    /// past the limit is dropped without PQcancel — a cancel to a dead address blocks the
-    /// loop. Its query is failed as one lost with its connection ("may or may
+    /// past the limit is dropped without a cancel request: the session ends when the
+    /// server notices the socket gone (and before libpq 17 a cancel to a dead address
+    /// blocks the loop, see cancel()). Its query is failed as one lost with its connection ("may or may
     /// not have been executed"; re-queued if it was not sent whole or is
     /// PgRetry::if_lost), and the connection reconnects in its own slot. The
     /// LISTEN connection is not watched.
@@ -443,11 +463,25 @@ public:
                     PgRetry                   retry = PgRetry::never);
 
     /// Cancel a running or queued query.
-    /// For in-flight queries: sends PQcancel to PostgreSQL; result is silently discarded.
+    /// For in-flight queries: asks PostgreSQL to cancel it; result is silently discarded.
+    /// The request goes on a connection of its own, which the loop drives
+    /// (PQcancelStart/PQcancelPoll, libpq 17 and later): this returns at once,
+    /// and a server that takes the connection and does not answer holds
+    /// nothing but that connection, given up after the connection string's
+    /// connect_timeout (10 s without one). With an older libpq it is PQcancel,
+    /// which blocks the loop until the server answers — against a server that
+    /// hangs, for as long as the kernel keeps the connection.
+    /// Until the request is done the query's connection takes no other query:
+    /// a request arriving after its query finished would cancel the next one.
+    /// The outcome is logged, not reported: delivered, failed, or given up. A
+    /// request still on its way when the pool ends goes with it, and the
+    /// query may run to its end on the server.
     /// For queued queries: removed from the queue without dispatching.
     /// For a query lost with its connection and not yet reported: not reported.
     /// A canceled query is never sent again after a connection loss.
-    /// Returns true if the query was found and cancel was initiated.
+    /// Returns true if the query was found and the cancel started (sent, with
+    /// an older libpq); a repeated call while a request is on its way starts
+    /// no second one.
     bool cancel(QueryId id);
 
     /// Call periodically (e.g. every 60s from module heartbeat).
@@ -659,6 +693,34 @@ private:
     };
     std::vector<Lost>                      lost_;
     EventLoop::TimerId                     lost_timer_{EventLoop::kInvalidTimer};
+
+#ifdef LIBPQ_HAS_ASYNC_CANCEL
+    // A cancel request in flight on its own connection (cancel()): the loop
+    // drives it, a timer gives it up. Owned here, so that the pool's end ends
+    // it as well.
+    struct CancelRequest
+    {
+        std::unique_ptr<PGcancelConn, decltype(&PQcancelFinish)> conn{nullptr, &PQcancelFinish};
+        uint64_t           query_id{0};
+        std::string        tag;     // conn_tag() of the connection the query runs on
+        PgConnection*      target{nullptr};  // that connection; nullptr once it is replaced
+        int                fd{-1};  // registered with the loop, -1 — not
+        EventLoop::TimerId timer{EventLoop::kInvalidTimer};
+        std::chrono::seconds limit{0};
+    };
+    std::vector<std::unique_ptr<CancelRequest>> cancels_;
+
+    /// Start a cancel request for the query on @p conn. False — not started.
+    bool start_cancel(PgConnection& conn, uint64_t id, std::string& error);
+    /// The cancel connection's socket is ready for what PQcancelPoll asked.
+    void on_cancel_io(CancelRequest* cr);
+    /// Done, failed or given up: taken off the loop and destroyed, its
+    /// connection free to take queries again, logged.
+    /// @p timed_out — given up by its timer.
+    void end_cancel(CancelRequest* cr, bool ok, std::string_view error, bool timed_out = false);
+    /// Taken off the loop and destroyed, nothing else.
+    void drop_cancel(CancelRequest* cr) noexcept;
+#endif
 
     void record_connect_success();
 
