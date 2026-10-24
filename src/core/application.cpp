@@ -1148,7 +1148,7 @@ void Application::single_run()
     loop.add_signal(SIGHUP, [this](const signalfd_siginfo&) {
         // During the stop (the loop runs again to finish the work in flight)
         // a reload would have the modules reconfigure and start anew.
-        if (http_stopping_ || module_manager_.stopping_started())
+        if (http_stopping_ || module_manager_.stopped())
         {
             logger_->notice("SIGHUP ignored — the process is stopping");
             return;
@@ -2492,9 +2492,8 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
 
                                             if (!module_manager_.execute(req, resp))
                                             {
-                                                // Modules stopped (a request read after the time to
-                                                // finish ran out): not "no such resource" — the
-                                                // client may retry elsewhere.
+                                                // The process is stopping: not "no such resource" —
+                                                // the client may retry elsewhere.
                                                 if (module_manager_.stopped())
                                                     resp.set_status(503, "Service Unavailable")
                                                         .set_header("Retry-After", "1")

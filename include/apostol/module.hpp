@@ -123,11 +123,12 @@ public:
     /// logs in anew and leaves behind exactly the session the drain exists to close.
     void on_stop();
 
-    /// True once quiesce() or on_stop() has run.
-    bool stopped() const noexcept { return stopped_; }
-
-    /// True once stopping() has run.
-    bool stopping_started() const noexcept { return stopping_; }
+    /// True once the stop has begun — stopping(), quiesce() or on_stop() has
+    /// run. Modules read it as "the process is stopping, start nothing new"
+    /// (an answer arriving now must not send a request out), and it has to say
+    /// so from the first moment: execute() goes on serving until quiesce(),
+    /// which comes only after the work in flight is finished.
+    bool stopped() const noexcept { return stopping_ || stopped_; }
 
     /// Comma-separated names of enabled modules (for process title).
     std::string module_names() const;
