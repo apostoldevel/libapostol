@@ -170,7 +170,10 @@ public:
     ///   1. finish — the loop runs until nothing is in flight — no query of a
     ///      pool outstanding, no answer owed on an HTTP connection, @p busy
     ///      false — or until stop_budget() runs out; the modules are intact and
-    ///      execute() still serves the connections already open;
+    ///      execute() still serves the connections already open; every
+    ///      k_shutdown_drain (half the budget, if less) a query with nowhere to
+    ///      run and no reconnect due before the next time is failed
+    ///      (PgPool::fail_stranded);
     ///   2. @p quiesce — execute() refuses from here on;
     ///   3. detach — whatever is still outstanding will not be delivered;
     ///   4. @p on_stop — modules release what their callbacks used;

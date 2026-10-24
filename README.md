@@ -383,7 +383,12 @@ reload:
 2. runs its loop until nothing is in flight — no query of a pool outstanding, no
    answer owed on an HTTP connection, no module reporting `busy()` — or until
    `stop_timeout` less 3.5 s runs out (never under 1.5 s); requests on the
-   connections still open are served meanwhile;
+   connections still open are served meanwhile. Every 1.5 s (half that time,
+   if less) a query with nowhere to run — no connection of its pool is up or
+   connecting, and no reconnect is due within the next 1.5 s — is failed
+   (`not sent: no connection to the database, …`), so that a stop during an
+   outage does not wait out `stop_timeout` and a request behind such a query
+   gets an answer;
 3. then, as before: modules latched, pools detached, `on_stop()`, a last drain
    of what `on_stop()` queued.
 

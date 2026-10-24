@@ -1043,6 +1043,19 @@ bool Application::finish_work(EventLoop& loop,
         return 0;
 #endif
     };
+    auto fail_stranded = [this](std::chrono::milliseconds patience) -> std::size_t {
+#ifdef WITH_POSTGRESQL
+        constexpr std::string_view reason = "no connection to the database, and the process is stopping";
+        std::size_t n = db_pool_ ? db_pool_->fail_stranded(reason, patience) : 0;
+        for (const auto& [name, pool] : named_pools_)
+            if (pool)
+                n += pool->fail_stranded(reason, patience);
+        return n;
+#else
+        (void) patience;
+        return 0;
+#endif
+    };
     auto done = [&] { return queries() == 0 && http_busy() == 0 && !(busy && busy()); };
 
     // Best effort by definition, and every step of it — a module's busy()
@@ -1055,12 +1068,58 @@ bool Application::finish_work(EventLoop& loop,
 
         const auto budget  = stop_budget();
         const auto started = std::chrono::steady_clock::now();
+        const auto elapsed = [&] {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started);
+        };
+
+        // Every `round`, a query with nowhere to run — the database is gone,
+        // no connection is up or connecting, no reconnect due within the next
+        // round — is failed (PgPool::fail_stranded): it would otherwise hold
+        // the stop for the whole budget, and an HTTP request behind it would
+        // get no answer. The first round is the time such a query had before
+        // "process.stop_timeout" existed; at most half the budget, so that an
+        // answer written by its handler still has time to leave. A timer, so
+        // that the handlers run inside run_for() — a stop() from one of them
+        // ends the finish — and so that something wakes the loop: with the
+        // database gone nothing else may, for a minute.
+        const auto round = std::min(std::chrono::milliseconds(k_shutdown_drain), budget / 2);
+        std::size_t failed = 0;
+        // Cancelled on every way out, a throw from run_for() included: the
+        // callback refers to this frame, and drain_db() runs the loop again.
+        struct StrandTimer {
+            EventLoop& loop;
+            EventLoop::TimerId id{EventLoop::kInvalidTimer};
+            ~StrandTimer() {
+                if (id != EventLoop::kInvalidTimer)
+                    try { loop.cancel_timer(id); } catch (...) {}
+            }
+        } strand_timer{loop};
+        try {
+            strand_timer.id = loop.add_timer(round,
+                [&failed, &fail_stranded, round] { failed += fail_stranded(round); });
+        } catch (const std::exception& e) {
+            // Refused by the loop (T789): the finish runs as it did before.
+            if (logger_)
+                logger_->warn("{} shutdown: queries with no connection will not be failed: {}",
+                              name_, e.what());
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() + budget;
         const bool finished = loop.run_for(budget, done);
-        const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - started);
+        // run_for() leaves within a millisecond of its time; earlier than
+        // that, the loop was stopped (stop_signal ignores a second SIGTERM,
+        // something else did not).
+        const bool cut_short = !finished
+            && std::chrono::steady_clock::now() + std::chrono::milliseconds(1) < deadline;
+        const auto took = elapsed();
 
         if (!logger_)
             return finished;
+
+        if (failed > 0)
+            logger_->warn("{} shutdown: {} database {} failed — no connection to the database",
+                          name_, failed, failed == 1 ? "query" : "queries");
 
         if (finished) {
             logger_->notice("{} shutdown: work in flight finished in {} ms",
@@ -1069,12 +1128,12 @@ bool Application::finish_work(EventLoop& loop,
             // The SIGKILL is the master's; what is left here is cut off by
             // detach_db() and on_stop(). Name it, so that a stop timeout too
             // short for the work reads as that in the log. Cut short before the
-            // time — a second SIGTERM stopped the loop — it says so instead.
+            // time — something stopped the loop — it says so instead.
             std::string modules = busy && busy() && busy_names ? busy_names() : std::string{};
             logger_->warn("{} shutdown: work in flight {} {} ms "
                           "(queries: {}, HTTP answers: {}, busy modules: {}) — process.stop_timeout is {} s",
-                          name_, took < budget ? "cut short after" : "did not finish in",
-                          static_cast<long long>(took < budget ? took.count() : budget.count()),
+                          name_, cut_short ? "cut short after" : "did not finish in",
+                          static_cast<long long>(cut_short ? took.count() : budget.count()),
                           queries(), http_busy(), modules.empty() ? "none" : modules,
                           settings_.stop_timeout);
         }

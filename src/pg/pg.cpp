@@ -1743,6 +1743,75 @@ std::size_t PgPool::outstanding() const
     return n;
 }
 
+// A Connecting listener counts as up, as healthy_count() counts a Connecting
+// connection: its handshake ends, one way or the other, within the handshake
+// limit.
+bool PgPool::listener_reachable() const
+{
+    return listener_ && listener_->fd() >= 0 && !listener_is_dead();
+}
+
+std::size_t PgPool::fail_stranded(std::string_view reason, std::chrono::milliseconds patience)
+{
+    // A reconnect throttled by the backoff (new_connection, start_listener)
+    // leaves nothing connecting until reconnect_timer_ fires: due within
+    // @p patience, the database may be back by then — a restart of the server
+    // or of the bouncer in front of it — and the query is left to it.
+    const bool reconnect_due = reconnect_timer_ != EventLoop::kInvalidTimer
+        && next_connect_attempt_ <= std::chrono::steady_clock::now() + patience;
+    const bool pool_down     = !reconnect_due && healthy_count() == 0;
+    const bool listener_down = !reconnect_due && !listener_reachable();
+
+    if (!pool_down && !listener_down)
+        return 0;
+
+    // Taken out of the queues first, all of them, before anything that may
+    // throw: a slot left moved-from in queue_ would be a null pointer for
+    // detach() and outstanding(). And a handler run by deliver_lost() below
+    // may execute() again: what it queues is not failed by this call.
+    std::vector<std::unique_ptr<PgQuery>> out;
+    out.reserve((pool_down ? queue_.size() : 0) + (listener_down ? listener_queue_.size() : 0));
+
+    if (pool_down) {
+        for (auto it = queue_.begin(); it != queue_.end();) {
+            if (canceled_ids_.count((*it)->id())) {
+                canceled_ids_.erase((*it)->id());
+                it = queue_.erase(it);
+            } else if ((*it)->detached()) {
+                ++it;
+            } else {
+                out.push_back(std::move(*it));
+                it = queue_.erase(it);
+            }
+        }
+    }
+
+    if (listener_down) {
+        for (auto it = listener_queue_.begin(); it != listener_queue_.end();) {
+            if (it->query->detached()) {
+                ++it;
+            } else {
+                out.push_back(std::move(it->query));
+                it = listener_queue_.erase(it);
+            }
+        }
+    }
+
+    const std::size_t n = out.size();
+    for (auto& q : out) {
+        std::string error = fmt::format("not sent: {}", reason);
+        if (pg_logger_ && !q->quiet())
+            pg_logger_->error("Query {} failed: {}", q->id(), error);
+        PgResult result = PgResult::lost(error);
+        lost_.push_back(Lost{std::move(q), std::move(error), std::move(result)});
+    }
+
+    if (n > 0)
+        deliver_lost();
+
+    return n;
+}
+
 void PgPool::mute_listeners() noexcept
 {
     listeners_muted_ = true;
@@ -2436,8 +2505,10 @@ void PgPool::on_listener_io(uint32_t events)
                 loop_.add_io(listener_->fd(), EPOLLIN, [this](uint32_t ev) {
                     on_listener_io(ev);
                 });
-                // Every new listener names itself first; a statement, because
-                // the connection string may be a URI and cannot simply be
+                // Every new listener names itself ahead of the statements
+                // queued for it — behind its LISTENs, which listener_send_next()
+                // ships before anything queued; a statement, because the
+                // connection string may be a URI and cannot simply be
                 // appended to.
                 if (!listener_name_.empty()) {
                     auto q = std::make_unique<PgQuery>(

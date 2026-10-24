@@ -532,6 +532,18 @@ public:
     /// nobody waits for them, so there is nothing to drain them for.
     std::size_t outstanding() const;
 
+    /// Fail the queries that have nowhere to run — queued on the pool while
+    /// none of its connections is up or connecting, or on the listener while
+    /// it is down — unless a reconnect is due within @p patience. They would
+    /// wait for that reconnect, with the database gone for as long as the
+    /// outage lasts. The caller hears @p reason — on_exception(), or a result
+    /// that is not ok() — as for a query lost with its connection, and before
+    /// this returns. For shutdown, in the finish of the work in flight: a stop
+    /// during an outage would otherwise wait out "process.stop_timeout", and
+    /// an HTTP request behind such a query would get no answer at all.
+    /// Returns how many were failed.
+    std::size_t fail_stranded(std::string_view reason, std::chrono::milliseconds patience);
+
     /// Stop dispatching notifications and LISTEN confirmations, for good: a handler
     /// registered by listen() — before this call or after it — is not called again.
     /// For shutdown, before the drain of work in flight: a NOTIFY is new work, and
@@ -716,6 +728,10 @@ private:
     /// watch's to judge), and false when there is no listener at all (nothing
     /// to restart; see the callers).
     bool listener_is_dead() const;
+
+    /// A listener exists, has a socket and is not dead — connected, or with
+    /// its handshake in flight.
+    bool listener_reachable() const;
 
     void on_listener_io(uint32_t events);
     void send_pending_listens();
