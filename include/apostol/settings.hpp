@@ -97,6 +97,10 @@ struct AppSettings
     std::string pg_conninfo_kernel;
     int         pg_pool_min{1};
     int         pg_pool_max{5};
+    // postgres.stall_timeout — seconds a query in flight may go without a byte
+    // from the server before its connection is dropped (PgPool::set_stall_timeout);
+    // 0 = never.
+    int         pg_stall_timeout{0};
     // postgres.reset — custom session settings ("prefix.name") reset before
     // every pool query (PgPool::set_reset); "all" — RESET ALL; [] — none.
     std::vector<std::string> pg_reset{"current.area"};
@@ -122,6 +126,12 @@ struct AppSettings
 
     // ── Build PG conninfo from JSON config + env vars ───────────────────
     // role: "worker" | "helper" | "kernel"
+    // The TCP keys keepalives_idle, keepalives_interval, keepalives_count and
+    // tcp_user_timeout (libpq's names and units) are taken from
+    // postgres.<role>.<key>, else postgres.<key>, and added to the string —
+    // to an explicit postgres.<role>.conninfo too, unless it sets the key
+    // itself. Not configured — not added. Throws ConfigError for a value that
+    // is not a whole number.
     static std::string build_pg_conninfo(
         const Config& cfg,
         std::string_view role,

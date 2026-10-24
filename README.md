@@ -331,6 +331,41 @@ handshake for good. The pool keeps the limit itself:
   `load_balance_hosts=random` (libpq 16+) makes each attempt pick a host at
   random, so the pool gets through to a live one.
 
+### A server that stops answering
+
+A connection whose peer goes silent — a dropped route, a black hole after a
+failover, no RST — is not broken as far as the client's kernel knows: a query
+in flight waits until the kernel gives up retransmitting (`tcp_retries2`, about
+15 minutes on Linux), and every pool slot it holds waits with it. Two settings,
+both off by default:
+
+- **TCP keys** — `keepalives_idle`, `keepalives_interval`, `keepalives_count`,
+  `tcp_user_timeout`: libpq's own names and units, in `postgres.<key>` for every
+  role or `postgres.<role>.<key>` for one. They are added to the connection
+  string the application builds and to an explicit `postgres.<role>.conninfo`
+  that does not set them itself (as query parameters for a
+  `postgresql://` URI). A value that is not a whole number refuses the file.
+  This is the detector: the kernel drops the connection, libpq reports
+  `Connection timed out`, the query is failed as lost and the pool reconnects.
+  A long statement on a live server is not affected — the server's kernel
+  acknowledges. Example: `"tcp_user_timeout": 10000, "keepalives_idle": 10,
+  "keepalives_interval": 5, "keepalives_count": 3`.
+- **`postgres.stall_timeout`** (seconds, `0` — off) — how long a query in
+  flight may go without a byte from the server. Past it the connection is
+  dropped **without** `PQcancel` (a cancel to a
+  dead address blocks the loop); its query is failed as lost —
+  `Query in flight: no answer from the server in Ns (postgres.stall_timeout),
+  dropping the connection without cancel` in the application's PostgreSQL log
+  (`log.postgres`) — or re-queued if it was not sent whole or may be repeated,
+  and the connection reconnects in its own slot. The LISTEN connection is not
+  watched. A statement that runs longer than the limit without sending
+  anything is dropped too: it is a safety net above the longest statement the
+  application runs, not a statement timeout.
+
+A failed connect moves the backoff (1, 2, 4 … 32 s) one step per round of
+attempts, not per connection: a pool and its listener that meet one dead
+server together count it once.
+
 ## Build (standalone development)
 
 ```bash

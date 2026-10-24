@@ -274,6 +274,18 @@ public:
     /// would drop a connection whose answer is being read right then.
     bool handshake_expired(std::chrono::steady_clock::time_point now);
 
+    /// When the server was last heard from with a query in flight: the moment
+    /// the query went out, then every read that found input. PgPool's stall
+    /// watch (set_stall_timeout()) measures the silence from here.
+    std::chrono::steady_clock::time_point heard() const { return heard_; }
+    void mark_heard(std::chrono::steady_clock::time_point now) { heard_ = now; }
+
+    /// The backoff round this connection's connect or reset attempt belongs
+    /// to (PgPool::record_connect_failure()). Stamped by the pool when the
+    /// attempt starts.
+    std::uint64_t round() const          { return round_; }
+    void          set_round(std::uint64_t r) { round_ = r; }
+
     /// libpq's connection error text — without the error of a quiet statement
     /// that libpq keeps at its head until the next query is sent (see
     /// withhold_last_error()).
@@ -317,6 +329,8 @@ private:
     std::chrono::seconds                  handshake_limit_{0};
     std::chrono::steady_clock::time_point handshake_deadline_{};
     bool                                  handshake_late_{false};  // past the limit at the last tick
+    std::chrono::steady_clock::time_point heard_{};
+    std::uint64_t                         round_{0};
     std::string      conninfo_;
     PgConnState      state_{PgConnState::Connecting};
     PgQuery*         current_query_{nullptr};
@@ -384,6 +398,25 @@ public:
     /// name — two or more dot-separated parts of letters, digits and '_', each
     /// starting with a letter or '_' and at most 63 bytes long.
     static bool valid_reset_name(std::string_view name);
+
+    /// How long a query in flight may go without a byte from the server before
+    /// its connection is given up as dead. Zero (the default) — never.
+    ///
+    /// The silence counts from the moment the query went out and starts again
+    /// with every read that finds input; checked once a second. A connection
+    /// past the limit is dropped without PQcancel — a cancel to a dead address blocks the
+    /// loop. Its query is failed as one lost with its connection ("may or may
+    /// not have been executed"; re-queued if it was not sent whole or is
+    /// PgRetry::if_lost), and the connection reconnects in its own slot. The
+    /// LISTEN connection is not watched.
+    ///
+    /// A statement that legitimately runs longer than the limit without
+    /// sending anything — a report, a heavy function, pg_sleep — is dropped
+    /// too: the limit is a safety net above the longest statement the pool
+    /// runs, not a statement timeout. The kernel-level detectors are the
+    /// connection string's keepalives_* and tcp_user_timeout.
+    void set_stall_timeout(std::chrono::seconds limit) { stall_timeout_ = limit; }
+    std::chrono::seconds stall_timeout() const { return stall_timeout_; }
 
     using QueryId = uint64_t;
 
@@ -516,8 +549,11 @@ private:
     /// Ensure at least min_conns_ healthy connections exist.
     void ensure_min_connections();
 
-    /// Count connections in Ready or Busy state.
+    /// Count connections in Ready, Busy or Connecting state with a socket.
     std::size_t healthy_count() const;
+
+    /// Busy, a stall limit set, and nothing heard for longer than it.
+    bool stalled(const PgConnection& conn, std::chrono::steady_clock::time_point now) const;
 
     /// Format v1-style connection tag: [backend_pid] [fd] [postgresql://user@host:port/dbname]
     std::string conn_tag(const PgConnection& conn) const;
@@ -542,10 +578,12 @@ private:
 
     // Exponential backoff for connect failures: prevents auth-fail / unreachable-host
     // tight loop from hammering PG with retries at full event-loop speed (and
-    // flooding logs).  Counter caps at 6 → max delay 60s.  Cleared on first
-    // successful connect.
+    // flooding logs).  Counter caps at 6 → max delay 32s.  Cleared on first
+    // successful connect. Counted once per round of attempts, not once per
+    // connection (record_connect_failure()).
     std::chrono::steady_clock::time_point next_connect_attempt_{};
     int                                    consecutive_connect_fails_{0};
+    std::uint64_t                          connect_round_{0};
     EventLoop::TimerId                     reconnect_timer_{EventLoop::kInvalidTimer};
 
     // Sent whole, lost with the connection, not to be repeated: waiting for
@@ -562,7 +600,14 @@ private:
     EventLoop::TimerId                     lost_timer_{EventLoop::kInvalidTimer};
 
     void record_connect_success();
-    void record_connect_failure();
+
+    /// A connect or reset attempt of round `round` failed. Only the first
+    /// failure of the current round moves the backoff a step and opens the
+    /// next round; the attempts started alongside it — the rest of the pool,
+    /// the listener — fail into a round already counted and change nothing
+    /// (a pool of five and its listener against one dead server used to
+    /// count six steps for one outage).
+    void record_connect_failure(std::uint64_t round);
 
     /// Arm reconnect_timer_ (if not already armed) to fire once the current
     /// backoff window elapses. The callback restores min_conns_ AND, if a
@@ -588,6 +633,16 @@ private:
     void on_handshake_watch();
     bool handshake_in_flight() const;   // a pool connection or the listener, with a limit
     EventLoop::TimerId handshake_timer_{EventLoop::kInvalidTimer};
+
+    // ── Stall watch (set_stall_timeout()) ─────────────────────────────────────
+    // One one-shot timer, armed when a query goes out and re-armed once a
+    // second while any connection is Busy. Refused by the loop, it is logged,
+    // not thrown; heartbeat() runs the same check.
+    void arm_stall_watch() noexcept;
+    void on_stall_watch();
+    void drop_stalled(std::chrono::steady_clock::time_point now);
+    std::chrono::seconds stall_timeout_{0};
+    EventLoop::TimerId   stall_timer_{EventLoop::kInvalidTimer};
 
     // Pointer set of connections currently registered with EventLoop.
     // Used by on_io to decide whether it's safe to rearm a conn after a

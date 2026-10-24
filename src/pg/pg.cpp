@@ -2,6 +2,7 @@
 #include "apostol/pg_utils.hpp"
 
 #include <fmt/format.h>
+#include <poll.h>
 #include <sys/epoll.h>
 
 #include <algorithm>
@@ -455,6 +456,7 @@ bool PgConnection::send_query(const std::string& sql)
         return false;  // flush error — treat as send failure
     needs_flush_ = (flush_ret == 1);  // 1 = more data to send, need EPOLLOUT
     state_ = PgConnState::Busy;
+    heard_ = std::chrono::steady_clock::now();  // the silence counts from here
     return true;
 }
 
@@ -674,6 +676,8 @@ bool PgPool::send_query(PgConnection& conn, const PgQuery& q)
     const bool sent  = reset ? conn.send_query(reset_sql_ + q.sql())
                              : conn.send_query(q.sql());
     conn.set_reset_results(sent && reset ? reset_count_ : 0);
+    if (sent)
+        arm_stall_watch();
     return sent;
 }
 
@@ -718,6 +722,10 @@ PgPool::~PgPool()
         loop_.cancel_timer(lost_timer_);
         lost_timer_ = EventLoop::kInvalidTimer;
     }
+    if (stall_timer_ != EventLoop::kInvalidTimer) {
+        loop_.cancel_timer(stall_timer_);
+        stall_timer_ = EventLoop::kInvalidTimer;
+    }
 
     if (listener_ && listener_->fd() >= 0) {
         if (pg_logger_)
@@ -755,12 +763,13 @@ void PgPool::new_connection()
     }
 
     auto conn = std::make_unique<PgConnection>(conninfo_);
+    conn->set_round(connect_round_);
     setup_notice_handler(*conn);
 
     if (!conn->connect_start()) {
         if (pg_logger_)
             pg_logger_->error("[0] [-1] [] ConnectException: connect_start failed");
-        record_connect_failure();
+        record_connect_failure(conn->round());
         return;
     }
 
@@ -825,7 +834,7 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                     pg_logger_->error("{} {} left without a socket (was fd={}): {}",
                                      conn_tag(conn), conn.resetting() ? "Reset" : "Connect",
                                      polled_fd, conn.error_message());
-                record_connect_failure();
+                record_connect_failure(conn.round());
                 replace_connection(conn);
                 break;
             }
@@ -842,7 +851,7 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                 if (pg_logger_)
                     pg_logger_->error("{} Connect/Reset failed: {}",
                                      conn_tag(conn), conn.error_message());
-                record_connect_failure();
+                record_connect_failure(conn.round());
                 // Replace this dead connection
                 replace_connection(conn);
             } else {
@@ -880,6 +889,11 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
             break;
 
         case PgConnState::Busy: {
+            // Input is a sign of life, whatever it turns out to be: the stall
+            // watch (set_stall_timeout()) counts the silence from here.
+            if (events & EPOLLIN)
+                conn.mark_heard(std::chrono::steady_clock::now());
+
             // Handle pending flush on writable event (Issue #2)
             if ((events & EPOLLOUT) && conn.needs_flush()) {
                 if (conn.flush()) {
@@ -1303,6 +1317,7 @@ bool PgPool::try_reconnect(PgConnection& conn)
     }
 
     int new_fd = conn.fd();
+    conn.set_round(connect_round_);
 
     if (pg_logger_)
         pg_logger_->notice("{} Reconnecting (reset_start)...", conn_tag(conn));
@@ -1525,16 +1540,24 @@ void PgPool::record_connect_success()
     next_connect_attempt_      = {};
 }
 
-void PgPool::record_connect_failure()
+void PgPool::record_connect_failure(std::uint64_t round)
 {
     using namespace std::chrono;
+    // Started before the last counted failure: the outage this attempt met has
+    // been counted already, and its window is running. A round is "the attempts
+    // started at once" — ensure_min_connections() opening the pool, the
+    // reconnect timer restoring pool and listener together — so one dead server
+    // costs one step however many connections met it.
+    if (round != connect_round_)
+        return;
+    ++connect_round_;
     // Already throttled: this failure is a fresh attempt that fired after a
     // previous backoff expired.  Bump the counter, but cap at 6 so the
     // window doesn't grow without bound.  Without the cap, repeated auth
     // failures would push the next attempt centuries into the future.
     if (consecutive_connect_fails_ < 6)
         consecutive_connect_fails_++;
-    int delay_sec = 1 << (consecutive_connect_fails_ - 1);  // 1, 2, 4, 8, 16, 32, 64
+    int delay_sec = 1 << (consecutive_connect_fails_ - 1);  // 1, 2, 4, 8, 16, 32 (the cap of 6)
     if (delay_sec > 60) delay_sec = 60;
     next_connect_attempt_ = steady_clock::now() + seconds(delay_sec);
 }
@@ -1628,7 +1651,7 @@ void PgPool::on_handshake_watch()
         if (pg_logger_)
             pg_logger_->error("{} Connect/Reset failed: handshake not finished in {}s",
                              conn_tag(*c), c->handshake_limit().count());
-        record_connect_failure();
+        record_connect_failure(c->round());
         replace_connection(*c);
     }
 
@@ -1638,10 +1661,10 @@ void PgPool::on_handshake_watch()
         if (pg_logger_)
             pg_logger_->error("{} Listener Error: handshake not finished in {}s",
                              conn_tag(*listener_), listener_->handshake_limit().count());
+        record_connect_failure(listener_->round());
         if (listener_->fd() >= 0)
             loop_.remove_io(listener_->fd());
         listener_.reset();
-        record_connect_failure();
         schedule_reconnect_timer();
     }
 
@@ -1702,6 +1725,11 @@ void PgPool::detach() noexcept
 
 std::size_t PgPool::healthy_count() const
 {
+    // A Busy connection past the stall limit is still counted: drop_stalled()
+    // gives it up within a second and reconnects it in its own slot. Counted
+    // out, it made every ensure_min_connections() in that second open a second
+    // connection for the same slot — kept for good once the first recovered, as
+    // the pool never shrinks.
     std::size_t count = 0;
     for (const auto& c : conns_) {
         auto s = c->state();
@@ -1710,6 +1738,112 @@ std::size_t PgPool::healthy_count() const
             count++;
     }
     return count;
+}
+
+bool PgPool::stalled(const PgConnection& conn, std::chrono::steady_clock::time_point now) const
+{
+    return stall_timeout_.count() > 0
+        && conn.state() == PgConnState::Busy
+        && now - conn.heard() > stall_timeout_;
+}
+
+void PgPool::arm_stall_watch() noexcept
+{
+    if (stall_timeout_.count() <= 0 || stall_timer_ != EventLoop::kInvalidTimer)
+        return;
+
+    // As arm_handshake_watch(): a timer the loop refuses fails no query;
+    // heartbeat() runs the same check, and the next query sent arms it again.
+    try {
+        stall_timer_ = loop_.add_timer(std::chrono::seconds(1),
+            [this] { on_stall_watch(); },
+            /*repeat=*/false);
+    } catch (const std::exception& e) {
+        if (pg_logger_) {
+            try {
+                pg_logger_->error("PgPool: stall watch not armed: {}", e.what());
+            } catch (...) {}
+        }
+    } catch (...) {
+        if (pg_logger_) {
+            try {
+                pg_logger_->error("PgPool: stall watch not armed: unknown exception");
+            } catch (...) {}
+        }
+    }
+}
+
+void PgPool::on_stall_watch()
+{
+    stall_timer_ = EventLoop::kInvalidTimer;
+
+    // Re-armed before the check: a throw out of the drop below (a reconnect the
+    // loop refuses) leaves the loop, and the watch must outlive it.
+    if (std::any_of(conns_.begin(), conns_.end(),
+                    [](const std::unique_ptr<PgConnection>& c) {
+                        return c->state() == PgConnState::Busy;
+                    }))
+        arm_stall_watch();
+
+    drop_stalled(std::chrono::steady_clock::now());
+}
+
+void PgPool::drop_stalled(std::chrono::steady_clock::time_point now)
+{
+    if (stall_timeout_.count() <= 0)
+        return;
+
+    // Collected first: replace_connection() erases from conns_ and appends.
+    std::vector<PgConnection*> silent;
+    for (const auto& c : conns_)
+        if (stalled(*c, now))
+            silent.push_back(c.get());
+
+    bool dropped = false;
+
+    for (PgConnection* c : silent) {
+        // Input waiting on the socket is an answer this loop has not read yet —
+        // after a stall of the loop itself, the timer and the answer arrive in
+        // one wake-up. Not judged; on_io() reads it.
+        if (c->fd() >= 0) {
+            pollfd p{c->fd(), POLLIN, 0};
+            if (::poll(&p, 1, 0) > 0) {
+                c->mark_heard(now);
+                continue;
+            }
+        }
+
+        const auto reason = fmt::format(
+            "no answer from the server in {}s (postgres.stall_timeout)", stall_timeout_.count());
+        if (pg_logger_)
+            pg_logger_->error("{} Query in flight: {}, dropping the connection without cancel",
+                             conn_tag(*c), reason);
+
+        // No PQcancel: it connects to the server synchronously, and an address
+        // that has stopped answering holds the loop for as long as the kernel
+        // tries. The session, if it is still alive over there, ends when
+        // the server notices the socket gone.
+        fail_inflight_query(*c, reason);
+        if (!try_reconnect(*c))
+            replace_connection(*c);
+        dropped = true;
+    }
+
+    // A query taken back above (not sent whole, PgRetry::if_lost) is in the
+    // queue, and the connection it came off is reconnecting to a peer that has
+    // probably gone: hand it to an idle one now rather than at the next
+    // heartbeat(). Collected first — dispatch_queue() may reset a connection.
+    if (dropped && !queue_.empty()) {
+        std::vector<PgConnection*> idle;
+        for (const auto& c : conns_)
+            if (c->state() == PgConnState::Ready)
+                idle.push_back(c.get());
+        for (PgConnection* c : idle) {
+            if (queue_.empty())
+                break;
+            dispatch_queue(*c);
+        }
+    }
 }
 
 void PgPool::heartbeat()
@@ -1750,6 +1884,10 @@ void PgPool::heartbeat()
         fail_inflight_query(*c, "connection lost");
         replace_connection(*c);
     }
+
+    // A query in flight the server has gone silent on — the stall watch's
+    // check, here as well for a watch the loop refused to arm.
+    drop_stalled(std::chrono::steady_clock::now());
 
     // Ensure min_conns
     ensure_min_connections();
@@ -1862,19 +2000,20 @@ void PgPool::start_listener()
     }
 
     listener_ = std::make_unique<PgConnection>(conninfo_);
+    listener_->set_round(connect_round_);
     ++listener_gen_;
     setup_notice_handler(*listener_);
 
     if (!listener_->connect_start()) {
         if (pg_logger_)
             pg_logger_->error("[0] [-1] [] ConnectException: listener connect_start failed");
+        record_connect_failure(listener_->round());
         listener_.reset();
         // Without this, a listener that fails synchronously at startup (e.g.
         // pgbouncer/postgres not yet accepting) is abandoned forever: nothing
         // else ever calls start_listener() again for it, since the one-shot
         // init_listen() caller only retries on ITS OWN query failing, not on
         // the listener connection specifically.
-        record_connect_failure();
         schedule_reconnect_timer();
         return;
     }
@@ -2053,8 +2192,8 @@ void PgPool::on_listener_io(uint32_t events)
                 if (pg_logger_)
                     pg_logger_->error("{} Listener left without a socket (was fd={}): {}",
                                      conn_tag(*listener_), polled_fd, listener_->error_message());
+                record_connect_failure(listener_->round());
                 listener_.reset();
-                record_connect_failure();
                 schedule_reconnect_timer();
                 return;
             }
@@ -2070,12 +2209,12 @@ void PgPool::on_listener_io(uint32_t events)
             } else if (ps == PGRES_POLLING_FAILED) {
                 if (pg_logger_)
                     pg_logger_->error("{} Listener Error: {}", conn_tag(*listener_), listener_->error_message());
+                record_connect_failure(listener_->round());
                 loop_.remove_io(listener_->fd());
                 listener_.reset();
                 // pending_listens_ already holds every channel (it's only
                 // cleared once send_pending_listens() actually ships a LISTEN,
                 // which never happened here) — just get a retry scheduled.
-                record_connect_failure();
                 schedule_reconnect_timer();
             } else {
                 // Register for what poll needs next (same as worker connections)

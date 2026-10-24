@@ -6,6 +6,10 @@
 #include <fmt/format.h>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
+#include <string_view>
+#include <utility>
+#include <vector>
 #include <unistd.h>
 
 namespace apostol
@@ -128,6 +132,7 @@ void AppSettings::populate(const Config& cfg)
 
     pg_pool_min = static_cast<int>(cfg.get_int("postgres.pool.min", pg_pool_min));
     pg_pool_max = static_cast<int>(cfg.get_int("postgres.pool.max", pg_pool_max));
+    pg_stall_timeout = static_cast<int>(cfg.get_int("postgres.stall_timeout", pg_stall_timeout));
 
     // Session settings reset before every pool query (PgPool::set_reset).
     // Left out — the default; [] — none. A name that is not one refuses the
@@ -219,10 +224,74 @@ std::string AppSettings::build_pg_conninfo(
         return {};
     };
 
-    // 1. If explicit conninfo string is set, use as-is (backward compat)
+    // The TCP keys: libpq's own names and units, the role's value over
+    // the common one. Without them a peer that stops answering — a black hole
+    // after a failover, a dropped route — holds a connection with a query in
+    // flight until the kernel gives up retransmitting (tcp_retries2, ~15 min).
+    static constexpr std::string_view tcp_keys[] = {
+        "keepalives_idle", "keepalives_interval", "keepalives_count", "tcp_user_timeout"};
+    std::vector<std::pair<std::string_view, std::string>> tcp;
+    for (auto name : tcp_keys) {
+        auto k = key(name);
+        auto v = get_as_string(k);
+        if (v.empty()) {
+            k = fmt::format("postgres.{}", name);
+            v = get_as_string(k);
+        }
+        if (v.empty())
+            continue;   // left out, or "${VAR}" with VAR unset
+        if (v.size() > 9 || v.find_first_not_of("0123456789") != std::string::npos)
+            throw ConfigError(fmt::format("{}: expected a whole number, got '{}'", k, v));
+        tcp.emplace_back(name, std::move(v));
+    }
+
+    // 1. If explicit conninfo string is set, use as-is (backward compat) —
+    //    the TCP keys it does not set itself added.
     auto conninfo = get_as_string(key("conninfo"));
-    if (!conninfo.empty())
+    if (!conninfo.empty()) {
+#ifdef WITH_POSTGRESQL
+        if (tcp.empty())
+            return conninfo;
+        char* err = nullptr;
+        std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> parsed(
+            PQconninfoParse(conninfo.c_str(), &err), &PQconninfoFree);
+        PQconninfoOption* opts = parsed.get();
+        if (!opts) {
+            // Left for libpq to refuse at connect, with its own words.
+            if (err)
+                PQfreemem(err);
+            return conninfo;
+        }
+        auto sets = [opts](std::string_view name) {
+            for (auto* o = opts; o->keyword; ++o)
+                if (name == o->keyword)
+                    return o->val != nullptr;
+            return false;
+        };
+        // A URI takes its keys as query parameters; key=value form, after a space.
+        const bool uri = conninfo.starts_with("postgresql://") || conninfo.starts_with("postgres://");
+        bool query = uri && conninfo.find('?') != std::string::npos;
+        for (const auto& [name, value] : tcp) {
+            if (sets(name))
+                continue;
+            if (uri) {
+                // "…/db?" and "…?a=1&" already end in a separator: libpq
+                // refuses the empty parameter another one would make.
+                if (!query)
+                    conninfo += '?';
+                else if (conninfo.back() != '?' && conninfo.back() != '&')
+                    conninfo += '&';
+                query = true;
+            } else {
+                conninfo += ' ';
+            }
+            conninfo += name;
+            conninfo += '=';
+            conninfo += value;
+        }
+#endif
         return conninfo;
+    }
 
     // 2. Read individual params from JSON config
     auto host     = get_as_string(key("host"));
@@ -286,6 +355,12 @@ std::string AppSettings::build_pg_conninfo(
     if (connect_timeout > 0 && !result.empty())
         append("connect_timeout", std::to_string(connect_timeout));
 
+    // Nothing to connect to — nothing to tune: an empty string means the role
+    // is not configured.
+    if (!result.empty())
+        for (const auto& [name, value] : tcp)
+            append(name, value);
+
     return result;
 }
 
@@ -318,6 +393,10 @@ std::vector<ValidationError> AppSettings::validate() const
     if (leader_interval < 1 || leader_interval > 3600)
         err("process.leader_interval",
             fmt::format("process.leader_interval must be 1..3600 seconds, got {}", leader_interval));
+
+    if (pg_stall_timeout < 0)
+        err("postgres.stall_timeout",
+            fmt::format("postgres.stall_timeout must be 0 (off) or a number of seconds, got {}", pg_stall_timeout));
 
     if (leader && pg_conninfo_helper.empty())
         err("process.leader",
