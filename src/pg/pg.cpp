@@ -623,6 +623,31 @@ bool is_reset_all(std::string_view name)
     return true;
 }
 
+// One step of the pool's own upkeep, run from a timer. The loop catches
+// nothing there: a throw left run() and ended the process — a worker with
+// every connection it served — for one epoll_ctl the kernel refused. The step
+// is caught by itself and logged; the steps after it still run, and what it
+// left undone the next heartbeat does again.
+template <typename Step>
+void upkeep(Logger* log, std::string_view step, Step&& run) noexcept
+{
+    try {
+        run();
+    } catch (...) {
+        if (!log)
+            return;
+        try {
+            try {
+                throw;
+            } catch (const std::exception& e) {
+                log->error("PgPool: {} failed: {} — the next heartbeat retries", step, e.what());
+            } catch (...) {
+                log->error("PgPool: {} failed: unknown exception — the next heartbeat retries", step);
+            }
+        } catch (...) {}
+    }
+}
+
 } // namespace
 
 bool PgPool::valid_reset_name(std::string_view name)
@@ -868,13 +893,16 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
             }
 
             if (ps == PGRES_POLLING_OK) {
+                // Watched first: a connection the loop refuses is replaced as
+                // a failed one, and the log does not call it connected.
+                if (!watch_or_replace(conn, EPOLLIN))
+                    break;
                 if (pg_logger_)
                     pg_logger_->notice("{} {}.",
                                       conn_tag(conn),
                                       conn.resetting() ? "Reconnected" : "Connected");
                 record_connect_success();
-                if (watch_or_replace(conn, EPOLLIN))
-                    dispatch_queue(conn);
+                dispatch_queue(conn);
             } else if (ps == PGRES_POLLING_FAILED) {
                 if (pg_logger_)
                     pg_logger_->error("{} Connect/Reset failed: {}",
@@ -1425,9 +1453,24 @@ void PgPool::dispatch_queue(PgConnection& conn)
     // the loop no longer watches (T607) would leave the rest unsent for good;
     // the server has not got the whole statement, so it has not run it —
     // re-queued as when send_query fails.
+    //
+    // The loop may also refuse the rest outright (epoll out of memory): the
+    // same — before, the throw left the query in flight with its tail unsent,
+    // the server waiting for the rest and the caller for an answer, for good.
     const bool sent = send_query(conn, *raw_q);
-    if (sent && (!conn.needs_flush() || loop_.modify_io(conn.fd(), EPOLLIN | EPOLLOUT)))
-        return;
+    std::string refused;
+    if (sent) {
+        if (!conn.needs_flush())
+            return;
+        try {
+            if (loop_.modify_io(conn.fd(), EPOLLIN | EPOLLOUT))
+                return;
+        } catch (const std::exception& e) {
+            refused = e.what();
+        } catch (...) {
+            refused = "unknown exception";
+        }
+    }
 
     // Taken back and the connection marked before the log line: a throw from
     // the log leaves no query that nothing points at (T650). Re-queue the
@@ -1439,7 +1482,10 @@ void PgPool::dispatch_queue(PgConnection& conn)
     enqueue(std::move(query));
     conn.set_state(PgConnState::Error);
     if (pg_logger_) {
-        if (sent)
+        if (sent && !refused.empty())
+            pg_logger_->error("{} Socket fd={} could not be watched for the rest in dispatch: {}, re-queuing",
+                             conn_tag(conn), conn.fd(), refused);
+        else if (sent)
             pg_logger_->error("{} Socket fd={} is no longer watched in dispatch, re-queuing",
                              conn_tag(conn), conn.fd());
         else
@@ -1576,8 +1622,13 @@ bool PgPool::try_reconnect(PgConnection& conn)
 {
     int old_fd = conn.fd();
 
-    // Attempt async reset (reuses existing PGconn handle — cheapest reconnect)
+    // Attempt async reset (reuses existing PGconn handle — cheapest reconnect).
+    // PQresetStart() closes the old socket whatever it returns: its
+    // registration goes too, or the loop keeps a handler under a number the
+    // next socket may get.
     if (!conn.reset_start()) {
+        if (old_fd >= 0)
+            loop_.remove_io(old_fd);
         if (pg_logger_)
             pg_logger_->error("{} reset_start() failed", conn_tag(conn));
         return false;
@@ -1585,6 +1636,18 @@ bool PgPool::try_reconnect(PgConnection& conn)
 
     int new_fd = conn.fd();
     conn.set_round(connect_round_);
+
+    // Started, and yet no socket: nothing would ever drive the handshake, and
+    // Connecting keeps it counted as healthy for good. Error — the caller
+    // replaces it, or heartbeat() does.
+    if (new_fd < 0) {
+        if (old_fd >= 0)
+            loop_.remove_io(old_fd);
+        conn.set_state(PgConnState::Error);
+        if (pg_logger_)
+            pg_logger_->error("{} reset_start() left no socket", conn_tag(conn));
+        return false;
+    }
 
     if (pg_logger_)
         pg_logger_->notice("{} Reconnecting (reset_start)...", conn_tag(conn));
@@ -1594,8 +1657,7 @@ bool PgPool::try_reconnect(PgConnection& conn)
     // kernel epoll registration is gone.  Always remove + re-add to be safe.
     if (old_fd >= 0)
         loop_.remove_io(old_fd);
-    if (new_fd >= 0)
-        watch(conn, EPOLLIN | EPOLLOUT);
+    watch(conn, EPOLLIN | EPOLLOUT);
     if (conn.handshake_limit().count() > 0)
         arm_handshake_watch();
 
@@ -1631,6 +1693,9 @@ bool PgPool::watch_or_replace(PgConnection& conn, uint32_t events)
         if (pg_logger_)
             pg_logger_->error("{} Socket fd={} could not be watched: {}, replacing",
                              conn_tag(conn), conn.fd(), e.what());
+        // A failed connection: the replacement waits out the backoff, or a
+        // loop that goes on refusing is asked again at event-loop speed.
+        record_connect_failure(conn.round());
         replace_connection(conn);
         return false;
     }
@@ -1763,13 +1828,38 @@ void PgPool::fail_inflight_query(PgConnection& conn, std::string_view reason)
         // execute() can grow conns_ under that walk.
         PgResult result = PgResult::lost(error);
         lost_.push_back(Lost{std::move(owned), std::move(error), std::move(result)});
+        arm_lost_delivery();
+    }
+}
 
-        if (lost_timer_ == EventLoop::kInvalidTimer)
-            lost_timer_ = loop_.add_timer(std::chrono::milliseconds(1),
-                [this] {
-                    lost_timer_ = EventLoop::kInvalidTimer;
-                    deliver_lost();
-                }, /*repeat=*/false);
+void PgPool::arm_lost_delivery() noexcept
+{
+    if (lost_.empty() || lost_timer_ != EventLoop::kInvalidTimer)
+        return;
+
+    // Refused, the loss stays in lost_ and heartbeat() arms it again. Thrown
+    // from here, it left the pool's own handling of the loss half done — out
+    // of heartbeat(), out of the loop — and the caller was never told.
+    try {
+        lost_timer_ = loop_.add_timer(std::chrono::milliseconds(1),
+            [this] {
+                lost_timer_ = EventLoop::kInvalidTimer;
+                deliver_lost();
+            }, /*repeat=*/false);
+    } catch (const std::exception& e) {
+        if (pg_logger_) {
+            try {
+                pg_logger_->error("PgPool: {} lost query(ies) not delivered yet: {} — the next heartbeat retries",
+                                  lost_.size(), e.what());
+            } catch (...) {}
+        }
+    } catch (...) {
+        if (pg_logger_) {
+            try {
+                pg_logger_->error("PgPool: {} lost query(ies) not delivered yet: unknown exception — the next heartbeat retries",
+                                  lost_.size());
+            } catch (...) {}
+        }
     }
 }
 
@@ -1887,12 +1977,12 @@ void PgPool::schedule_reconnect_timer()
     reconnect_timer_ = loop_.add_timer(delay,
         [this] {
             reconnect_timer_ = EventLoop::kInvalidTimer;
-            ensure_min_connections();
+            upkeep(pg_logger_, "reconnect", [this] { ensure_min_connections(); });
             // listener_ may have died on the same outage that triggered this
             // timer (or failed independently at startup, see start_listener());
             // restart it if there's still something to LISTEN for.
             if (!listener_ && wants_listener())
-                start_listener();
+                upkeep(pg_logger_, "listener reconnect", [this] { start_listener(); });
         },
         /*repeat=*/false);
 }
@@ -1951,20 +2041,15 @@ void PgPool::on_handshake_watch()
             pg_logger_->error("{} Connect/Reset failed: handshake not finished in {}s",
                              conn_tag(*c), c->handshake_limit().count());
         record_connect_failure(c->round());
-        replace_connection(*c);
+        upkeep(pg_logger_, "replacing a connection past its handshake limit",
+               [this, c] { replace_connection(*c); });
     }
 
-    // As the FAILED branch of on_listener_io: nothing was shipped during the
-    // handshake, so pending_listens_ still holds every channel.
     if (listener_ && listener_->handshake_expired(now)) {
         if (pg_logger_)
             pg_logger_->error("{} Listener Error: handshake not finished in {}s",
                              conn_tag(*listener_), listener_->handshake_limit().count());
-        record_connect_failure(listener_->round());
-        if (listener_->fd() >= 0)
-            loop_.remove_io(listener_->fd());
-        listener_.reset();
-        schedule_reconnect_timer();
+        abandon_listener(/*watched=*/true);
     }
 
     if (handshake_in_flight())
@@ -2231,7 +2316,7 @@ void PgPool::on_stall_watch()
                     }))
         arm_stall_watch();
 
-    drop_stalled(std::chrono::steady_clock::now());
+    upkeep(pg_logger_, "stall check", [this] { drop_stalled(std::chrono::steady_clock::now()); });
 }
 
 void PgPool::drop_stalled(std::chrono::steady_clock::time_point now)
@@ -2294,21 +2379,27 @@ void PgPool::drop_stalled(std::chrono::steady_clock::time_point now)
 
 void PgPool::heartbeat()
 {
+    // Every step below on its own (upkeep): heartbeat() runs from a timer, and
+    // a throw out of any of them — a socket or a timer the loop refuses — left
+    // the loop and ended the worker, the listener check at the end skipped.
+
     // Check each connection's actual PQstatus (not cached state_)
-    for (auto& c : conns_) {
-        if (c->state() == PgConnState::Ready || c->state() == PgConnState::Busy) {
-            if (!c->connected()) {
-                if (pg_logger_)
-                    pg_logger_->error("{} CONNECTION_BAD detected in heartbeat, reconnecting",
-                                     conn_tag(*c));
-                fail_inflight_query(*c, "connection lost");
-                if (!try_reconnect(*c)) {
-                    replace_connection(*c);
-                    break;  // conns_ was modified, restart on next heartbeat
+    upkeep(pg_logger_, "heartbeat: connection check", [this] {
+        for (auto& c : conns_) {
+            if (c->state() == PgConnState::Ready || c->state() == PgConnState::Busy) {
+                if (!c->connected()) {
+                    if (pg_logger_)
+                        pg_logger_->error("{} CONNECTION_BAD detected in heartbeat, reconnecting",
+                                         conn_tag(*c));
+                    fail_inflight_query(*c, "connection lost");
+                    if (!try_reconnect(*c)) {
+                        replace_connection(*c);
+                        break;  // conns_ was modified, restart on next heartbeat
+                    }
                 }
             }
         }
-    }
+    });
 
     // A connection still in Error here has nothing left to drive it: every
     // path that sets Error goes on at once to try_reconnect() or
@@ -2319,24 +2410,27 @@ void PgPool::heartbeat()
     // or the loop does not watch it. Collected first — replace_connection()
     // erases from conns_. A query still on it is failed as lost, not dropped
     // with it — none is today, every path takes it off first.
-    std::vector<PgConnection*> dead;
-    for (const auto& c : conns_)
-        if (c->state() == PgConnState::Error)
-            dead.push_back(c.get());
-    for (PgConnection* c : dead) {
-        if (pg_logger_)
-            pg_logger_->error("{} Left in Error with nothing to drive it, replacing",
-                             conn_tag(*c));
-        fail_inflight_query(*c, "connection lost");
-        replace_connection(*c);
-    }
+    upkeep(pg_logger_, "heartbeat: replacing connections left in Error", [this] {
+        std::vector<PgConnection*> dead;
+        for (const auto& c : conns_)
+            if (c->state() == PgConnState::Error)
+                dead.push_back(c.get());
+        for (PgConnection* c : dead) {
+            if (pg_logger_)
+                pg_logger_->error("{} Left in Error with nothing to drive it, replacing",
+                                 conn_tag(*c));
+            fail_inflight_query(*c, "connection lost");
+            replace_connection(*c);
+        }
+    });
 
     // A query in flight the server has gone silent on — the stall watch's
     // check, here as well for a watch the loop refused to arm.
-    drop_stalled(std::chrono::steady_clock::now());
+    upkeep(pg_logger_, "heartbeat: stall check",
+           [this] { drop_stalled(std::chrono::steady_clock::now()); });
 
     // Ensure min_conns
-    ensure_min_connections();
+    upkeep(pg_logger_, "heartbeat: minimum connections", [this] { ensure_min_connections(); });
 
     // A handshake in flight — the listener's included — whose watch the loop
     // refused (arm_handshake_watch) gets it now; already armed, this does
@@ -2345,10 +2439,15 @@ void PgPool::heartbeat()
         arm_handshake_watch();
 
     // Drain queue if there are ready connections
-    for (auto& c : conns_) {
-        if (c->state() == PgConnState::Ready && !queue_.empty())
-            dispatch_queue(*c);
-    }
+    upkeep(pg_logger_, "heartbeat: queue", [this] {
+        for (auto& c : conns_) {
+            if (c->state() == PgConnState::Ready && !queue_.empty())
+                dispatch_queue(*c);
+        }
+    });
+
+    // A loss whose delivery the loop refused to arm (arm_lost_delivery).
+    arm_lost_delivery();
 
     // The listener lives outside conns_, so the loop above never saw it — and
     // everything else that could notice its death is event-driven. When
@@ -2360,16 +2459,18 @@ void PgPool::heartbeat()
     // It matters most where nobody is watching. A channel that is quiet by
     // design (a vessel at sea) produces no events to ride on, and "no
     // notifications" is indistinguishable from "no subscription".
-    if (listener_) {
-        if (listener_is_dead())
-            restart_listener("heartbeat found the listener dead");
-    } else if (wants_listener()) {
-        // Subscriptions or listener statements outstanding and no listener object at all.
-        if (pg_logger_)
-            pg_logger_->error("PgPool: {} LISTEN channel(s), {} listener statement(s) with no listener — restarting",
-                             notify_handlers_.size(), listener_queue_.size());
-        start_listener();
-    }
+    upkeep(pg_logger_, "heartbeat: listener check", [this] {
+        if (listener_) {
+            if (listener_is_dead())
+                restart_listener("heartbeat found the listener dead");
+        } else if (wants_listener()) {
+            // Subscriptions or listener statements outstanding and no listener object at all.
+            if (pg_logger_)
+                pg_logger_->error("PgPool: {} LISTEN channel(s), {} listener statement(s) with no listener — restarting",
+                                 notify_handlers_.size(), listener_queue_.size());
+            start_listener();
+        }
+    });
 }
 
 // ── PgPool — LISTEN / NOTIFY ──────────────────────────────────────────────────
@@ -2548,13 +2649,7 @@ void PgPool::fail_listener_query(std::string_view reason)
     // pool's own handling of the loss.
     PgResult result = PgResult::lost(error);
     lost_.push_back(Lost{std::move(listener_query_), std::move(error), std::move(result)});
-
-    if (lost_timer_ == EventLoop::kInvalidTimer)
-        lost_timer_ = loop_.add_timer(std::chrono::milliseconds(1),
-            [this] {
-                lost_timer_ = EventLoop::kInvalidTimer;
-                deliver_lost();
-            }, /*repeat=*/false);
+    arm_lost_delivery();
 }
 
 void PgPool::arm_listener_answer(std::chrono::seconds limit)
@@ -2622,8 +2717,12 @@ void PgPool::start_listener()
     // Honour the same backoff window as the regular pool — an unreachable
     // postgres/pgbouncer shouldn't be hammered by a second, independent
     // retry loop running at full event-loop speed on top of the pool's own.
+    //
+    // Throws nothing (but bad_alloc): it is called from listen() — a module's
+    // on_start — and from timers, and every refusal here is the pool's to
+    // retry; the channels stay in the registry either way.
     if (steady_clock::now() < next_connect_attempt_) {
-        schedule_reconnect_timer();
+        upkeep(pg_logger_, "listener reconnect", [this] { schedule_reconnect_timer(); });
         return;
     }
 
@@ -2635,26 +2734,58 @@ void PgPool::start_listener()
     if (!listener_->connect_start()) {
         if (pg_logger_)
             pg_logger_->error("[0] [-1] [] ConnectException: listener connect_start failed");
-        record_connect_failure(listener_->round());
-        listener_.reset();
         // Without this, a listener that fails synchronously at startup (e.g.
         // pgbouncer/postgres not yet accepting) is abandoned forever: nothing
         // else ever calls start_listener() again for it, since the one-shot
         // init_listen() caller only retries on ITS OWN query failing, not on
         // the listener connection specifically.
-        schedule_reconnect_timer();
+        abandon_listener(/*watched=*/false);
         return;
     }
 
     if (pg_logger_)
         pg_logger_->debug("{} Status: LISTENER CONNECTION_STARTED", conn_tag(*listener_));
 
-    int fd = listener_->fd();
-    loop_.add_io(fd, EPOLLIN | EPOLLOUT, [this](uint32_t events) {
-        on_listener_io(events);
-    });
+    if (!watch_listener(EPOLLIN | EPOLLOUT)) {
+        abandon_listener(/*watched=*/false);
+        return;
+    }
     if (listener_->handshake_limit().count() > 0)
         arm_handshake_watch();
+}
+
+bool PgPool::watch_listener(uint32_t events)
+{
+    // A listener the loop does not watch hears nothing, and nothing tells: in
+    // a handshake it stays Connecting — handshake_expired() keeps moving the
+    // deadline of a connect in flight — and connected, it is not dead to
+    // listener_is_dead(). Every channel was deaf for good, without a line.
+    try {
+        loop_.add_io(listener_->fd(), events, [this](uint32_t ev) { on_listener_io(ev); });
+        return true;
+    } catch (const std::exception& e) {
+        if (pg_logger_)
+            pg_logger_->error("{} Listener socket fd={} could not be watched: {}, replacing",
+                             conn_tag(*listener_), listener_->fd(), e.what());
+    } catch (...) {
+        if (pg_logger_)
+            pg_logger_->error("{} Listener socket fd={} could not be watched: unknown exception, replacing",
+                             conn_tag(*listener_), listener_->fd());
+    }
+    return false;
+}
+
+void PgPool::abandon_listener(bool watched)
+{
+    // A listener that never got as far as a LISTEN: pending_listens_ still
+    // holds every channel (it is emptied only when send_pending_listens()
+    // ships them), so the next one subscribes them all. Counted as a failed
+    // connection — the next attempt waits out the backoff.
+    record_connect_failure(listener_->round());
+    if (watched && listener_->fd() >= 0)
+        loop_.remove_io(listener_->fd());
+    listener_.reset();
+    upkeep(pg_logger_, "listener reconnect", [this] { schedule_reconnect_timer(); });
 }
 
 bool PgPool::listener_is_dead() const
@@ -2824,20 +2955,21 @@ void PgPool::on_listener_io(uint32_t events)
                 if (pg_logger_)
                     pg_logger_->error("{} Listener left without a socket (was fd={}): {}",
                                      conn_tag(*listener_), polled_fd, listener_->error_message());
-                record_connect_failure(listener_->round());
-                listener_.reset();
-                schedule_reconnect_timer();
+                abandon_listener(/*watched=*/false);
                 return;
             }
 
             if (ps == PGRES_POLLING_OK) {
+                // Watched first, as on_io() does: refused, it is a failed
+                // connection, not a connected one.
+                if (!watch_listener(EPOLLIN)) {
+                    abandon_listener(/*watched=*/false);
+                    return;
+                }
                 if (pg_logger_)
                     pg_logger_->notice("{} Listener Connected.", conn_tag(*listener_));
                 listener_probed_ = false;
                 listener_waited_ = false;
-                loop_.add_io(listener_->fd(), EPOLLIN, [this](uint32_t ev) {
-                    on_listener_io(ev);
-                });
                 // Every new listener names itself ahead of the statements
                 // queued for it — behind its LISTENs, which listener_send_next()
                 // ships before anything queued; a statement, because the
@@ -2852,21 +2984,16 @@ void PgPool::on_listener_io(uint32_t events)
             } else if (ps == PGRES_POLLING_FAILED) {
                 if (pg_logger_)
                     pg_logger_->error("{} Listener Error: {}", conn_tag(*listener_), listener_->error_message());
-                record_connect_failure(listener_->round());
-                loop_.remove_io(listener_->fd());
-                listener_.reset();
-                // pending_listens_ already holds every channel (it's only
-                // cleared once send_pending_listens() actually ships a LISTEN,
-                // which never happened here) — just get a retry scheduled.
-                schedule_reconnect_timer();
+                abandon_listener(/*watched=*/true);
             } else {
                 // Register for what poll needs next (same as worker connections)
                 uint32_t want = (ps == PGRES_POLLING_READING) ? EPOLLIN
                               : (ps == PGRES_POLLING_WRITING) ? EPOLLOUT
                               : (EPOLLIN | EPOLLOUT);
-                loop_.add_io(listener_->fd(), want, [this](uint32_t ev) {
-                    on_listener_io(ev);
-                });
+                if (!watch_listener(want)) {
+                    abandon_listener(/*watched=*/false);
+                    return;
+                }
             }
             break;
         }

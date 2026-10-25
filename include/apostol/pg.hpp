@@ -490,7 +490,9 @@ public:
     /// Call periodically (e.g. every 60s from module heartbeat).
     /// Checks connection health, reconnects dead connections, replaces those
     /// left in Error with nothing to drive them, restores min_conns, and arms
-    /// the handshake watch if a handshake in flight has none.
+    /// the handshake watch if a handshake in flight has none. Does not throw
+    /// on a refusal of the loop (a socket or a timer it cannot take): a step
+    /// that fails is logged, the steps after it still run.
     void heartbeat();
 
     // ── LISTEN / NOTIFY ───────────────────────────────────────────────────────
@@ -652,6 +654,10 @@ private:
     /// Tell the callers in lost_ — from the loop, on a clean stack.
     void deliver_lost();
 
+    /// Arm the timer that runs deliver_lost(), if lost_ holds anything and it
+    /// is not armed. Refused by the loop, it is logged; heartbeat() asks again.
+    void arm_lost_delivery() noexcept;
+
     /// Ensure at least min_conns_ healthy connections exist.
     void ensure_min_connections();
 
@@ -802,6 +808,16 @@ private:
 
     // ── Listener (dedicated connection for LISTEN/NOTIFY) ─────────────────────
     void start_listener();
+
+    /// Register the listener's socket with the loop; false, logged, if the
+    /// loop refuses it.
+    bool watch_listener(uint32_t events);
+
+    /// Drop a listener that failed before its first LISTEN went out — a
+    /// connect or a handshake that failed, a socket the loop refused — and
+    /// schedule the next one. `watched`: its socket may still be registered
+    /// with the loop and is taken off it.
+    void abandon_listener(bool watched);
 
     /// Drop a dead listener and start a fresh one, re-arming every channel
     /// from notify_handlers_. Re-arming reads the REGISTRY, never a literal
