@@ -1814,6 +1814,7 @@ void PgPool::record_connect_success()
     consecutive_connect_fails_ = 0;
     next_connect_attempt_      = {};
     pool_probed_               = false;
+    pool_waited_               = false;
 }
 
 void PgPool::record_connect_failure(std::uint64_t round)
@@ -2034,7 +2035,12 @@ std::size_t PgPool::fail_stranded(std::string_view reason, std::chrono::millisec
     // or of the bouncer in front of it — and the query is left to it.
     // Down counts only with a query waiting on that side: an empty queue has
     // nothing to fail, and must not spend the attempt below — nor drop the
-    // backoff — for a listener nobody is waiting on.
+    // backoff — for a listener nobody is waiting on. Waited for once per
+    // side: the backoff's first steps (1, 2 s) can both fall due within two
+    // rounds of a long stop in a row, and a side that waited already attempts
+    // past the backoff below instead — a fresh outage is failed by the third
+    // call at the latest (Application::finish_work: rounds of a quarter of
+    // the budget).
     const auto sides = [this, patience] {
         const bool reconnect_due = reconnect_timer_ != EventLoop::kInvalidTimer
             && next_connect_attempt_ <= std::chrono::steady_clock::now() + patience;
@@ -2042,8 +2048,16 @@ std::size_t PgPool::fail_stranded(std::string_view reason, std::chrono::millisec
             [](const auto& q) { return !q->detached(); });
         const bool listener_waits = std::any_of(listener_queue_.begin(), listener_queue_.end(),
             [](const auto& e) { return !e.query->detached(); });
-        const bool pool_down     = !reconnect_due && pool_waits && healthy_count() == 0;
-        const bool listener_down = !reconnect_due && listener_waits && !listener_reachable();
+        bool pool_down     = pool_waits && healthy_count() == 0;
+        bool listener_down = listener_waits && !listener_reachable();
+        if (reconnect_due) {
+            const bool pool_waited     = pool_waited_;
+            const bool listener_waited = listener_waited_;
+            pool_waited_     = pool_waited || pool_down;
+            listener_waited_ = listener_waited || listener_down;
+            pool_down     = pool_down && pool_waited;
+            listener_down = listener_down && listener_waited;
+        }
         return std::pair{pool_down, listener_down};
     };
     auto [pool_down, listener_down] = sides();
@@ -2815,6 +2829,7 @@ void PgPool::on_listener_io(uint32_t events)
                 if (pg_logger_)
                     pg_logger_->notice("{} Listener Connected.", conn_tag(*listener_));
                 listener_probed_ = false;
+                listener_waited_ = false;
                 loop_.add_io(listener_->fd(), EPOLLIN, [this](uint32_t ev) {
                     on_listener_io(ev);
                 });

@@ -1081,17 +1081,19 @@ bool Application::finish_work(EventLoop& loop,
         // attempt past the pool's backoff — the server may be back since the
         // last one failed — and a later one fails it once that attempt has
         // failed too. A round is the time such a query had before
-        // "process.stop_timeout" existed; at most a third of the budget, so
-        // that both rounds fit and an answer written by the handler still has
-        // time to leave — a third of the master's SIGKILL time, if that is
-        // shorter than the budget's floor ("process.stop_timeout": 1). A timer, so
+        // "process.stop_timeout" existed; at most a quarter of the budget, so
+        // that three rounds fit and an answer written by the handler still has
+        // time to leave — a quarter of the master's SIGKILL time, if that is
+        // shorter than the budget's floor ("process.stop_timeout": 1). Three:
+        // a reconnect due within the first round is waited for, not replaced,
+        // so a fresh outage costs a round more than an old one. A timer, so
         // that the handlers run inside run_for() — a stop() from one of them
         // ends the finish — and so that something wakes the loop: with the
         // database gone nothing else may, for a minute.
         const auto kill_after = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::seconds(settings_.stop_timeout));
         const auto round = std::min(std::chrono::milliseconds(k_shutdown_drain),
-                                    std::min(budget, kill_after) / 3);
+                                    std::min(budget, kill_after) / 4);
         std::size_t failed = 0;
         // Cancelled on every way out, a throw from run_for() included: the
         // callback refers to this frame, and drain_db() runs the loop again.

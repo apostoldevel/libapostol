@@ -577,7 +577,9 @@ public:
     /// the server answers: the first call that finds a side (pool, listener)
     /// stranded starts an attempt at once instead and fails nothing of it; a
     /// later one fails its queries once that attempt has failed — a server
-    /// back between two attempts is found. Cancelled queries still queued are
+    /// back between two attempts is found. A reconnect due within @p patience
+    /// is waited for once per side; found due again, it is replaced by an
+    /// attempt at once. Cancelled queries still queued are
     /// dropped by every call (their results are discarded anyway). The caller
     /// hears @p reason — on_exception(), or a result that is not ok() — as for
     /// a query lost with its connection, and before
@@ -694,6 +696,11 @@ private:
     // has succeeded since: the next stranded call fails that side's queries.
     bool                                   pool_probed_{false};
     bool                                   listener_probed_{false};
+    // fail_stranded() waited for a reconnect due on the pool's queue (the
+    // listener's) since the last connect of that side: the next one found due
+    // is not waited for.
+    bool                                   pool_waited_{false};
+    bool                                   listener_waited_{false};
 
     // Sent whole, lost with the connection, not to be repeated: waiting for
     // deliver_lost() to tell their callers. Kept here rather than in a bare timer

@@ -171,10 +171,12 @@ public:
     ///      pool outstanding, no answer owed on an HTTP connection, @p busy
     ///      false — or until stop_budget() runs out; the modules are intact and
     ///      execute() still serves the connections already open; every
-    ///      k_shutdown_drain (a third of the budget, if less) a query with
+    ///      k_shutdown_drain (a quarter of the budget or of the master's
+    ///      SIGKILL time, "process.stop_timeout", if less) a query with
     ///      nowhere to run and no reconnect due before the next time is failed
     ///      (PgPool::fail_stranded) — the first such round only reconnects
-    ///      past the backoff, the next one fails what that did not save;
+    ///      past the backoff (or waits, once, for the reconnect due), a later
+    ///      one fails what that did not save;
     ///   2. @p quiesce — execute() refuses from here on;
     ///   3. detach — whatever is still outstanding will not be delivered;
     ///   4. @p on_stop — modules release what their callbacks used;
