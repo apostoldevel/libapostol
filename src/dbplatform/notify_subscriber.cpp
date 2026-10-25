@@ -303,8 +303,8 @@ void NotifySubscriber::take(std::int64_t id)
 
 // ─── The outcome ─────────────────────────────────────────────────────────────
 
-void NotifySubscriber::complete(const NotifyRow& row, std::string result_sql,
-                                DoneHandler on_done, FailHandler on_fail, bool quiet)
+PgPool::QueryId NotifySubscriber::complete(const NotifyRow& row, std::string result_sql,
+                                           DoneHandler on_done, FailHandler on_fail, bool quiet)
 {
     auto it = taken_.find(row.id);
     if (it == taken_.end() || it->second.token != row.token) {
@@ -314,13 +314,13 @@ void NotifySubscriber::complete(const NotifyRow& row, std::string result_sql,
         if (on_fail)
             guarded(log_, options_.channel, "fail handler",
                     [&] { on_fail("the row is not with the module", true); });
-        return;
+        return 0;
     }
     taken_.erase(it);
 
     const std::int64_t id = row.id;
     std::weak_ptr<NotifySubscriber*> w = self_;
-    pool_.execute(ack_sql(row, result_sql),
+    return pool_.execute(ack_sql(row, result_sql),
         [w, id, on_done = std::move(on_done), on_fail = std::move(on_fail)](std::vector<PgResult> results) {
             // Called whether or not the subscriber is still there; logged when it is.
             auto call = [&w](std::string_view what, auto&& f) {

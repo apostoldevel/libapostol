@@ -136,9 +136,19 @@ public:
     /// ; SELECT notify.ack(id, token)" (the ack on a line of its own). @p result_sql may be empty (nothing to
     /// write but the confirmation) and may hold several statements; it must not
     /// commit or open a transaction of its own.
-    void complete(const NotifyRow& row, std::string result_sql,
-                  DoneHandler on_done = {}, FailHandler on_fail = {},
-                  bool quiet = false);
+    ///
+    /// Returns the pool's id of the batch, sent or queued, for
+    /// PgPool::cancel(); 0 when nothing was sent (the row is not with the
+    /// module, @p on_fail is told). A batch canceled before it finished calls
+    /// neither handler, whatever cancel() returned, and whether the row was
+    /// confirmed is not known: a cancel in time left nothing written — the row
+    /// returns by its lease (refuse() is not possible any more) —, one too
+    /// late found the result and the ack committed. cancel() of a batch that
+    /// has finished does nothing (and still returns true): a module that may
+    /// cancel late keeps its own flag, set by the handlers.
+    PgPool::QueryId complete(const NotifyRow& row, std::string result_sql,
+                             DoneHandler on_done = {}, FailHandler on_fail = {},
+                             bool quiet = false);
 
     /// notify.nack: the module will not do it. @p reason goes into the row.
     void refuse(const NotifyRow& row, std::string_view reason);
