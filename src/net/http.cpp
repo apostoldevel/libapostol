@@ -819,6 +819,14 @@ bool HttpConnection::on_readable(RequestHandler handler)
         req.socket_fd = conn_.fd();
         HttpResponse resp;
         answered_in_dispatch_ = false;
+        // The answer to a request that closes the connection says so, whether
+        // it goes out now, later or as a file (RFC 9112 §9.6). Closed after an
+        // answer that does not say it, the connection looks reusable to a
+        // client that pools connections — a proxy with keepalive to its
+        // upstreams decides by the answer — and its next request meets the
+        // FIN. Set before the handler: a file is sent from inside it.
+        if (!req.keep_alive())
+            close_after_send_ = true;
         handler(req, resp);
         // A WebSocket handshake the handler did not take (release_tcp() sets
         // closed_) was refused — 401, 403, 400, now or deferred. Its client
@@ -830,7 +838,7 @@ bool HttpConnection::on_readable(RequestHandler handler)
         // --http2) is an ordinary request answered over HTTP/1.1, and its
         // connection stays open.
         const bool ws_refused = !closed_ && wants_websocket(req);
-        if ((ws_refused || draining_) && !resp.is_deferred())
+        if ((ws_refused || draining_ || close_after_send_) && !resp.is_deferred())
             resp.set_close(true);
         // Skip response if the handler upgraded to WebSocket (release_tcp() was called)
         // or if the handler marked it as deferred (async PG response)
@@ -1069,11 +1077,11 @@ void HttpConnection::send_response(const HttpResponse& resp)
 
     response_started();
 
-    // A process that stops (stop_keep_alive): every answer is the last on the
-    // connection — say so in it, deferred ones included, not only by closing.
-    // Copied only then: the copy carries the body.
+    // The last answer on the connection says so, deferred ones included, not
+    // only by closing: the request asked to close, or the process stops
+    // (stop_keep_alive). Copied only then: the copy carries the body.
     std::string data;
-    if (draining_ && !says_close(resp)) {
+    if ((draining_ || close_after_send_) && !says_close(resp)) {
         HttpResponse last = resp;
         data = last.set_close(true).serialize();
     } else {
@@ -1157,7 +1165,7 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
         "Content-Length: {}\r\n"
         "{}"
         "\r\n",
-        mime_type, file_size, draining_ ? "Connection: close\r\n" : "");
+        mime_type, file_size, (draining_ || close_after_send_) ? "Connection: close\r\n" : "");
 
     // If there are already pending writes, append headers and queue file
     if (write_pos_ < write_buf_.size() || file_fd_ >= 0) {
