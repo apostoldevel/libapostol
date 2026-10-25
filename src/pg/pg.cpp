@@ -1924,10 +1924,9 @@ void PgPool::record_connect_failure(std::uint64_t round)
     // attempt per round every 4 s is nothing to a server and a line or two in
     // the log; a step doubling on to 32 s found a server back after a long
     // outage up to 32 s late — behind a bouncer that has just reopened, all
-    // of that delay is the pool's. Not under twice the shutdown round
-    // (Application::finish_work, 1.5 s): a step within the round keeps a
-    // reconnect due on every round of a stop (fail_stranded), and the stop
-    // waits for it.
+    // of that delay is the pool's. A stop does not hang on the step:
+    // fail_stranded() waits for a reconnect due on each side once
+    // (pool_waited_, listener_waited_), however short the step.
     if (consecutive_connect_fails_ < std::numeric_limits<int>::max())
         consecutive_connect_fails_++;
     const int delay_sec = 1 << (std::min(consecutive_connect_fails_, 3) - 1);
