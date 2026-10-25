@@ -315,10 +315,16 @@ handshake for good. The pool keeps the limit itself:
   `APP_DEFAULT_PG_CONNECT_TIMEOUT` (5 s in the template) — or
   `PGCONNECT_TIMEOUT`, or a service file. Below 2 s it is 2 s, as in libpq. A
   connection string with no `connect_timeout`, or 0 — no limit, as in libpq.
-- It counts from the moment TCP is up, per address, as in libpq. The TCP
-  connect itself is left to the kernel: when it fails — a first address that
-  drops SYN, an IPv6 black hole — libpq moves on to the next address or host,
-  and the clock starts again there.
+- It counts per address, as libpq's does, but twice: once for the TCP
+  connect and once more from the moment TCP is up — one address may take up
+  to twice the limit. A TCP connect past the limit — a first address that
+  drops SYN, an IPv6 black hole, a firewall that drops instead of rejecting —
+  is given up, `Connect/Reset: TCP connect not finished in Ns, the address is
+  given up` or `Listener: TCP connect not finished in Ns, …` in the PostgreSQL
+  log, and libpq moves on to the next address or host, where the clock starts
+  again; after the last one the connect fails as any failed connect, with
+  libpq's text `Connection reset by peer`. Left to the kernel, such a connect
+  took its SYN retries: about two minutes per address on Linux defaults.
 - Past the limit (checked once a second, the verdict on the second check in a
   row) the connection is dropped as a failed connect —
   `Connect/Reset failed: handshake not finished in Ns` or

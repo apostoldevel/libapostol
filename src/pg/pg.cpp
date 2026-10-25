@@ -333,6 +333,7 @@ void PgConnection::start_handshake_clock()
     }
 
     handshake_late_ = false;
+    tcp_given_up_   = false;
     if (timeout <= 0) {
         handshake_limit_    = std::chrono::seconds(0);
         handshake_deadline_ = {};
@@ -350,13 +351,6 @@ bool PgConnection::handshake_expired(std::chrono::steady_clock::time_point now)
     if (state_ != PgConnState::Connecting || handshake_limit_.count() <= 0)
         return false;
 
-    if (conn_ && PQstatus(conn_.get()) == CONNECTION_STARTED) {
-        // TCP connect in flight: the kernel's to bound, not ours (see the header).
-        handshake_deadline_ = now + handshake_limit_;
-        handshake_late_     = false;
-        return false;
-    }
-
     if (now <= handshake_deadline_)
         return false;
 
@@ -367,8 +361,46 @@ bool PgConnection::handshake_expired(std::chrono::steady_clock::time_point now)
     return true;
 }
 
+PgConnection::TcpGiveUp PgConnection::give_up_tcp_connect()
+{
+    if (!conn_ || tcp_given_up_ || PQstatus(conn_.get()) != CONNECTION_STARTED)
+        return TcpGiveUp::none;
+
+    const int fd = PQsocket(conn_.get());
+    if (fd < 0)
+        return TcpGiveUp::none;
+
+    tcp_given_up_ = true;
+
+    // Writable or in error: the connect is over and its event on the way.
+    pollfd pfd{fd, POLLOUT, 0};
+    if (::poll(&pfd, 1, 0) != 0)
+        return TcpGiveUp::finished;
+
+    return ::shutdown(fd, SHUT_RDWR) == 0 ? TcpGiveUp::given_up : TcpGiveUp::none;
+}
+
+// A poll that started a TCP connect — libpq moved on to the next address or
+// host, or opened the same one again (SSL/GSS fallback) — or finished one
+// (TCP is up) starts the clock again: the limit is per connect and per
+// handshake after it (see handshake_expired() in the header).
+void PgConnection::after_poll(bool was_tcp_connect)
+{
+    if (state_ != PgConnState::Connecting)
+        return;
+    if (!was_tcp_connect && PQstatus(conn_.get()) != CONNECTION_STARTED)
+        return;
+
+    tcp_given_up_ = false;
+    if (handshake_limit_.count() > 0) {
+        handshake_deadline_ = std::chrono::steady_clock::now() + handshake_limit_;
+        handshake_late_     = false;
+    }
+}
+
 PostgresPollingStatusType PgConnection::connect_poll()
 {
+    const bool was_tcp_connect = PQstatus(conn_.get()) == CONNECTION_STARTED;
     auto ps = PQconnectPoll(conn_.get());
     last_fd_ = PQsocket(conn_.get());  // docs: re-determine socket after each poll
 
@@ -377,6 +409,7 @@ PostgresPollingStatusType PgConnection::connect_poll()
     else if (ps == PGRES_POLLING_FAILED)
         state_ = PgConnState::Error;
 
+    after_poll(was_tcp_connect);
     return ps;
 }
 
@@ -398,6 +431,7 @@ bool PgConnection::reset_start()
 
 PostgresPollingStatusType PgConnection::reset_poll()
 {
+    const bool was_tcp_connect = PQstatus(conn_.get()) == CONNECTION_STARTED;
     auto ps = PQresetPoll(conn_.get());
     last_fd_ = PQsocket(conn_.get());  // docs: re-determine socket after each poll
 
@@ -406,6 +440,7 @@ PostgresPollingStatusType PgConnection::reset_poll()
     else if (ps == PGRES_POLLING_FAILED)
         state_ = PgConnState::Error;
 
+    after_poll(was_tcp_connect);
     return ps;
 }
 
@@ -2036,6 +2071,14 @@ void PgPool::on_handshake_watch()
             expired.push_back(c.get());
 
     for (PgConnection* c : expired) {
+        // A TCP connect past the limit: libpq gets the next address, or fails
+        // the connect after the last one (on_io), as after a failed connect.
+        const auto tcp = c->give_up_tcp_connect();
+        if (tcp == PgConnection::TcpGiveUp::given_up && pg_logger_)
+            pg_logger_->warn("{} Connect/Reset: TCP connect not finished in {}s, the address is given up",
+                             conn_tag(*c), c->handshake_limit().count());
+        if (tcp != PgConnection::TcpGiveUp::none)
+            continue;
         if (pg_logger_)
             pg_logger_->error("{} Connect/Reset failed: handshake not finished in {}s",
                              conn_tag(*c), c->handshake_limit().count());
@@ -2045,10 +2088,16 @@ void PgPool::on_handshake_watch()
     }
 
     if (listener_ && listener_->handshake_expired(now)) {
-        if (pg_logger_)
-            pg_logger_->error("{} Listener Error: handshake not finished in {}s",
+        const auto tcp = listener_->give_up_tcp_connect();
+        if (tcp == PgConnection::TcpGiveUp::given_up && pg_logger_)
+            pg_logger_->warn("{} Listener: TCP connect not finished in {}s, the address is given up",
                              conn_tag(*listener_), listener_->handshake_limit().count());
-        abandon_listener(/*watched=*/true);
+        if (tcp == PgConnection::TcpGiveUp::none) {
+            if (pg_logger_)
+                pg_logger_->error("{} Listener Error: handshake not finished in {}s",
+                                 conn_tag(*listener_), listener_->handshake_limit().count());
+            abandon_listener(/*watched=*/true);
+        }
     }
 
     if (handshake_in_flight())
@@ -2756,9 +2805,10 @@ void PgPool::start_listener()
 bool PgPool::watch_listener(uint32_t events)
 {
     // A listener the loop does not watch hears nothing, and nothing tells: in
-    // a handshake it stays Connecting — handshake_expired() keeps moving the
-    // deadline of a connect in flight — and connected, it is not dead to
-    // listener_is_dead(). Every channel was deaf for good, without a line.
+    // a handshake it stays Connecting until the handshake watch judges it — a
+    // limit and more later, never without connect_timeout — and connected, it
+    // is not dead to listener_is_dead(). Every channel was deaf for good,
+    // without a line.
     try {
         loop_.add_io(listener_->fd(), events, [this](uint32_t ev) { on_listener_io(ev); });
         return true;

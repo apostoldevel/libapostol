@@ -284,17 +284,43 @@ public:
     /// Asked once per tick of PgPool's handshake watch. True when the
     /// handshake has been past its limit at this tick AND at the previous one.
     ///
-    /// The clock runs only once TCP is up. While PQstatus is
-    /// CONNECTION_STARTED the kernel bounds the connect, and a failed connect
-    /// is what makes libpq move on to the next address or host — cutting it
-    /// short kept every attempt on a first address that drops SYN (an IPv6
-    /// black hole) where libpq alone would have reached the second. Each such
-    /// move starts the clock again: the limit is per address, as in libpq.
+    /// The limit is per TCP connect and per handshake after it, as libpq's own
+    /// connect_timeout is per address: the clock starts again whenever a poll
+    /// starts a TCP connect (the next address or host, or the same one again)
+    /// or finishes one. A connect whose SYN is dropped — a firewall that drops
+    /// instead of rejecting, an IPv6 black hole — is thus judged too; left to
+    /// the kernel, it held the connection in Connecting, counted as up and
+    /// without a line in the log, for the kernel's SYN retries: about two
+    /// minutes per address on Linux defaults. Such a connect is not
+    /// dropped but given up (give_up_tcp_connect()), so that libpq moves on to
+    /// the next address as after a failed connect.
     ///
     /// Two ticks, because after a stalled loop the socket's answer and the
     /// watch's timer come in one epoll batch: a verdict on the first tick
     /// would drop a connection whose answer is being read right then.
     bool handshake_expired(std::chrono::steady_clock::time_point now);
+
+    /// What give_up_tcp_connect() did.
+    enum class TcpGiveUp { none, given_up, finished };
+
+    /// For a handshake handshake_expired() judged, while it is still at its
+    /// TCP connect (PQstatus CONNECTION_STARTED):
+    ///  - given_up — the connect is ended as the kernel ends one that failed:
+    ///    shutdown() of a socket in SYN_SENT aborts the connect and reports it
+    ///    on the socket at once (EPOLLOUT|EPOLLERR, SO_ERROR ECONNRESET). The
+    ///    next poll is libpq's verdict: the next address or host, or
+    ///    PGRES_POLLING_FAILED after the last one;
+    ///  - finished — the connect has finished, or failed, since the last poll
+    ///    (PQstatus moves only when libpq is polled, and its event can come in
+    ///    the same epoll batch as the watch): nothing is done, the poll that
+    ///    event brings judges it — an established connection is not shut down
+    ///    under libpq;
+    ///  - none — not at a TCP connect, or one of the above was answered here
+    ///    and no poll has come since: the caller drops the connection as a
+    ///    failed connect.
+    /// The clock is left as it is: a poll after either of the first two starts
+    /// it again at once, and one that does not come is caught by the next tick.
+    TcpGiveUp give_up_tcp_connect();
 
     /// When the server was last heard from with a query in flight: the moment
     /// the query went out, then every read that found input. PgPool's stall
@@ -353,11 +379,14 @@ private:
 
     /// Start the handshake clock from the options of the live PGconn.
     void start_handshake_clock();
+    /// Start it again, for a poll that started or finished a TCP connect.
+    void after_poll(bool was_tcp_connect);
 
     std::unique_ptr<PGconn, decltype(&PQfinish)> conn_;
     std::chrono::seconds                  handshake_limit_{0};
     std::chrono::steady_clock::time_point handshake_deadline_{};
     bool                                  handshake_late_{false};  // past the limit at the last tick
+    bool                                  tcp_given_up_{false};    // give_up_tcp_connect() acted, no poll since
     std::chrono::steady_clock::time_point heard_{};
     std::uint64_t                         round_{0};
     std::uint64_t                         cancel_pending_{0};
@@ -777,14 +806,16 @@ private:
 
     // ── Handshake watch (T606) ────────────────────────────────────────────────
     // PQconnectPoll keeps no time: a server that takes the TCP connection and
-    // never answers leaves the handshake waiting for an event that will not
-    // come, and heartbeat()/listener_is_dead() leave Connecting alone. One
-    // one-shot timer, armed whenever a handshake with a limit starts and
-    // re-armed while any is in flight, asks each one handshake_expired() once
-    // a second; an expired one is dropped as a failed connect — pool or
-    // listener alike, with the backoff. A timer the loop refuses (T789) is
-    // logged, not thrown: the handshake goes on without its limit until the
-    // next start or heartbeat() arms the watch again.
+    // never answers, or a SYN nobody answers, leaves the handshake waiting for
+    // an event that will not come (or comes when the kernel gives up), and
+    // heartbeat()/listener_is_dead() leave Connecting alone. One one-shot
+    // timer, armed whenever a handshake with a limit starts and re-armed while
+    // any is in flight, asks each one handshake_expired() once a second; an
+    // expired TCP connect is given up and libpq tries the next address
+    // (give_up_tcp_connect()), any other expired handshake is dropped as a
+    // failed connect — pool or listener alike, with the backoff. A timer the
+    // loop refuses (T789) is logged, not thrown: the handshake goes on without
+    // its limit until the next start or heartbeat() arms the watch again.
     void arm_handshake_watch() noexcept;
     void on_handshake_watch();
     bool handshake_in_flight() const;   // a pool connection or the listener, with a limit
