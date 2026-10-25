@@ -684,7 +684,7 @@ private:
 
     // Exponential backoff for connect failures: prevents auth-fail / unreachable-host
     // tight loop from hammering PG with retries at full event-loop speed (and
-    // flooding logs).  Counter caps at 6 → max delay 32s.  Cleared on first
+    // flooding logs).  The delay is 1, 2, then 4 s on (record_connect_failure()).  Cleared on first
     // successful connect. Counted once per round of attempts, not once per
     // connection (record_connect_failure()).
     std::chrono::steady_clock::time_point next_connect_attempt_{};

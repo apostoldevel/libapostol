@@ -1829,13 +1829,18 @@ void PgPool::record_connect_failure(std::uint64_t round)
         return;
     ++connect_round_;
     // Already throttled: this failure is a fresh attempt that fired after a
-    // previous backoff expired.  Bump the counter, but cap at 6 so the
-    // window doesn't grow without bound.  Without the cap, repeated auth
-    // failures would push the next attempt centuries into the future.
-    if (consecutive_connect_fails_ < 6)
+    // previous backoff expired. The counter goes on — the log tells how long
+    // the outage has lasted — the step stops at 4 s: 1, 2, 4, 4, … One
+    // attempt per round every 4 s is nothing to a server and a line or two in
+    // the log; a step doubling on to 32 s found a server back after a long
+    // outage up to 32 s late — behind a bouncer that has just reopened, all
+    // of that delay is the pool's. Not under twice the shutdown round
+    // (Application::finish_work, 1.5 s): a step within the round keeps a
+    // reconnect due on every round of a stop (fail_stranded), and the stop
+    // waits for it.
+    if (consecutive_connect_fails_ < std::numeric_limits<int>::max())
         consecutive_connect_fails_++;
-    int delay_sec = 1 << (consecutive_connect_fails_ - 1);  // 1, 2, 4, 8, 16, 32 (the cap of 6)
-    if (delay_sec > 60) delay_sec = 60;
+    const int delay_sec = 1 << (std::min(consecutive_connect_fails_, 3) - 1);
     next_connect_attempt_ = steady_clock::now() + seconds(delay_sec);
 }
 

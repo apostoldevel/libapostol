@@ -362,9 +362,10 @@ both off by default:
   anything is dropped too: it is a safety net above the longest statement the
   application runs, not a statement timeout.
 
-A failed connect moves the backoff (1, 2, 4 … 32 s) one step per round of
+A failed connect moves the backoff (1, 2, then 4 s on) one step per round of
 attempts, not per connection: a pool and its listener that meet one dead
-server together count it once.
+server together count it once. A server back after a long outage is tried
+within 4 s.
 
 ### Stopping without dropping the work in flight
 
