@@ -573,8 +573,14 @@ public:
     /// none of its connections is up or connecting, or on the listener while
     /// it is down — unless a reconnect is due within @p patience. They would
     /// wait for that reconnect, with the database gone for as long as the
-    /// outage lasts. The caller hears @p reason — on_exception(), or a result
-    /// that is not ok() — as for a query lost with its connection, and before
+    /// outage lasts. The backoff says when the next attempt is, not whether
+    /// the server answers: the first call that finds a side (pool, listener)
+    /// stranded starts an attempt at once instead and fails nothing of it; a
+    /// later one fails its queries once that attempt has failed — a server
+    /// back between two attempts is found. Cancelled queries still queued are
+    /// dropped by every call (their results are discarded anyway). The caller
+    /// hears @p reason — on_exception(), or a result that is not ok() — as for
+    /// a query lost with its connection, and before
     /// this returns. For shutdown, in the finish of the work in flight: a stop
     /// during an outage would otherwise wait out "process.stop_timeout", and
     /// an HTTP request behind such a query would get no answer at all.
@@ -683,6 +689,11 @@ private:
     int                                    consecutive_connect_fails_{0};
     std::uint64_t                          connect_round_{0};
     EventLoop::TimerId                     reconnect_timer_{EventLoop::kInvalidTimer};
+    // fail_stranded() started an attempt past the backoff for the pool's
+    // queue (the listener's), and no connect of the pool (of the listener)
+    // has succeeded since: the next stranded call fails that side's queries.
+    bool                                   pool_probed_{false};
+    bool                                   listener_probed_{false};
 
     // Sent whole, lost with the connection, not to be repeated: waiting for
     // deliver_lost() to tell their callers. Kept here rather than in a bare timer
@@ -728,6 +739,10 @@ private:
 #endif
 
     void record_connect_success();
+
+    /// The attempt the reconnect timer would make, made now: the backoff
+    /// window is dropped (fail_stranded()). Throws what the loop throws.
+    void reconnect_now();
 
     /// A connect or reset attempt of round `round` failed. Only the first
     /// failure of the current round moves the backoff a step and opens the

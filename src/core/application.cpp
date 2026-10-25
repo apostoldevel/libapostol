@@ -1077,13 +1077,21 @@ bool Application::finish_work(EventLoop& loop,
         // no connection is up or connecting, no reconnect due within the next
         // round — is failed (PgPool::fail_stranded): it would otherwise hold
         // the stop for the whole budget, and an HTTP request behind it would
-        // get no answer. The first round is the time such a query had before
-        // "process.stop_timeout" existed; at most half the budget, so that an
-        // answer written by its handler still has time to leave. A timer, so
+        // get no answer. The first round that finds it so only starts an
+        // attempt past the pool's backoff — the server may be back since the
+        // last one failed — and a later one fails it once that attempt has
+        // failed too. A round is the time such a query had before
+        // "process.stop_timeout" existed; at most a third of the budget, so
+        // that both rounds fit and an answer written by the handler still has
+        // time to leave — a third of the master's SIGKILL time, if that is
+        // shorter than the budget's floor ("process.stop_timeout": 1). A timer, so
         // that the handlers run inside run_for() — a stop() from one of them
         // ends the finish — and so that something wakes the loop: with the
         // database gone nothing else may, for a minute.
-        const auto round = std::min(std::chrono::milliseconds(k_shutdown_drain), budget / 2);
+        const auto kill_after = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::seconds(settings_.stop_timeout));
+        const auto round = std::min(std::chrono::milliseconds(k_shutdown_drain),
+                                    std::min(budget, kill_after) / 3);
         std::size_t failed = 0;
         // Cancelled on every way out, a throw from run_for() included: the
         // callback refers to this frame, and drain_db() runs the loop again.

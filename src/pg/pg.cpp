@@ -12,6 +12,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
+#include <utility>
 
 namespace apostol
 {
@@ -1811,6 +1813,7 @@ void PgPool::record_connect_success()
 {
     consecutive_connect_fails_ = 0;
     next_connect_attempt_      = {};
+    pool_probed_               = false;
 }
 
 void PgPool::record_connect_failure(std::uint64_t round)
@@ -1833,6 +1836,23 @@ void PgPool::record_connect_failure(std::uint64_t round)
     int delay_sec = 1 << (consecutive_connect_fails_ - 1);  // 1, 2, 4, 8, 16, 32 (the cap of 6)
     if (delay_sec > 60) delay_sec = 60;
     next_connect_attempt_ = steady_clock::now() + seconds(delay_sec);
+}
+
+void PgPool::reconnect_now()
+{
+    if (reconnect_timer_ != EventLoop::kInvalidTimer) {
+        loop_.cancel_timer(reconnect_timer_);
+        reconnect_timer_ = EventLoop::kInvalidTimer;
+    }
+    next_connect_attempt_ = {};
+    if (pg_logger_)
+        pg_logger_->notice("PgPool: reconnecting now, past the backoff");
+    // What the reconnect timer does, and a listener that died on the outage.
+    ensure_min_connections();
+    if (listener_ && listener_is_dead())
+        restart_listener("down while queries wait for it");
+    else if (!listener_ && wants_listener())
+        start_listener();
 }
 
 void PgPool::schedule_reconnect_timer()
@@ -1996,17 +2016,69 @@ bool PgPool::listener_reachable() const
 
 std::size_t PgPool::fail_stranded(std::string_view reason, std::chrono::milliseconds patience)
 {
+    // A cancelled query is done, whatever the database does: its result is
+    // discarded (cancel()), and dispatch_queue() would only drop it. Dropped
+    // now, so that it holds the finish no longer — outstanding() counts it.
+    for (auto it = queue_.begin(); it != queue_.end();) {
+        if (canceled_ids_.count((*it)->id())) {
+            canceled_ids_.erase((*it)->id());
+            it = queue_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     // A reconnect throttled by the backoff (new_connection, start_listener)
     // leaves nothing connecting until reconnect_timer_ fires: due within
     // @p patience, the database may be back by then — a restart of the server
     // or of the bouncer in front of it — and the query is left to it.
-    const bool reconnect_due = reconnect_timer_ != EventLoop::kInvalidTimer
-        && next_connect_attempt_ <= std::chrono::steady_clock::now() + patience;
-    const bool pool_down     = !reconnect_due && healthy_count() == 0;
-    const bool listener_down = !reconnect_due && !listener_reachable();
+    // Down counts only with a query waiting on that side: an empty queue has
+    // nothing to fail, and must not spend the attempt below — nor drop the
+    // backoff — for a listener nobody is waiting on.
+    const auto sides = [this, patience] {
+        const bool reconnect_due = reconnect_timer_ != EventLoop::kInvalidTimer
+            && next_connect_attempt_ <= std::chrono::steady_clock::now() + patience;
+        const bool pool_waits = std::any_of(queue_.begin(), queue_.end(),
+            [](const auto& q) { return !q->detached(); });
+        const bool listener_waits = std::any_of(listener_queue_.begin(), listener_queue_.end(),
+            [](const auto& e) { return !e.query->detached(); });
+        const bool pool_down     = !reconnect_due && pool_waits && healthy_count() == 0;
+        const bool listener_down = !reconnect_due && listener_waits && !listener_reachable();
+        return std::pair{pool_down, listener_down};
+    };
+    auto [pool_down, listener_down] = sides();
 
     if (!pool_down && !listener_down)
         return 0;
+
+    // Not due within the patience is a schedule, not an answer: the server
+    // may be back since the last attempt failed, and the next one may be up
+    // to the backoff's cap away. A side found stranded for the first time
+    // gets one attempt now, past the backoff, and nothing of it is failed; it
+    // is failed by a later call, once that attempt has failed too (a
+    // handshake in flight counts as up, see healthy_count()). Per side: the
+    // listener connecting says nothing of the pool's connections.
+    const bool pool_probed     = pool_probed_;
+    const bool listener_probed = listener_probed_;
+    bool refused = false;
+    if ((pool_down && !pool_probed) || (listener_down && !listener_probed)) {
+        pool_probed_     = pool_probed || pool_down;
+        listener_probed_ = listener_probed || listener_down;
+        try {
+            reconnect_now();
+        } catch (const std::exception& e) {
+            // Refused by the loop: what it did start is waited for (sides()
+            // below), the rest has nothing to wait for.
+            refused = true;
+            if (pg_logger_)
+                pg_logger_->error("PgPool: reconnect for the stranded queries failed: {}", e.what());
+        }
+        std::tie(pool_down, listener_down) = sides();
+        pool_down     = pool_down && (pool_probed || refused);
+        listener_down = listener_down && (listener_probed || refused);
+        if (!pool_down && !listener_down)
+            return 0;
+    }
 
     // Taken out of the queues first, all of them, before anything that may
     // throw: a slot left moved-from in queue_ would be a null pointer for
@@ -2017,10 +2089,7 @@ std::size_t PgPool::fail_stranded(std::string_view reason, std::chrono::millisec
 
     if (pool_down) {
         for (auto it = queue_.begin(); it != queue_.end();) {
-            if (canceled_ids_.count((*it)->id())) {
-                canceled_ids_.erase((*it)->id());
-                it = queue_.erase(it);
-            } else if ((*it)->detached()) {
+            if ((*it)->detached()) {
                 ++it;
             } else {
                 out.push_back(std::move(*it));
@@ -2745,6 +2814,7 @@ void PgPool::on_listener_io(uint32_t events)
             if (ps == PGRES_POLLING_OK) {
                 if (pg_logger_)
                     pg_logger_->notice("{} Listener Connected.", conn_tag(*listener_));
+                listener_probed_ = false;
                 loop_.add_io(listener_->fd(), EPOLLIN, [this](uint32_t ev) {
                     on_listener_io(ev);
                 });
