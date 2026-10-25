@@ -86,8 +86,9 @@ struct HttpRequest
     /// Case-insensitive header lookup. Returns empty string when not found.
     std::string header(std::string_view name) const;
 
-    /// True for HTTP/1.1 without "Connection: close";
-    /// true for HTTP/1.0 only if "Connection: keep-alive" is set explicitly.
+    /// False when "close" is among the Connection options — every Connection
+    /// field, comma-separated, case-insensitive; otherwise true for HTTP/1.1,
+    /// and for any other version only if "keep-alive" is among them.
     bool keep_alive() const;
 
     /// URL-decoded query-param lookup. Returns @p def when not found.

@@ -171,16 +171,42 @@ std::string HttpRequest::header(std::string_view name) const
     return {};
 }
 
+// The value of Connection is a comma-separated list of options, compared
+// case-insensitively, with optional whitespace around each; several Connection
+// fields are one list (RFC 9110 §5.3, §7.6.1). "close" anywhere in it ends the
+// connection after this request (RFC 9112 §9.6), whatever else it lists.
 bool HttpRequest::keep_alive() const
 {
-    auto conn = header("Connection");
-    std::transform(conn.begin(), conn.end(), conn.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+    bool close = false;
+    bool keep  = false;
 
+    for (const auto& [name, value] : headers) {
+        if (::strcasecmp(name.c_str(), "Connection") != 0)
+            continue;
+        std::string_view list{value};
+        while (!list.empty()) {
+            const auto comma = list.find(',');
+            std::string_view token = list.substr(0, comma);
+            list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+
+            const auto first = token.find_first_not_of(" \t");
+            if (first == std::string_view::npos)
+                continue;
+            token = token.substr(first, token.find_last_not_of(" \t") - first + 1);
+
+            if (token.size() == 5 && ::strncasecmp(token.data(), "close", 5) == 0)
+                close = true;
+            else if (token.size() == 10 && ::strncasecmp(token.data(), "keep-alive", 10) == 0)
+                keep = true;
+        }
+    }
+
+    if (close)
+        return false;
     if (version == "HTTP/1.1")
-        return conn != "close";
-    // HTTP/1.0: keep-alive only if explicitly requested
-    return conn == "keep-alive";
+        return true;
+    // HTTP/1.0 (and any other version): keep-alive only if explicitly requested
+    return keep;
 }
 
 std::string HttpRequest::param(std::string_view name, std::string_view def) const
