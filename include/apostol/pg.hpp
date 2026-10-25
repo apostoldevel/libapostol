@@ -536,6 +536,14 @@ public:
     /// The callback is invoked from within the EventLoop for each notification.
     /// May be called before or after start().
     ///
+    /// Every call adds a handler, and a notification calls every handler of
+    /// its channel: several subscribers to one channel are supported, and a
+    /// subscriber that calls listen() twice gets each notification twice —
+    /// and each LISTEN confirmation twice, if it gave `on_ready` both times.
+    /// Handlers are not compared (a std::function cannot be), so the pool
+    /// cannot tell a repeat from a second subscriber — subscribe once per
+    /// subscriber, and keep the guard on the caller's side.
+    ///
     /// `on_ready` fires, from within the EventLoop, each time the server
     /// acknowledges LISTEN on the channel: the first subscription and every
     /// re-subscription after the listener connection is lost and replaced
@@ -554,7 +562,10 @@ public:
     void listen(const std::string& channel, NotifyHandler cb,
                 ListenReadyHandler on_ready = {});
 
-    /// Unsubscribe from a channel (removes all callbacks for that channel).
+    /// Unsubscribe from a channel: removes every handler of the channel,
+    /// those of other subscribers in this pool included, and the on_ready
+    /// handlers with them. Called from a handler, it takes effect from the
+    /// next notification: the one being handed out still reaches the rest.
     void unlisten(std::string_view channel);
 
     /// Run a statement on the LISTEN connection itself rather than on a pool
