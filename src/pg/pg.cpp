@@ -2597,8 +2597,18 @@ void PgPool::listener_execute(std::string               sql,
     auto q = std::make_unique<PgQuery>(std::move(sql), quiet);
     q->on_result(std::move(on_result));
     q->on_exception(std::move(on_exception));
-    // Asked after detach(): somebody waits for it, as for execute().
-    listener_queue_.push_back(ListenerQuery{std::move(q), answer_within});
+    // Asked after detach(): somebody waits for it, as for execute() — and, as
+    // enqueue() does, it goes ahead of the detached ones. on_stop()'s
+    // deregistration would otherwise wait behind a statement nobody waits for
+    // (a drain asked in on_stopping()) and miss the drain after on_stop().
+    ListenerQuery lq{std::move(q), answer_within};
+    if (detached_) {
+        auto first = std::find_if(listener_queue_.begin(), listener_queue_.end(),
+            [](const ListenerQuery& x) { return x.query->detached(); });
+        listener_queue_.insert(first, std::move(lq));
+    } else {
+        listener_queue_.push_back(std::move(lq));
+    }
 
     if (notify_depth_ > 0)
         return;   // from a notification handler: on_listener_io ships it when the batch is read

@@ -574,7 +574,9 @@ public:
     /// listener's backend pid (pg_backend_pid() there is the listener's).
     ///
     /// One at a time, in the order given, when the listener is idle; a LISTEN
-    /// waiting to be shipped goes first. Starts the listener if there is none.
+    /// waiting to be shipped goes first, and after detach() one asked since
+    /// goes ahead of the detached ones still waiting (the statement in the
+    /// server's hands is not overtaken). Starts the listener if there is none.
     /// Counted by outstanding() — a shutdown drain waits for it — and therefore
     /// bounded by @p answer_within when there is one. Not reset (set_reset()),
     /// not repeated: the
@@ -643,9 +645,11 @@ public:
     /// none of them is guaranteed to run. Queries executed after this call are
     /// delivered as usual. Implies mute_listeners().
     ///
-    /// Queries executed after this call go out ahead of the ones it detached: what
-    /// on_stop() sends (a deregistration, a sign-out) is not left behind work that
-    /// nobody waits for, when every connection is busy.
+    /// Queries executed after this call go out ahead of the ones it detached — on
+    /// the pool and on the listener (listener_execute()): what on_stop() sends (a
+    /// deregistration, a sign-out) is not left behind work that nobody waits for,
+    /// when every connection is busy. A detached query that does go out may
+    /// therefore execute after one asked since.
     ///
     /// For shutdown, between the drain of work in flight and on_stop(): a module
     /// tears down in on_stop() what its callbacks use, and a result that arrived
