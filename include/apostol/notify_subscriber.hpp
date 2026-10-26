@@ -116,10 +116,33 @@ public:
 
     /// complete(): the results of the module's statement (without the ack's).
     using DoneHandler   = std::function<void(std::vector<PgResult>)>;
+    /// What complete() tells a module that did not get its confirmation. It
+    /// converts to the text, so a handler taking (std::string_view error,
+    /// bool stale) is a FailHandler as well.
+    struct Failure
+    {
+        std::string error;
+        /// The SQLSTATE of the statement that failed. An error of the server's
+        /// own: the batch is one transaction, and nothing of it was written
+        /// ("40001", "40P01", "55P03" are worth a repeat; "NT409" is stale).
+        /// Class 08 and 57P0x say the connection or the server went (a
+        /// pooler in front reports a lost server this way): written or not
+        /// is unknown. "" — no answer from the server: the batch was lost
+        /// with the connection (written or not is unknown) or never sent; with
+        /// stale, the row was not with the module and nothing was sent.
+        /// A repeat is the module's own: complete() is once per row (a second
+        /// one finds the row gone and says stale) — send ack_sql() through the
+        /// pool; a repeat of a batch that was written is refused as NT409.
+        std::string sqlstate;
+
+        operator std::string_view() const noexcept { return error; }
+    };
+
     /// complete() did not confirm. @p stale — the token was not current: the
     /// result is rolled back and the row is somebody else's. Otherwise the
-    /// outcome is unknown or the statement failed; the row returns by its lease.
-    using FailHandler   = std::function<void(std::string_view error, bool stale)>;
+    /// statement failed or the outcome is unknown — failure.sqlstate tells
+    /// which; the row returns by its lease.
+    using FailHandler   = std::function<void(const Failure& failure, bool stale)>;
 
     /// @p pool must outlive the subscriber.
     NotifySubscriber(PgPool& pool, EventLoop& loop, Logger& log, Options options,

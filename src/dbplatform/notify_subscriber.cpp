@@ -313,7 +313,7 @@ PgPool::QueryId NotifySubscriber::complete(const NotifyRow& row, std::string res
         log_.error("notify [{}]: complete({}) for a row that is not with the module", options_.channel, row.id);
         if (on_fail)
             guarded(log_, options_.channel, "fail handler",
-                    [&] { on_fail("the row is not with the module", true); });
+                    [&] { on_fail(Failure{"the row is not with the module", {}}, true); });
         return 0;
     }
     taken_.erase(it);
@@ -349,11 +349,11 @@ PgPool::QueryId NotifySubscriber::complete(const NotifyRow& row, std::string res
                     self.log_.warn("notify [{}]: row {}: the token is not current — the result is rolled back, "
                                    "the row is somebody else's", self.options_.channel, id);
                 else
-                    self.log_.error("notify [{}]: row {}: result and ack failed: {}", self.options_.channel, id,
-                                    bad->error_message());
+                    self.log_.error("notify [{}]: row {}: result and ack failed ({}): {}", self.options_.channel,
+                                    id, *bad->sqlstate() ? bad->sqlstate() : "no answer", bad->error_message());
             }
             if (on_fail)
-                call("fail handler", [&] { on_fail(bad->error_message(), stale); });
+                call("fail handler", [&] { on_fail(Failure{bad->error_message(), bad->sqlstate()}, stale); });
         },
         {}, quiet);
 }
