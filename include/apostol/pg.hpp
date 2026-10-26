@@ -14,6 +14,7 @@
 #include <optional>
 #include <deque>
 #include <queue>   // no longer used here; kept for consumers that got it through this header
+#include <random>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -260,6 +261,16 @@ public:
     int          last_fd()   const { return last_fd_; }
     bool         connected() const;
 
+    /// Connected, and no transaction block open (PQtransactionStatus is
+    /// PQTRANS_IDLE). A caller that opens a block with one execute() and
+    /// closes it with another leaves the connection Ready and PQTRANS_INTRANS
+    /// in between.
+    bool         idle_outside_transaction() const;
+
+    /// Connected and in a transaction block that a failed statement has
+    /// aborted (PQTRANS_INERROR): every statement fails until ROLLBACK.
+    bool         transaction_aborted() const;
+
     /// A query is in flight and its answer — or the next part of it — is already
     /// in libpq's buffer: PQgetResult would not block. After a PQconsumeInput
     /// that read it (consume_notify() reads whatever came), no epoll event
@@ -339,6 +350,11 @@ public:
     /// it holds more than min connections (PgPool::set_idle_timeout()).
     std::chrono::steady_clock::time_point idle_since() const { return idle_since_; }
 
+    /// When this connection's lifetime is up (PgPool::set_lifetime()): stamped
+    /// by the pool each time a connect or reset completes; max() — never.
+    std::chrono::steady_clock::time_point retire_at() const { return retire_at_; }
+    void set_retire_at(std::chrono::steady_clock::time_point t) { retire_at_ = t; }
+
     /// The query whose cancel request is on its way to this connection's
     /// backend (PgPool::cancel()), 0 — none. While it is, the connection takes
     /// no query: a request arriving after its query finished would cancel the
@@ -395,6 +411,7 @@ private:
     std::chrono::steady_clock::time_point heard_{};
     std::uint64_t                         round_{0};
     std::chrono::steady_clock::time_point idle_since_{};
+    std::chrono::steady_clock::time_point retire_at_{std::chrono::steady_clock::time_point::max()};
     std::uint64_t                         cancel_pending_{0};
     std::string      conninfo_;
     PgConnState      state_{PgConnState::Connecting};
@@ -422,7 +439,8 @@ private:
 /// not already covered by a connection being opened, up to max_conns — and a
 /// connection idle past the idle timeout is closed again while more than
 /// min_conns are open (set_idle_timeout()). max_conns equal to min_conns
-/// keeps the pool at min_conns.
+/// keeps the pool at min_conns. A connection that has lived past its lifetime
+/// is replaced by a new one (set_lifetime()).
 ///
 /// Reconnect strategy (mirrors v1 CPQConnectPoll):
 /// - On Error state: attempt PQresetStart() to reconnect in-place
@@ -460,6 +478,50 @@ public:
     /// min_conns the pool rarely holds more than min_conns, and this does nothing.
     void set_idle_timeout(std::chrono::seconds limit) { idle_timeout_ = limit; }
     std::chrono::seconds idle_timeout() const { return idle_timeout_; }
+
+    /// A connection that has lived this long is replaced by a new one
+    /// (pgbouncer's server_lifetime, HikariCP's maxLifetime). Zero — never,
+    /// the default.
+    ///
+    /// Why: a PostgreSQL server process does not give back what it has grown —
+    /// the catalog and plan caches of every function it has run. A pool whose
+    /// connections live as long as the application keeps that memory for good,
+    /// and a pooler in session mode with clients that never leave does not
+    /// recycle them either.
+    ///
+    /// A retirement starts only with the connection free — Ready, nothing in
+    /// flight, no transaction block open — and opens the replacement first.
+    /// The old connection goes on taking queries — last, after every other
+    /// ready one — and is closed once the replacement is up and it is itself
+    /// free again; one whose block a failed statement has aborted is closed
+    /// as well (closing it is the ROLLBACK it waits for). A block a caller
+    /// opens on it meanwhile and leaves open holds the retirement, and the
+    /// replacement as a connection above the pool's size, until it ends. A
+    /// replacement that fails to connect (a changed password, the server's
+    /// connection limit), or is lost before the old one goes, ends the
+    /// retirement: the old connection stays in service and the next attempt
+    /// waits a minute. No connection is closed as idle (set_idle_timeout())
+    /// while a retirement is in progress. One connection at a time, and only
+    /// while the pool is healthy — no connect backoff pending, no handshake in
+    /// flight, not detached. Each connection's term is shortened by up to a
+    /// tenth at random, so connections opened together do not all go together.
+    /// Checked when a query completes and by heartbeat(): an idle connection
+    /// goes at the first heartbeat past its term, the next one at the
+    /// heartbeat after that. A reconnect starts a new term; a retiring
+    /// connection that reconnects is still closed once its replacement is up.
+    /// The LISTEN connection is not replaced (a new one would leave a gap in
+    /// NOTIFY).
+    ///
+    /// The pool does not keep a caller's queries on one connection: a block
+    /// opened by one execute() and closed by another holds together only in a
+    /// pool of one connection — and a successor is a second one, as is growth
+    /// (max_conns above min_conns).
+    ///
+    /// Set before start(): it applies to connections that complete a connect
+    /// or reset after the call. Zero ends a retirement in progress where it
+    /// stands — the replacement stays as a pool connection.
+    void set_lifetime(std::chrono::seconds lifetime);
+    std::chrono::seconds lifetime() const { return lifetime_; }
 
     /// Session settings returned to their start-of-session value before every
     /// query on a pool connection, so that a setting one query leaves on the
@@ -692,10 +754,17 @@ public:
     void detach() noexcept;
 
 private:
-    /// @p growth — a connection above min_conns (grow_for_queue()): not
-    /// deferred to the reconnect timer by the backoff, and its failure does
-    /// not move the backoff but pauses growth (record_connect_failure()).
-    void new_connection(bool growth = false);
+    /// Why a connection is opened, which decides what its failure means
+    /// (record_connect_failure()).
+    enum class Opening {
+        min,         ///< one of min_conns: a failure moves the backoff
+        growth,      ///< above min_conns (grow_for_queue()): pauses growth
+        successor,   ///< replaces one past its lifetime: puts retirement off
+    };
+
+    /// A connection opened for growth or as a successor is not deferred to
+    /// the reconnect timer by the backoff, and its failure does not move it.
+    void new_connection(Opening why = Opening::min);
     void on_io(PgConnection& conn, uint32_t events);
     void dispatch_queue(PgConnection& conn);
 
@@ -752,6 +821,32 @@ private:
 
     /// Take a connection out of the pool and close it; true if it was there.
     bool remove_connection(PgConnection& conn, std::string_view why);
+
+    // ── Lifetime (set_lifetime()) ─────────────────────────────────────────────
+    /// A connection's term, counted from `now`: max() with no lifetime set.
+    std::chrono::steady_clock::time_point retire_deadline(std::chrono::steady_clock::time_point now);
+
+    /// Open the successor of `conn` if its term is up, it is free outside a
+    /// transaction block, and the pool may start a retirement now. True when
+    /// one was opened.
+    bool start_retirement(PgConnection& conn, std::chrono::steady_clock::time_point now);
+
+    /// Close retiring_ if its successor is up and it is free (or its block
+    /// aborted). True when it was closed — a reference to it is dangling from
+    /// then on.
+    bool finish_retirement();
+
+    /// Lifetime set and `conn`'s term up.
+    bool past_lifetime(const PgConnection& conn, std::chrono::steady_clock::time_point now) const;
+
+    /// start_retirement() with the clock read here, when a lifetime is set
+    /// and `conn` is not the one being retired already.
+    void start_retirement_now(PgConnection& conn);
+
+    /// After a query on `conn` completed: start its retirement if its term is
+    /// up, or close it if it is retiring_ and its successor is up. True when
+    /// `conn` was closed — the queue has gone to the other ready connections.
+    bool retire_after_query(PgConnection& conn);
 
     /// Connections in Connecting with a socket — they take queued queries
     /// once up.
@@ -901,6 +996,21 @@ private:
     std::chrono::steady_clock::time_point growth_paused_until_{};
     bool                 lazy_{false};
     bool                 used_{false};   // a lazy pool asked for something
+
+    std::chrono::seconds lifetime_{0};
+    // Seeded from the clock: std::random_device may throw, and a pool with no
+    // lifetime set has no use for it at all.
+    std::minstd_rand     lifetime_rng_{static_cast<std::minstd_rand::result_type>(
+        std::chrono::steady_clock::now().time_since_epoch().count())};
+    // The connection past its term being retired, and its successor — opened
+    // first; successor_up_ once it has connected. All clear — no retirement in
+    // progress. remove_connection() ends the retirement whichever of the two
+    // it takes out of the pool.
+    PgConnection*        retiring_{nullptr};
+    PgConnection*        successor_{nullptr};
+    bool                 successor_up_{false};
+    // A successor failed to connect: no retirement starts before this.
+    std::chrono::steady_clock::time_point retire_paused_until_{};
     EventLoop::TimerId   stall_timer_{EventLoop::kInvalidTimer};
 
     // Pointer set of connections currently registered with EventLoop.

@@ -456,6 +456,16 @@ bool PgConnection::connected() const
     return conn_ && PQstatus(conn_.get()) == CONNECTION_OK;
 }
 
+bool PgConnection::idle_outside_transaction() const
+{
+    return connected() && PQtransactionStatus(conn_.get()) == PQTRANS_IDLE;
+}
+
+bool PgConnection::transaction_aborted() const
+{
+    return connected() && PQtransactionStatus(conn_.get()) == PQTRANS_INERROR;
+}
+
 bool PgConnection::cancel(std::string& errbuf)
 {
     if (!conn_) {
@@ -842,12 +852,17 @@ void PgPool::start()
 }
 
 namespace {
-// The round of a connection above min_conns: never the current one, so
-// record_connect_failure() tells its failure from an outage of the pool.
-constexpr std::uint64_t kGrowthRound = std::numeric_limits<std::uint64_t>::max();
+// The rounds of a connection above min_conns and of a successor: never the
+// current one, so record_connect_failure() tells their failure from an outage
+// of the pool.
+constexpr std::uint64_t kGrowthRound    = std::numeric_limits<std::uint64_t>::max();
+constexpr std::uint64_t kSuccessorRound = std::numeric_limits<std::uint64_t>::max() - 1;
+
+// How long a successor that failed to connect puts the next retirement off.
+constexpr std::chrono::seconds kRetirePause{60};
 }
 
-void PgPool::new_connection(bool growth)
+void PgPool::new_connection(Opening why)
 {
     using namespace std::chrono;
 
@@ -856,15 +871,18 @@ void PgPool::new_connection(bool growth)
     // speed.  Without this, an auth fail produces tens of attempts per
     // second, flooding logs and PG's auth subsystem. Growth is not deferred:
     // the reconnect timer and heartbeat() grow again for what still waits.
+    // Nor is a successor, which start_retirement() opens only past the backoff.
     auto now = steady_clock::now();
     if (now < next_connect_attempt_) {
-        if (!growth)
+        if (why == Opening::min)
             schedule_reconnect_timer();
         return;
     }
 
     auto conn = std::make_unique<PgConnection>(conninfo_);
-    conn->set_round(growth ? kGrowthRound : connect_round_);
+    conn->set_round(why == Opening::growth    ? kGrowthRound
+                  : why == Opening::successor ? kSuccessorRound
+                  :                             connect_round_);
     setup_notice_handler(*conn);
 
     if (!conn->connect_start()) {
@@ -950,6 +968,19 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                                       conn_tag(conn),
                                       conn.resetting() ? "Reconnected" : "Connected");
                 record_connect_success();
+                // A new term with every connect and reset: a reset is a new
+                // server process.
+                conn.set_retire_at(retire_deadline(std::chrono::steady_clock::now()));
+                if (&conn == successor_)
+                    successor_up_ = true;
+                // The successor is up: the connection it replaces goes now if
+                // it is free — and if that is this one (its reset finished
+                // first), nothing more is done with it.
+                if (retiring_ && successor_up_) {
+                    const bool self = &conn == retiring_;
+                    if (finish_retirement() && self)
+                        break;
+                }
                 dispatch_queue(conn);
             } else if (ps == PGRES_POLLING_FAILED) {
                 if (pg_logger_)
@@ -1058,6 +1089,7 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                 if (conn.state() == PgConnState::Ready) {
                     const PgQuery* raw_q = conn.current_query();
                     conn.set_current_query(nullptr);
+                    start_retirement_now(conn);
                     if (raw_q) {
                         auto it = std::find_if(inflight_.begin(), inflight_.end(),
                             [raw_q](const std::unique_ptr<PgQuery>& p) {
@@ -1070,7 +1102,8 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                                 owned->deliver({});
                         }
                     }
-                    dispatch_queue(conn);
+                    if (!retire_after_query(conn))
+                        dispatch_queue(conn);
                 }
                 break;
             }
@@ -1105,6 +1138,11 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
 
             const PgQuery* raw_q = conn.current_query();
             conn.set_current_query(nullptr);
+
+            // Free, before any handler runs: a handler that sends the next
+            // query takes this connection again at once when it is the only
+            // one, and it would never be found free afterwards.
+            start_retirement_now(conn);
 
             if (raw_q) {
                 // Find the unique_ptr in inflight_ that owns raw_q
@@ -1164,7 +1202,10 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                 }
             }
 
-            dispatch_queue(conn);
+            // Between queries: a connection past its lifetime goes here once
+            // its successor is up, and the queue waits for another one.
+            if (!retire_after_query(conn))
+                dispatch_queue(conn);
             break;
         }
 
@@ -1414,7 +1455,8 @@ void PgPool::end_cancel(CancelRequest* cr, bool ok, std::string_view error, bool
                     replace_connection(*target);
             } else {
                 target->set_cancel_pending(0);
-                dispatch_queue(*target);
+                if (!retire_after_query(*target))
+                    dispatch_queue(*target);
             }
         } catch (...) {
             // Never left marked for good: it would take no query again. Its
@@ -1558,8 +1600,21 @@ PgPool::QueryId PgPool::execute(std::string              sql,
 
     auto qid = q->id();
 
-    // Find a ready connection (mirrors v1 GetReadyConnection)
+    // Find a ready connection (mirrors v1 GetReadyConnection). One past its
+    // lifetime comes after the others, and the one being retired after all:
+    // a query sent from a result handler would otherwise land on the
+    // connection that has just answered — it is Ready while the handler runs —
+    // and a chain of such queries would keep it from ever being free when its
+    // successor is up. Last, not never: when it is the only one ready, the
+    // query goes there rather than wait.
+    const auto now = std::chrono::steady_clock::now();
+    auto rank = [&](const PgConnection& c) {
+        return &c == retiring_ ? 2 : past_lifetime(c, now) ? 1 : 0;
+    };
+    for (int pass = 0; pass < 3; ++pass)
     for (auto& c : conns_) {
+        if (rank(*c) != pass)
+            continue;
         if (c->state() == PgConnState::Ready && !c->cancel_pending()) {
             // P0 Fix: verify actual PQstatus before using (v1 checks Connected())
             if (!c->connected()) {
@@ -1796,11 +1851,172 @@ bool PgPool::remove_connection(PgConnection& conn, std::string_view why)
         [&conn](const std::unique_ptr<PgConnection>& p) {
             return p.get() == &conn;
         });
+    // A retirement loses whichever side goes. Without its successor the
+    // connection past its term stays in service, and the next attempt waits:
+    // a successor that failed would fail again at once (a changed password,
+    // the server's connection limit).
+    // Up or not: a successor that is gone did not replace anything, and the
+    // pool has to keep the connection it was opened for.
+    if (&conn == successor_) {
+        if (retiring_ && pg_logger_)
+            pg_logger_->notice("{} Its successor is gone: kept in service, the next retirement in {}s",
+                               conn_tag(*retiring_), kRetirePause.count());
+        retiring_     = nullptr;
+        successor_    = nullptr;
+        successor_up_ = false;
+        retire_paused_until_ = std::chrono::steady_clock::now() + kRetirePause;
+    }
+    // The retiring one gone (closed by the retirement, or lost): its successor
+    // is a pool connection like any other.
+    if (&conn == retiring_) {
+        retiring_     = nullptr;
+        successor_    = nullptr;
+        successor_up_ = false;
+    }
+
     if (it == conns_.end())
         return false;
     if (pg_logger_)
         pg_logger_->notice("{} {}", conn_tag(conn), why);
     conns_.erase(it);
+    return true;
+}
+
+void PgPool::set_lifetime(std::chrono::seconds lifetime)
+{
+    lifetime_ = lifetime.count() > 0 ? lifetime : std::chrono::seconds(0);
+    // Switched off: a retirement in progress is not finished by anything any
+    // more — its connections stay as they are, the successor among them.
+    if (lifetime_.count() == 0) {
+        retiring_     = nullptr;
+        successor_    = nullptr;
+        successor_up_ = false;
+    }
+}
+
+bool PgPool::past_lifetime(const PgConnection& conn, std::chrono::steady_clock::time_point now) const
+{
+    return lifetime_.count() > 0 && now >= conn.retire_at();
+}
+
+std::chrono::steady_clock::time_point PgPool::retire_deadline(std::chrono::steady_clock::time_point now)
+{
+    using namespace std::chrono;
+
+    if (lifetime_.count() <= 0)
+        return steady_clock::time_point::max();
+
+    const auto term = duration_cast<milliseconds>(lifetime_);
+    std::uniform_int_distribution<long long> spread(0, term.count() / 10);
+    return now + term - milliseconds(spread(lifetime_rng_));
+}
+
+bool PgPool::start_retirement(PgConnection& conn, std::chrono::steady_clock::time_point now)
+{
+    if (retiring_ || detached_ || !past_lifetime(conn, now))
+        return false;
+    // Free at this moment: Ready, nothing on it, no transaction block a caller
+    // has opened. A connection in a block would hold the retirement — and its
+    // successor, a connection above the pool's size — until the block ends.
+    if (conn.state() != PgConnState::Ready || conn.current_query() || conn.cancel_pending()
+        || !conn.idle_outside_transaction())
+        return false;
+
+    // Only a healthy pool opens a successor. A backoff pending means the
+    // server refused the last connect; a handshake in flight is either the
+    // same doubt or a connection the pool is short of. The cap is
+    // ensure_min_connections()'s: the successor takes one of its spare slots.
+    if (now < retire_paused_until_ || consecutive_connect_fails_ > 0 || now < next_connect_attempt_)
+        return false;
+    for (const auto& c : conns_)
+        if (c->state() == PgConnState::Connecting)
+            return false;
+    if (conns_.size() >= max_conns_ + min_conns_)
+        return false;
+
+    // A successor the loop refuses fails nothing: the connection stays in
+    // service. Not thrown — this runs inside on_io() and heartbeat().
+    const auto before = conns_.size();
+    std::string refused;
+    try {
+        new_connection(Opening::successor);
+    } catch (const std::exception& e) {
+        refused = e.what();
+    } catch (...) {
+        refused = "unknown exception";
+    }
+    if (conns_.size() == before) {
+        retire_paused_until_ = now + kRetirePause;
+        if (pg_logger_)
+            pg_logger_->notice("{} Past postgres.pool.lifetime ({}s), its successor not opened{}{}: "
+                               "kept in service, the next retirement in {}s",
+                               conn_tag(conn), lifetime_.count(), refused.empty() ? "" : ": ",
+                               refused, kRetirePause.count());
+        return false;
+    }
+
+    retiring_     = &conn;
+    successor_    = conns_.back().get();
+    successor_up_ = false;
+    if (pg_logger_)
+        pg_logger_->notice("{} Past postgres.pool.lifetime ({}s): opening its successor",
+                           conn_tag(conn), lifetime_.count());
+    return true;
+}
+
+bool PgPool::finish_retirement()
+{
+    if (!retiring_ || !successor_up_)
+        return false;
+
+    // Free: nothing in flight, no cancel on its way — and no transaction block
+    // a caller left open, which lives in this server process alone: closing
+    // it would roll the block back under that caller. An aborted block
+    // (PQTRANS_INERROR) has nothing left to lose: every statement on it fails
+    // until a ROLLBACK, and closing it is that ROLLBACK.
+    PgConnection& c = *retiring_;
+    if (c.state() != PgConnState::Ready || c.current_query() || c.cancel_pending())
+        return false;
+    if (!c.idle_outside_transaction() && !c.transaction_aborted())
+        return false;
+
+    remove_connection(c, fmt::format("Retired: past postgres.pool.lifetime ({}s), its successor is up",
+                                     lifetime_.count()));
+    return true;
+}
+
+void PgPool::start_retirement_now(PgConnection& conn)
+{
+    if (lifetime_.count() > 0 && &conn != retiring_)
+        start_retirement(conn, std::chrono::steady_clock::now());
+}
+
+bool PgPool::retire_after_query(PgConnection& conn)
+{
+    if (lifetime_.count() <= 0)
+        return false;
+
+    if (&conn != retiring_) {
+        start_retirement_now(conn);
+        return false;
+    }
+    if (!finish_retirement())
+        return false;
+
+    // Gone with the queue perhaps not empty: what waits goes to a ready
+    // connection now, not at the next completion or heartbeat(). Collected
+    // first — dispatch_queue() may reset a connection.
+    if (!queue_.empty()) {
+        std::vector<PgConnection*> ready;
+        for (const auto& c : conns_)
+            if (c->state() == PgConnState::Ready)
+                ready.push_back(c.get());
+        for (PgConnection* c : ready) {
+            if (queue_.empty())
+                break;
+            dispatch_queue(*c);
+        }
+    }
     return true;
 }
 
@@ -1827,7 +2043,7 @@ void PgPool::grow_for_queue(std::size_t demand)
     while (healthy_count() < max_conns_ && connecting_count() < demand
            && conns_.size() < max_conns_ + min_conns_) {
         const auto before = conns_.size();
-        new_connection(/*growth=*/true);
+        new_connection(Opening::growth);
         if (conns_.size() == before)
             break;   // deferred by the backoff, or connect_start() failed
     }
@@ -1835,14 +2051,17 @@ void PgPool::grow_for_queue(std::size_t demand)
 
 void PgPool::close_idle(std::chrono::steady_clock::time_point now)
 {
-    if (idle_timeout_.count() <= 0 || !queue_.empty())
+    // Not during a retirement: the connection past its term and its successor
+    // are one slot, and closing either as one above min would leave the pool
+    // short once the retirement finishes.
+    if (idle_timeout_.count() <= 0 || !queue_.empty() || retiring_)
         return;
     // Collected first: remove_connection() erases from conns_. Idle — Ready
     // with nothing on it and no cancel on its way, for longer than the limit.
     std::vector<PgConnection*> idle;
     for (const auto& c : conns_)
         if (c->state() == PgConnState::Ready && !c->current_query() && !c->cancel_pending()
-            && now - c->idle_since() >= idle_timeout_)
+            && c->idle_outside_transaction() && now - c->idle_since() >= idle_timeout_)
             idle.push_back(c.get());
     auto healthy = healthy_count();
     for (PgConnection* c : idle) {
@@ -2038,6 +2257,10 @@ void PgPool::record_connect_failure(std::uint64_t round)
         growth_paused_until_ = steady_clock::now() + seconds(4);
         return;
     }
+    // A successor failed: the pool has all its connections, the one past its
+    // term among them. remove_connection() puts the next retirement off.
+    if (round == kSuccessorRound)
+        return;
     // Started before the last counted failure: the outage this attempt met has
     // been counted already, and its window is running. A round is "the attempts
     // started at once" — ensure_min_connections() opening the pool, the
@@ -2580,6 +2803,25 @@ void PgPool::heartbeat()
     // Back to min_conns after a burst.
     upkeep(pg_logger_, "heartbeat: idle connections",
            [this] { close_idle(std::chrono::steady_clock::now()); });
+
+    // An idle connection past its lifetime has no query to finish, so nothing
+    // else would start its retirement or finish it. One per call: the
+    // successor's handshake holds the next one back anyway. The oldest term
+    // first.
+    upkeep(pg_logger_, "heartbeat: lifetime", [this] {
+        if (lifetime_.count() <= 0)
+            return;
+        finish_retirement();
+        if (retiring_)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        PgConnection* due = nullptr;
+        for (const auto& c : conns_)
+            if (past_lifetime(*c, now) && (!due || c->retire_at() < due->retire_at()))
+                due = c.get();
+        if (due)
+            start_retirement(*due, now);
+    });
 
     // A handshake in flight — the listener's included — whose watch the loop
     // refused (arm_handshake_watch) gets it now; already armed, this does

@@ -109,6 +109,9 @@ struct AppSettings
     // pool holds more than pool.min; past it, it is closed (PgPool::set_idle_timeout);
     // 0 = never.
     int         pg_pool_idle_timeout{60};
+    // postgres.pool.lifetime — seconds a pool connection lives before a new one
+    // replaces it (PgPool::set_lifetime); 0 = never.
+    int         pg_pool_lifetime{0};
     // postgres.stall_timeout — seconds a query in flight may go without a byte
     // from the server before its connection is dropped (PgPool::set_stall_timeout);
     // 0 = never.

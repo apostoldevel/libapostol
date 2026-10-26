@@ -135,6 +135,7 @@ void AppSettings::populate(const Config& cfg)
     // Left out — pool.min: growth above it is asked for, never a default.
     pg_pool_max = static_cast<int>(cfg.get_int("postgres.pool.max", pg_pool_min));
     pg_pool_idle_timeout = static_cast<int>(cfg.get_int("postgres.pool.idle_timeout", pg_pool_idle_timeout));
+    pg_pool_lifetime = static_cast<int>(cfg.get_int("postgres.pool.lifetime", pg_pool_lifetime));
     pg_stall_timeout = static_cast<int>(cfg.get_int("postgres.stall_timeout", pg_stall_timeout));
 
     // Session settings reset before every pool query (PgPool::set_reset).
@@ -448,6 +449,10 @@ std::vector<ValidationError> AppSettings::validate() const
         err("postgres.pool.idle_timeout",
             fmt::format("postgres.pool.idle_timeout must be 0 (never) or a number of seconds, got {}",
                 pg_pool_idle_timeout));
+    if (pg_pool_lifetime < 0)
+        err("postgres.pool.lifetime",
+            fmt::format("postgres.pool.lifetime must be 0 (never) or a number of seconds, got {}",
+                pg_pool_lifetime));
 
     // Prefix
     if (prefix.empty())

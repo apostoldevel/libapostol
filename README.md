@@ -327,6 +327,45 @@ its first query, so a process that never runs one holds none — and a wrong
 password or host shows in its log at that first query, not at start. Its LISTEN
 connection is opened by `listen()` as before.
 
+### Connection lifetime
+
+A PostgreSQL server process does not give back what it has grown — the catalog
+and plan caches of every function it has run — so a pool whose connections live
+as long as the application keeps that memory for good. With
+**`postgres.pool.lifetime`** seconds (default `0` — never) a pool connection
+that has lived this long is replaced by a new one:
+
+```json
+{ "postgres": { "pool": { "min": 5, "max": 5, "lifetime": 3600 } } }
+```
+
+- A replacement starts only with the connection free (nothing in flight, no
+  transaction block open), and the new connection is opened first. The old one
+  goes on taking queries — last, after every other ready one — and is closed
+  once the new one is up and it is itself free again. Count one connection more
+  than the pool's size per pool for that while; a transaction block a caller
+  opens on the old connection and leaves open stretches it until the block
+  ends (an aborted block is closed at once — that is its ROLLBACK).
+- A new connection that does not connect (a changed password, the server's
+  connection limit), or is lost before the old one goes, leaves the old one in
+  service, and the next attempt waits a minute. No connection is closed as idle
+  (`idle_timeout`) while a replacement is in progress.
+- The pool does not keep a caller's queries on one connection: a transaction
+  block opened by one query and closed by another holds together only in a
+  pool of one connection, and the replacement is a second one.
+- One connection at a time, and only while the pool is healthy (no reconnect
+  backoff pending, no connect in flight). Each connection's term is shortened
+  by up to a tenth at random, so connections opened together do not all go
+  together.
+- Checked when a query completes and by the pool's heartbeat, once a minute:
+  an idle connection goes at the first heartbeat past its term, the next idle
+  one a minute later. A reconnect starts a new term; a connection being replaced
+  that reconnects is still closed once its replacement is up.
+- Every pool — worker, helper, custom process, `db_pool(role)`; not the LISTEN
+  connection, not the leader's lock connection. Logged at notice:
+  `Past postgres.pool.lifetime (…s): opening its successor`, then
+  `Retired: past postgres.pool.lifetime (…s), its successor is up`.
+
 ### A time limit on connecting to PostgreSQL
 
 The pool connects asynchronously, and libpq's asynchronous handshake keeps no

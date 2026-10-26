@@ -2318,6 +2318,7 @@ PgPool& Application::setup_db(EventLoop& loop, std::string conninfo,
     db_pool_->set_reset(settings_.pg_reset);
     db_pool_->set_stall_timeout(std::chrono::seconds(settings_.pg_stall_timeout));
     db_pool_->set_idle_timeout(std::chrono::seconds(settings_.pg_pool_idle_timeout));
+    db_pool_->set_lifetime(std::chrono::seconds(settings_.pg_pool_lifetime));
     db_pool_->set_lazy(lazy);
     db_pool_->start();
     return *db_pool_;
@@ -2366,6 +2367,7 @@ PgPool& Application::db_pool(std::string_view role)
     pool->set_reset(settings_.pg_reset);
     pool->set_stall_timeout(std::chrono::seconds(settings_.pg_stall_timeout));
     pool->set_idle_timeout(std::chrono::seconds(settings_.pg_pool_idle_timeout));
+    pool->set_lifetime(std::chrono::seconds(settings_.pg_pool_lifetime));
     pool->start();
 
     auto& ref = *pool;
