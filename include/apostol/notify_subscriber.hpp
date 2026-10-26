@@ -45,7 +45,9 @@ namespace apostol::db_platform
 //   refuse()     notify.nack — given out again if a repeat is allowed.
 //   timers       notify.heartbeat ON THE LISTENER (a listener the network cut
 //                silently answers nothing: it is replaced, and its subscriber
-//                is not chosen meanwhile), NULL → subscribe anew;
+//                is not chosen meanwhile), NULL → subscribe anew; seen
+//                written later than `alive` after the last one → the lapse
+//                handler (the database counted the subscriber dead meanwhile);
 //                notify.sweep on the pool, with a spread; channel_policy again.
 //   drain()      for on_stopping(): notify.drain (not chosen as an addressee
 //                any more), nothing new taken; rows taken go on to their end.
@@ -113,6 +115,20 @@ public:
     /// after the database forgot the old (heartbeat answered NULL). Zero — none
     /// right now. A module that publishes its number (a route) publishes again.
     using NumberHandler = std::function<void(int number)>;
+    /// The database counted this subscriber dead for a while, under the same
+    /// number: the seen of the heartbeat it confirmed now came more than the
+    /// channel's `alive` after the last one confirmed (or the subscription) —
+    /// a heartbeat late in the server, failed or not sent (a stalled loop).
+    /// What is removed meanwhile for a subscriber not alive — a route a
+    /// target_fn reads, by a reaper of the configuration — is gone although
+    /// nothing else changed: a module that publishes it publishes again.
+    /// @p gap — between the two, on the database's clock. A failure alone is
+    /// not told: the next confirmed heartbeat tells whether the gap grew past
+    /// `alive`. It errs towards telling: a gap a little short of `alive`
+    /// counts (a seen is visible from its commit, after the clock read), and
+    /// so does one across a heartbeat the server wrote but whose answer was
+    /// lost. Not told while draining: not alive then anyway.
+    using LapseHandler  = std::function<void(std::chrono::milliseconds gap)>;
 
     /// complete(): the results of the module's statement (without the ack's).
     using DoneHandler   = std::function<void(std::vector<PgResult>)>;
@@ -147,7 +163,7 @@ public:
     /// @p pool must outlive the subscriber.
     NotifySubscriber(PgPool& pool, EventLoop& loop, Logger& log, Options options,
                      RowHandler on_row, LegacyHandler on_legacy = {},
-                     NumberHandler on_number = {});
+                     NumberHandler on_number = {}, LapseHandler on_lapse = {});
     ~NotifySubscriber();
 
     NotifySubscriber(const NotifySubscriber&)            = delete;
@@ -216,6 +232,7 @@ private:
     std::chrono::seconds heartbeat_every() const;
     std::chrono::seconds sweep_every() const;
     std::chrono::seconds answer_within() const;
+    std::chrono::seconds alive() const;
 
     std::string personal_channel() const;
 
@@ -227,12 +244,17 @@ private:
     RowHandler    on_row_;
     LegacyHandler on_legacy_;
     NumberHandler on_number_;
+    LapseHandler  on_lapse_;
 
     // Callbacks the pool and the loop hold carry a weak copy: a subscriber
     // destroyed first is not called into.
     std::shared_ptr<NotifySubscriber*> self_;
 
     int         number_{0};
+    // The database's clock_timestamp() beside the last seen confirmed — the
+    // subscription's, then each heartbeat's answered —, epoch seconds: the
+    // start of the gap a lapse is measured over. 0 — none.
+    double seen_at_{0};
     std::string listening_;          // the personal channel listened to; empty — none
 
     // id → row: with the module (taken, no complete()/refuse() yet).

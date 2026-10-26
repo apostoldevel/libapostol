@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <optional>
 #include <unistd.h>
@@ -24,6 +25,9 @@ namespace
 constexpr std::chrono::seconds kDefaultHeartbeat{5};
 constexpr std::chrono::seconds kDefaultSweep{2};
 constexpr std::chrono::seconds kDefaultAlive{15};
+// A new seen is visible from its commit, a little after the clock read beside
+// it: a gap this much short of alive may still have been a dead moment.
+constexpr std::chrono::milliseconds kCommitMargin{100};
 
 /// A whole number of the text form, or nullopt.
 std::optional<std::int64_t> parse_id(std::string_view text)
@@ -52,6 +56,19 @@ std::string text_of(const PgResult& r, int col)
     return r.is_null(0, col) ? std::string{} : std::string(r.value(0, col));
 }
 
+/// The database's clock_timestamp() as epoch seconds; 0 when absent. Not
+/// strtod: it follows the process's locale (Application sets it), and with a
+/// decimal comma it stops at the point.
+double epoch_of(const PgResult& r, int col)
+{
+    if (r.columns() <= col || r.is_null(0, col))
+        return 0;
+    const std::string_view text = r.value(0, col);
+    double v = 0;
+    const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), v);
+    return ec == std::errc{} && v > 0 ? v : 0;
+}
+
 std::chrono::seconds seconds_of(const PgResult& r, int col, std::chrono::seconds fallback)
 {
     if (r.is_null(0, col))
@@ -64,7 +81,7 @@ std::chrono::seconds seconds_of(const PgResult& r, int col, std::chrono::seconds
 
 NotifySubscriber::NotifySubscriber(PgPool& pool, EventLoop& loop, Logger& log, Options options,
                                    RowHandler on_row, LegacyHandler on_legacy,
-                                   NumberHandler on_number)
+                                   NumberHandler on_number, LapseHandler on_lapse)
     : pool_(pool)
     , loop_(loop)
     , log_(log)
@@ -72,6 +89,7 @@ NotifySubscriber::NotifySubscriber(PgPool& pool, EventLoop& loop, Logger& log, O
     , on_row_(std::move(on_row))
     , on_legacy_(std::move(on_legacy))
     , on_number_(std::move(on_number))
+    , on_lapse_(std::move(on_lapse))
     , self_(std::make_shared<NotifySubscriber*>(this))
     , spread_(static_cast<std::minstd_rand::result_type>(::getpid()))
 {
@@ -146,7 +164,9 @@ void NotifySubscriber::subscribe()
 
     // On the listener: notify.subscribe records pg_backend_pid() of the
     // connection it runs on, and that has to be the listener's.
-    const std::string sql = fmt::format("SELECT notify.subscribe({}, {}, {}, {})",
+    // With the database's clock: the new row's seen, to measure a lapse from.
+    const std::string sql = fmt::format("SELECT notify.subscribe({}, {}, {}, {}), "
+                                        "extract(epoch FROM clock_timestamp())",
         pq_quote_literal(options_.node), pq_quote_literal(options_.channel),
         options_.application.empty() ? std::string("null") : pq_quote_literal(options_.application),
         options_.role.empty() ? std::string("null") : pq_quote_literal(options_.role));
@@ -166,6 +186,7 @@ void NotifySubscriber::subscribe()
                 self.arm_retry();
                 return;
             }
+            self.seen_at_ = epoch_of(*r, 1);
             self.on_subscribed(static_cast<int>(std::strtol(r->value(0, 0), nullptr, 10)));
         },
         [w](std::string_view error) {
@@ -487,7 +508,8 @@ void NotifySubscriber::heartbeat_now()
 
     const int number = number_;
     std::weak_ptr<NotifySubscriber*> w = self_;
-    pool_.listener_execute(fmt::format("SELECT notify.heartbeat({}, pg_backend_pid())", number),
+    pool_.listener_execute(fmt::format("SELECT notify.heartbeat({}, pg_backend_pid()), "
+                                       "extract(epoch FROM clock_timestamp())", number),
         [w, number](std::vector<PgResult> results) {
             auto p = w.lock();
             if (!p)
@@ -506,7 +528,8 @@ void NotifySubscriber::heartbeat_now()
                 // The database does not know the number any more: a new one.
                 self.log_.warn("notify [{}]: subscriber {} is not registered any more — subscribing again",
                                self.options_.channel, number);
-                self.number_ = 0;
+                self.number_  = 0;
+                self.seen_at_ = 0;
                 if (self.on_number_)
                     guarded(self.log_, self.options_.channel, "number handler", [&] { self.on_number_(0); });
                 self.subscribe();
@@ -515,6 +538,25 @@ void NotifySubscriber::heartbeat_now()
             if (!self.draining_ && std::string_view(r->value(0, 0)) == "draining")
                 self.log_.warn("notify [{}]: subscriber {} is draining, not by this process",
                                self.options_.channel, number);
+
+            // The two seen this one and the last confirmed one wrote, on the
+            // database's clock: from `alive` after the first until the second,
+            // notify.is_alive() said no.
+            // While draining it is not alive whatever the gap, and drain's own
+            // seen is not read: nothing to tell.
+            const double at   = epoch_of(*r, 1);
+            const double from = self.seen_at_;
+            self.seen_at_ = at;
+            if (from <= 0 || at <= 0 || self.draining_)
+                return;
+            const auto gap = std::chrono::milliseconds(std::llround((at - from) * 1000));
+            if (gap + kCommitMargin < self.alive())
+                return;
+            self.log_.warn("notify [{}]: subscriber {}: {} ms between confirmed heartbeats, alive is {} s — "
+                           "the database counted it dead meanwhile",
+                           self.options_.channel, number, gap.count(), self.alive().count());
+            if (self.on_lapse_)
+                guarded(self.log_, self.options_.channel, "lapse handler", [&] { self.on_lapse_(gap); });
         },
         [w](std::string_view error) {
             auto p = w.lock();
@@ -625,6 +667,11 @@ std::chrono::seconds NotifySubscriber::sweep_every() const
     if (policy_sweep_.count() > 0)
         return policy_sweep_;
     return kDefaultSweep;
+}
+
+std::chrono::seconds NotifySubscriber::alive() const
+{
+    return alive_.count() > 0 ? alive_ : kDefaultAlive;
 }
 
 std::chrono::seconds NotifySubscriber::answer_within() const
