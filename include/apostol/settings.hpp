@@ -102,7 +102,13 @@ struct AppSettings
     std::string pg_conninfo_helper;
     std::string pg_conninfo_kernel;
     int         pg_pool_min{1};
-    int         pg_pool_max{5};
+    // postgres.pool.max — left out, it is pool.min: the pool grows above min
+    // only when a larger max is set.
+    int         pg_pool_max{1};
+    // postgres.pool.idle_timeout — seconds a connection may stay idle while the
+    // pool holds more than pool.min; past it, it is closed (PgPool::set_idle_timeout);
+    // 0 = never.
+    int         pg_pool_idle_timeout{60};
     // postgres.stall_timeout — seconds a query in flight may go without a byte
     // from the server before its connection is dropped (PgPool::set_stall_timeout);
     // 0 = never.

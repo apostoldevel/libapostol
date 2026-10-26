@@ -302,6 +302,31 @@ role active and the rest waiting:
 name; `node_process_id()` adds `:<pid>`. Only a string counts: an application
 that keeps an object under `"node"` (cs: `{"code", "url"}`) is left alone.
 
+### Pool size
+
+`postgres.pool.min` connections are opened at start and kept. With
+`postgres.pool.max` above it, a query that finds no ready connection opens one
+more — as many as there are queued queries not already covered by a connection
+being opened, up to `max` — and a connection idle for
+**`postgres.pool.idle_timeout`** seconds (default `60`, `0` — never) is closed
+again while more than `min` are open; the pool checks it with its heartbeat,
+once a minute, so a connection goes at the first check past the limit.
+**`max` left out is `min`, and `max` equal to `min` keeps the pool at `min`.**
+Before this, `max` had no effect and every pool stayed at `min`, so a
+configuration that sets `max` above `min` now opens up to `max` under load:
+count `max` × processes × copies against the server's (or the pooler's)
+connection limit, or set `max` to `min`. A connection above `min` that the
+server refuses (its connection limit) pauses growth for 4 s and does not move
+the reconnect backoff of the pool's own connections. The pools the library
+opens itself — a custom process's, `db_pool("helper")`, `db_pool("kernel")` —
+take `min`/`max` from the settings; the worker's and the helper's take what the
+application passes to `setup_db()` (the template passes the settings).
+
+A custom process opens its pool (`postgres.helper`) lazily: no connection until
+its first query, so a process that never runs one holds none — and a wrong
+password or host shows in its log at that first query, not at start. Its LISTEN
+connection is opened by `listen()` as before.
+
 ### A time limit on connecting to PostgreSQL
 
 The pool connects asynchronously, and libpq's asynchronous handshake keeps no

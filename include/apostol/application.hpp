@@ -108,8 +108,11 @@ public:
     /// Create and start a PgPool with @p conninfo, @p min_conns .. @p max_conns.
     /// Returns a reference to the pool (owned by this Application).
     /// Must be called from on_worker_start() before start_http_server().
+    /// @p lazy — the pool opens no connection until its first query
+    /// (PgPool::set_lazy()).
     PgPool& setup_db(EventLoop& loop, std::string conninfo,
-                     std::size_t min_conns = 1, std::size_t max_conns = 5);
+                     std::size_t min_conns = 1, std::size_t max_conns = 1,
+                     bool lazy = false);
 
     /// Access the PgPool created by setup_db(). Throws if setup_db() was not
     /// called first.

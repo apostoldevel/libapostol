@@ -1510,12 +1510,15 @@ void Application::custom_process_run(CustomProcess& proc)
     // "leader" — when the role's lock is taken; a standby holds no pool.
     auto start = [&]() -> bool
     {
-        // 5. PgPool (if helper conninfo is configured)
+        // 5. PgPool (if helper conninfo is configured). Lazy: a process that
+        // never runs a query — one that only listens, or does no database
+        // work at all — holds no pool connection.
         const auto& conninfo = settings().pg_conninfo_helper;
         if (!conninfo.empty()) {
             setup_db(loop, conninfo,
                 static_cast<std::size_t>(settings().pg_pool_min),
-                static_cast<std::size_t>(settings().pg_pool_max));
+                static_cast<std::size_t>(settings().pg_pool_max),
+                /*lazy=*/true);
         }
 
         // 6. Process on_start
@@ -1530,7 +1533,8 @@ void Application::custom_process_run(CustomProcess& proc)
 
         started = true;
 
-        // 7. Drop privileges after initialization (sockets bound, DB connected)
+        // 7. Drop privileges after initialization (sockets bound; the pool is
+        // lazy — it connects at the first query, after this)
         set_user(cfg_user(), cfg_group());
 
         // Set process title AFTER on_start (modules may be registered)
@@ -2272,7 +2276,8 @@ void Application::add_custom_process(std::string name, std::function<void(EventL
 // ─── PostgreSQL pool ─────────────────────────────────────────────────────────
 
 PgPool& Application::setup_db(EventLoop& loop, std::string conninfo,
-                               std::size_t min_conns, std::size_t max_conns)
+                               std::size_t min_conns, std::size_t max_conns,
+                               bool lazy)
 {
     // Create dedicated postgres logger (writes to stderr + separate postgres.log)
     {
@@ -2312,6 +2317,8 @@ PgPool& Application::setup_db(EventLoop& loop, std::string conninfo,
         min_conns, max_conns, pg_logger_.get());
     db_pool_->set_reset(settings_.pg_reset);
     db_pool_->set_stall_timeout(std::chrono::seconds(settings_.pg_stall_timeout));
+    db_pool_->set_idle_timeout(std::chrono::seconds(settings_.pg_pool_idle_timeout));
+    db_pool_->set_lazy(lazy);
     db_pool_->start();
     return *db_pool_;
 }
@@ -2358,6 +2365,7 @@ PgPool& Application::db_pool(std::string_view role)
         pg_logger_.get());
     pool->set_reset(settings_.pg_reset);
     pool->set_stall_timeout(std::chrono::seconds(settings_.pg_stall_timeout));
+    pool->set_idle_timeout(std::chrono::seconds(settings_.pg_pool_idle_timeout));
     pool->start();
 
     auto& ref = *pool;

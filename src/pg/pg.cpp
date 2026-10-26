@@ -404,9 +404,10 @@ PostgresPollingStatusType PgConnection::connect_poll()
     auto ps = PQconnectPoll(conn_.get());
     last_fd_ = PQsocket(conn_.get());  // docs: re-determine socket after each poll
 
-    if (ps == PGRES_POLLING_OK)
-        state_ = PgConnState::Ready;
-    else if (ps == PGRES_POLLING_FAILED)
+    if (ps == PGRES_POLLING_OK) {
+        state_      = PgConnState::Ready;
+        idle_since_ = std::chrono::steady_clock::now();
+    } else if (ps == PGRES_POLLING_FAILED)
         state_ = PgConnState::Error;
 
     after_poll(was_tcp_connect);
@@ -435,9 +436,10 @@ PostgresPollingStatusType PgConnection::reset_poll()
     auto ps = PQresetPoll(conn_.get());
     last_fd_ = PQsocket(conn_.get());  // docs: re-determine socket after each poll
 
-    if (ps == PGRES_POLLING_OK)
-        state_ = PgConnState::Ready;
-    else if (ps == PGRES_POLLING_FAILED)
+    if (ps == PGRES_POLLING_OK) {
+        state_      = PgConnState::Ready;
+        idle_since_ = std::chrono::steady_clock::now();
+    } else if (ps == PGRES_POLLING_FAILED)
         state_ = PgConnState::Error;
 
     after_poll(was_tcp_connect);
@@ -525,7 +527,8 @@ std::vector<PgResult> PgConnection::collect_results()
             // NULL → all results for this query are done, connection is idle.
             // Only transition to Ready here — PQsendQuery requires PQgetResult
             // to have returned NULL before a new query can be sent.
-            state_ = PgConnState::Ready;
+            state_      = PgConnState::Ready;
+            idle_since_ = std::chrono::steady_clock::now();
             break;
         }
         pending_results_.emplace_back(r);
@@ -832,26 +835,36 @@ PgPool::~PgPool()
 
 void PgPool::start()
 {
+    if (lazy_ && !used_)
+        return;
     for (std::size_t i = 0; i < min_conns_; ++i)
         new_connection();
 }
 
-void PgPool::new_connection()
+namespace {
+// The round of a connection above min_conns: never the current one, so
+// record_connect_failure() tells its failure from an outage of the pool.
+constexpr std::uint64_t kGrowthRound = std::numeric_limits<std::uint64_t>::max();
+}
+
+void PgPool::new_connection(bool growth)
 {
     using namespace std::chrono;
 
     // Exponential backoff: if the previous connect failed recently, defer
     // this attempt via a one-shot timer instead of looping at event-loop
     // speed.  Without this, an auth fail produces tens of attempts per
-    // second, flooding logs and PG's auth subsystem.
+    // second, flooding logs and PG's auth subsystem. Growth is not deferred:
+    // the reconnect timer and heartbeat() grow again for what still waits.
     auto now = steady_clock::now();
     if (now < next_connect_attempt_) {
-        schedule_reconnect_timer();
+        if (!growth)
+            schedule_reconnect_timer();
         return;
     }
 
     auto conn = std::make_unique<PgConnection>(conninfo_);
-    conn->set_round(connect_round_);
+    conn->set_round(growth ? kGrowthRound : connect_round_);
     setup_notice_handler(*conn);
 
     if (!conn->connect_start()) {
@@ -1536,6 +1549,8 @@ PgPool::QueryId PgPool::execute(std::string              sql,
                                 bool                      quiet,
                                 PgRetry                   retry)
 {
+    used_ = true;
+
     auto q = std::make_unique<PgQuery>(std::move(sql), quiet);
     q->on_result(std::move(on_result));
     q->on_exception(std::move(on_exception));
@@ -1626,7 +1641,20 @@ PgPool::QueryId PgPool::execute(std::string              sql,
     // (epoll, timerfd — T767), and a query already queued would then go out
     // with the next connection while its caller, told it failed, sends it
     // again. Nothing in here dispatches the queue, so the order is free.
+    // Counted with this query: one more connection while the queue outgrows
+    // the ones being opened, up to max_conns_.
     ensure_min_connections();
+    // Optional: a connection above min the loop refuses (epoll at its limit)
+    // must not fail a query the min connections can still run.
+    try {
+        grow_for_queue(queue_.size() + 1);
+    } catch (const std::exception& e) {
+        if (pg_logger_)
+            pg_logger_->error("PgPool: growth failed: {} — the query waits for a connection", e.what());
+    } catch (...) {
+        if (pg_logger_)
+            pg_logger_->error("PgPool: growth failed: unknown exception — the query waits for a connection");
+    }
 
     enqueue(std::move(q));
 
@@ -1738,6 +1766,14 @@ bool PgPool::watch_or_replace(PgConnection& conn, uint32_t events)
 
 void PgPool::replace_connection(PgConnection& conn)
 {
+    remove_connection(conn, "Replacing dead connection");
+
+    // Create replacement
+    ensure_min_connections();
+}
+
+bool PgPool::remove_connection(PgConnection& conn, std::string_view why)
+{
     int old_fd = conn.fd();
     if (old_fd >= 0)
         loop_.remove_io(old_fd);
@@ -1756,20 +1792,66 @@ void PgPool::replace_connection(PgConnection& conn)
             cr->target = nullptr;
 #endif
 
-    // Find and erase this connection from conns_
     auto it = std::find_if(conns_.begin(), conns_.end(),
         [&conn](const std::unique_ptr<PgConnection>& p) {
             return p.get() == &conn;
         });
+    if (it == conns_.end())
+        return false;
+    if (pg_logger_)
+        pg_logger_->notice("{} {}", conn_tag(conn), why);
+    conns_.erase(it);
+    return true;
+}
 
-    if (it != conns_.end()) {
-        if (pg_logger_)
-            pg_logger_->notice("{} Replacing dead connection", conn_tag(conn));
-        conns_.erase(it);
+std::size_t PgPool::connecting_count() const
+{
+    std::size_t n = 0;
+    for (const auto& c : conns_)
+        if (c->state() == PgConnState::Connecting && c->fd() >= 0)
+            ++n;
+    return n;
+}
+
+void PgPool::grow_for_queue(std::size_t demand)
+{
+    // Only above min, and only when asked for (max_conns_ above min_conns_).
+    // Below min is ensure_min_connections()'s — deferred by the backoff, it
+    // is not to be raced here. The cap on conns_ is ensure_min_connections()'s
+    // too: connections in Error awaiting their replacement still hold a slot.
+    // Nor after detach(): what still waits is work nobody waits for. Nor
+    // while a refused growth connection pauses it.
+    if (max_conns_ <= min_conns_ || detached_ || healthy_count() < min_conns_
+        || std::chrono::steady_clock::now() < growth_paused_until_)
+        return;
+    while (healthy_count() < max_conns_ && connecting_count() < demand
+           && conns_.size() < max_conns_ + min_conns_) {
+        const auto before = conns_.size();
+        new_connection(/*growth=*/true);
+        if (conns_.size() == before)
+            break;   // deferred by the backoff, or connect_start() failed
     }
+}
 
-    // Create replacement
-    ensure_min_connections();
+void PgPool::close_idle(std::chrono::steady_clock::time_point now)
+{
+    if (idle_timeout_.count() <= 0 || !queue_.empty())
+        return;
+    // Collected first: remove_connection() erases from conns_. Idle — Ready
+    // with nothing on it and no cancel on its way, for longer than the limit.
+    std::vector<PgConnection*> idle;
+    for (const auto& c : conns_)
+        if (c->state() == PgConnState::Ready && !c->current_query() && !c->cancel_pending()
+            && now - c->idle_since() >= idle_timeout_)
+            idle.push_back(c.get());
+    auto healthy = healthy_count();
+    for (PgConnection* c : idle) {
+        if (healthy <= min_conns_)
+            break;
+        remove_connection(*c, fmt::format("Closing connection idle for {}s, above the minimum of {}",
+                                          idle_timeout_.count(), min_conns_));
+        --healthy;
+    }
 }
 
 void PgPool::fail_inflight_query(PgConnection& conn, std::string_view reason)
@@ -1927,6 +2009,8 @@ void PgPool::deliver_lost()
 
 void PgPool::ensure_min_connections()
 {
+    if (lazy_ && !used_)
+        return;
     auto healthy = healthy_count();
     while (healthy < min_conns_ && conns_.size() < max_conns_ + min_conns_) {
         new_connection();
@@ -1945,6 +2029,15 @@ void PgPool::record_connect_success()
 void PgPool::record_connect_failure(std::uint64_t round)
 {
     using namespace std::chrono;
+    // A connection above min_conns failed — most likely refused for the
+    // server's (or the pooler's) connection limit. The pool's own connections
+    // are not concerned: the backoff stays as it is, so a min connection lost
+    // meanwhile is replaced at once; growth waits instead, or every burst would
+    // knock on the limit again.
+    if (round == kGrowthRound) {
+        growth_paused_until_ = steady_clock::now() + seconds(4);
+        return;
+    }
     // Started before the last counted failure: the outage this attempt met has
     // been counted already, and its window is running. A round is "the attempts
     // started at once" — ensure_min_connections() opening the pool, the
@@ -2011,7 +2104,11 @@ void PgPool::schedule_reconnect_timer()
     reconnect_timer_ = loop_.add_timer(delay,
         [this] {
             reconnect_timer_ = EventLoop::kInvalidTimer;
-            upkeep(pg_logger_, "reconnect", [this] { ensure_min_connections(); });
+            upkeep(pg_logger_, "reconnect", [this] {
+                ensure_min_connections();
+                if (!queue_.empty())
+                    grow_for_queue(queue_.size());
+            });
             // listener_ may have died on the same outage that triggered this
             // timer (or failed independently at startup, see start_listener());
             // restart it if there's still something to LISTEN for.
@@ -2307,8 +2404,8 @@ std::size_t PgPool::healthy_count() const
     // A Busy connection past the stall limit is still counted: drop_stalled()
     // gives it up within a second and reconnects it in its own slot. Counted
     // out, it made every ensure_min_connections() in that second open a second
-    // connection for the same slot — kept for good once the first recovered, as
-    // the pool never shrinks.
+    // connection for the same slot — kept once the first recovered, until the
+    // idle timeout closes it (and for good with that timeout off).
     std::size_t count = 0;
     for (const auto& c : conns_) {
         auto s = c->state();
@@ -2480,6 +2577,10 @@ void PgPool::heartbeat()
     // Ensure min_conns
     upkeep(pg_logger_, "heartbeat: minimum connections", [this] { ensure_min_connections(); });
 
+    // Back to min_conns after a burst.
+    upkeep(pg_logger_, "heartbeat: idle connections",
+           [this] { close_idle(std::chrono::steady_clock::now()); });
+
     // A handshake in flight — the listener's included — whose watch the loop
     // refused (arm_handshake_watch) gets it now; already armed, this does
     // nothing.
@@ -2492,6 +2593,14 @@ void PgPool::heartbeat()
             if (c->state() == PgConnState::Ready && !queue_.empty())
                 dispatch_queue(*c);
         }
+    });
+
+    // What the ready connections could not take — growth deferred by the
+    // backoff or paused, or connections lost since — gets its connections
+    // now, up to max_conns.
+    upkeep(pg_logger_, "heartbeat: growth", [this] {
+        if (!queue_.empty())
+            grow_for_queue(queue_.size());
     });
 
     // A loss whose delivery the loop refused to arm (arm_lost_delivery).

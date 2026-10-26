@@ -334,6 +334,11 @@ public:
     std::uint64_t round() const          { return round_; }
     void          set_round(std::uint64_t r) { round_ = r; }
 
+    /// When this connection last became Ready — connected, reconnected, or
+    /// done with a query. PgPool closes one idle past its idle timeout while
+    /// it holds more than min connections (PgPool::set_idle_timeout()).
+    std::chrono::steady_clock::time_point idle_since() const { return idle_since_; }
+
     /// The query whose cancel request is on its way to this connection's
     /// backend (PgPool::cancel()), 0 — none. While it is, the connection takes
     /// no query: a request arriving after its query finished would cancel the
@@ -389,6 +394,7 @@ private:
     bool                                  tcp_given_up_{false};    // give_up_tcp_connect() acted, no poll since
     std::chrono::steady_clock::time_point heard_{};
     std::uint64_t                         round_{0};
+    std::chrono::steady_clock::time_point idle_since_{};
     std::uint64_t                         cancel_pending_{0};
     std::string      conninfo_;
     PgConnState      state_{PgConnState::Connecting};
@@ -411,17 +417,25 @@ private:
 /// Owns N PgConnections, integrates with EventLoop.
 /// execute() dispatches to a ready connection or queues the query.
 ///
+/// Size: min_conns are kept open. With max_conns above it, a query that finds
+/// no ready connection opens one more — as many as there are queued queries
+/// not already covered by a connection being opened, up to max_conns — and a
+/// connection idle past the idle timeout is closed again while more than
+/// min_conns are open (set_idle_timeout()). max_conns equal to min_conns
+/// keeps the pool at min_conns.
+///
 /// Reconnect strategy (mirrors v1 CPQConnectPoll):
 /// - On Error state: attempt PQresetStart() to reconnect in-place
 /// - On dispatch: verify PQstatus() before sending queries
-/// - Periodic heartbeat: check health, restore min_conns, cleanup idle
+/// - Periodic heartbeat: check health, restore min_conns, grow for a queue
+///   left waiting, close connections idle above min_conns
 class PgPool
 {
 public:
     PgPool(EventLoop&   loop,
            std::string  conninfo,
            std::size_t  min_conns = 1,
-           std::size_t  max_conns = 5,
+           std::size_t  max_conns = 1,
            Logger*      pg_logger = nullptr);
     ~PgPool();
 
@@ -429,7 +443,23 @@ public:
     PgPool& operator=(const PgPool&) = delete;
 
     /// Open min_conns connections and register them with the event loop.
+    /// A lazy pool (set_lazy()) opens nothing here.
     void start();
+
+    /// A lazy pool opens no pool connection until the first execute(): start()
+    /// connects nothing and heartbeat() restores no minimum before it. For a
+    /// process that may never run a query — it holds no connection then. The
+    /// LISTEN connection is not the pool's: listen() and listener_execute()
+    /// open it as before. Set before start().
+    void set_lazy(bool lazy) { lazy_ = lazy; }
+
+    /// How long a connection may stay idle (Ready, nothing in flight) while
+    /// the pool holds more than min_conns; past it, heartbeat() closes it.
+    /// Zero — never closed. Default 60 s. Checked by heartbeat(): a connection
+    /// is closed at the first heartbeat past the limit. Without max_conns above
+    /// min_conns the pool rarely holds more than min_conns, and this does nothing.
+    void set_idle_timeout(std::chrono::seconds limit) { idle_timeout_ = limit; }
+    std::chrono::seconds idle_timeout() const { return idle_timeout_; }
 
     /// Session settings returned to their start-of-session value before every
     /// query on a pool connection, so that a setting one query leaves on the
@@ -518,8 +548,10 @@ public:
 
     /// Call periodically (e.g. every 60s from module heartbeat).
     /// Checks connection health, reconnects dead connections, replaces those
-    /// left in Error with nothing to drive them, restores min_conns, and arms
-    /// the handshake watch if a handshake in flight has none. Does not throw
+    /// left in Error with nothing to drive them, restores min_conns, grows for
+    /// a queue still waiting, closes connections idle above min_conns
+    /// (set_idle_timeout() — so the timeout is honoured to within one period),
+    /// and arms the handshake watch if a handshake in flight has none. Does not throw
     /// on a refusal of the loop (a socket or a timer it cannot take): a step
     /// that fails is logged, the steps after it still run.
     void heartbeat();
@@ -660,7 +692,10 @@ public:
     void detach() noexcept;
 
 private:
-    void new_connection();
+    /// @p growth — a connection above min_conns (grow_for_queue()): not
+    /// deferred to the reconnect timer by the backoff, and its failure does
+    /// not move the backoff but pauses growth (record_connect_failure()).
+    void new_connection(bool growth = false);
     void on_io(PgConnection& conn, uint32_t events);
     void dispatch_queue(PgConnection& conn);
 
@@ -702,8 +737,25 @@ private:
     /// is not armed. Refused by the loop, it is logged; heartbeat() asks again.
     void arm_lost_delivery() noexcept;
 
-    /// Ensure at least min_conns_ healthy connections exist.
+    /// Ensure at least min_conns_ healthy connections exist. Does nothing in a
+    /// lazy pool not used yet.
     void ensure_min_connections();
+
+    /// Open connections for @p demand queued queries: one for each not covered
+    /// by a connection already being opened, while fewer than max_conns_ are
+    /// healthy. Stops at the first one the backoff defers or libpq refuses.
+    void grow_for_queue(std::size_t demand);
+
+    /// Close Ready connections idle past idle_timeout_ while more than
+    /// min_conns_ are healthy.
+    void close_idle(std::chrono::steady_clock::time_point now);
+
+    /// Take a connection out of the pool and close it; true if it was there.
+    bool remove_connection(PgConnection& conn, std::string_view why);
+
+    /// Connections in Connecting with a socket — they take queued queries
+    /// once up.
+    std::size_t connecting_count() const;
 
     /// Count connections in Ready, Busy or Connecting state with a socket.
     std::size_t healthy_count() const;
@@ -844,6 +896,11 @@ private:
     void on_stall_watch();
     void drop_stalled(std::chrono::steady_clock::time_point now);
     std::chrono::seconds stall_timeout_{0};
+    std::chrono::seconds idle_timeout_{60};
+    // A growth connection failed: no growth before this (record_connect_failure()).
+    std::chrono::steady_clock::time_point growth_paused_until_{};
+    bool                 lazy_{false};
+    bool                 used_{false};   // a lazy pool asked for something
     EventLoop::TimerId   stall_timer_{EventLoop::kInvalidTimer};
 
     // Pointer set of connections currently registered with EventLoop.
