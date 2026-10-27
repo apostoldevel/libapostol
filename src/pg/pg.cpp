@@ -1210,11 +1210,18 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
         }
 
         case PgConnState::Error: {
+            // As the PQconsumeInput failure above: a quiet query in flight may
+            // have its error parsed into the buffer, not yet reduced.
+            const bool quiet_inflight =
+                conn.current_query() && conn.current_query()->quiet();
+            const std::string reason = quiet_inflight
+                ? "connection lost (the in-flight statement is quiet; its text is withheld)"
+                : conn.error_message();
             if (pg_logger_)
-                pg_logger_->error("{} Error: {}", conn_tag(conn), conn.error_message());
+                pg_logger_->error("{} Error: {}", conn_tag(conn), reason);
 
             // Fail any in-flight query on this connection
-            fail_inflight_query(conn, conn.error_message());
+            fail_inflight_query(conn, reason);
 
             // Attempt reconnect (mirrors v1 GetReadyConnection -> ResetStart)
             if (!try_reconnect(conn)) {
@@ -3021,10 +3028,16 @@ void PgPool::deliver_listener_query(std::vector<PgResult> results)
     auto q = std::move(listener_query_);
 
     // A quiet statement's error text may quote the statement: reduced before
-    // the log line and the handlers see it, as on_io does.
-    if (q->quiet())
+    // the log line and the handlers see it, as on_io does — in the listener's
+    // own buffer too, which a listener lost later reports at the head of its
+    // message ("LISTEN subscription lost (…)").
+    if (q->quiet()) {
         for (auto& r : results)
             r.withhold_statement();
+        if (listener_ && std::any_of(results.begin(), results.end(),
+                                     [](const PgResult& r) { return !r.ok(); }))
+            listener_->withhold_last_error();
+    }
 
     // As on_io does for a pool query: a failed statement goes to the error
     // handler, and a caller without one gets the results and reads ok().
@@ -3562,7 +3575,15 @@ void PgPool::on_listener_io(uint32_t events)
         }
 
         case PgConnState::Error:
-            restart_listener(listener_->error_message());
+            // EPOLLERR/EPOLLHUP: libpq has read nothing of the loss, and its
+            // buffer holds what the last statement left — with a quiet one in
+            // flight, its error parsed ahead of a ReadyForQuery that never
+            // came, not yet reduced. The reason goes to the log and to that
+            // statement's handler.
+            if (listener_query_ && listener_query_->quiet())
+                restart_listener("connection lost (the in-flight statement is quiet; its text is withheld)");
+            else
+                restart_listener(listener_->error_message());
             // start_listener() registered the replacement fd via add_io,
             // which arms it; the old fd is gone. Skip the rearm below rather
             // than touch a connection this handler just replaced.
