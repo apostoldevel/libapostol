@@ -1,4 +1,5 @@
 #include "apostol/websocket.hpp"
+#include "apostol/config.hpp"
 
 #include "apostol/event_loop.hpp"
 
@@ -7,6 +8,9 @@
 #  include <openssl/buffer.h>
 #  include <openssl/evp.h>
 #endif
+
+#include <fmt/format.h>
+#include <nlohmann/json.hpp>
 
 #include <sys/epoll.h>
 
@@ -17,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -469,6 +474,7 @@ bool WsConnection::on_writable()
             return true;
         }
         pending_pos_ += static_cast<std::size_t>(n);
+        drained_at_ = std::chrono::steady_clock::now();   // the peer acknowledges (WsKeepAlive)
     }
 
     pending_.clear();
@@ -521,11 +527,19 @@ bool WsConnection::on_readable(MessageHandler on_msg, CloseHandler on_close)
     // Drain all available data
     char    buf[4096];
     bool    got_eof = false;
+    bool    got_any = false;
     for (;;) {
         ssize_t n = conn_.read(buf, sizeof(buf));
         if (n < 0) break;                                // EAGAIN
         if (n == 0) { got_eof = true; break; }           // EOF
+        got_any = true;
         if (!parser_.feed(buf, static_cast<std::size_t>(n))) break;
+    }
+
+    // A sign of life, whatever the bytes were (WsKeepAlive).
+    if (got_any) {
+        last_read_ = std::chrono::steady_clock::now();
+        keepalive_ping_at_.reset();
     }
 
     // Auto-respond to ping
@@ -545,6 +559,85 @@ bool WsConnection::on_readable(MessageHandler on_msg, CloseHandler on_close)
     }
 
     return true;
+}
+
+// ── WsKeepAlive ──────────────────────────────────────────────────────────────
+
+WsKeepAlive::Step WsKeepAlive::step(WsConnection& ws, std::chrono::steady_clock::time_point now) const
+{
+    if (!enabled() || ws.closed())
+        return Step::none;
+
+    if (ws.keepalive_ping_at_) {
+        // A tail draining since the ping: alive, and the ping may still be
+        // behind it — the grace counts from the last progress.
+        if (ws.drained_at_ > *ws.keepalive_ping_at_)
+            ws.keepalive_ping_at_ = ws.drained_at_;
+        const auto grace = close_after.count() > 0 ? close_after : ping_after;
+        if (now - *ws.keepalive_ping_at_ < grace)
+            return Step::none;
+        // The peer is gone, or too slow to count as there: not waiting for
+        // its close in answer — the owner tears the session down now.
+        ws.keepalive_ping_at_.reset();
+        ws.send_close(1001, "no answer to ping");
+        ws.closed_ = true;
+        return Step::closed;
+    }
+
+    if (now - std::max(ws.last_read_, ws.drained_at_) < ping_after)
+        return Step::none;
+
+    ws.send_ping();
+    if (ws.closed())   // the write failed, or the backpressure cap was hit
+        return Step::closed;
+    ws.keepalive_ping_at_ = now;
+    return Step::pinged;
+}
+
+namespace
+{
+
+constexpr long long kMaxKeepAliveSeconds = 999'999'999;
+
+std::chrono::seconds keepalive_seconds(const nlohmann::json& section, std::string_view where, const char* key)
+{
+    const auto it = section.find(key);
+    if (it == section.end() || it->is_null())
+        return std::chrono::seconds{0};
+
+    long long v = -1;   // stays -1 for what is not a number of seconds
+    if (it->is_number_unsigned()) {
+        if (it->get<std::uint64_t>() <= static_cast<std::uint64_t>(kMaxKeepAliveSeconds))
+            v = static_cast<long long>(it->get<std::uint64_t>());
+    } else if (it->is_number_integer()) {
+        if (it->get<long long>() <= kMaxKeepAliveSeconds)
+            v = it->get<long long>();
+    } else if (it->is_string()) {
+        const auto& str = it->get_ref<const std::string&>();
+        // "${VAR}" with the variable unset or blank is an absent key, as
+        // everywhere in the configuration.
+        if (std::all_of(str.begin(), str.end(), [](unsigned char c) { return std::isspace(c); }))
+            return std::chrono::seconds{0};
+        if (str.size() <= 9 &&
+            std::all_of(str.begin(), str.end(), [](unsigned char c) { return std::isdigit(c); }))
+            v = std::stoll(str);
+    }
+    if (v < 0)
+        throw ConfigError(fmt::format("{}.{}: expected a number of seconds (0 — off), got {}", where, key,
+                                      it->dump(-1, ' ', false, nlohmann::json::error_handler_t::replace)));
+    return std::chrono::seconds{v};
+}
+
+} // namespace
+
+WsKeepAlive WsKeepAlive::from_config(const nlohmann::json* section, std::string_view where)
+{
+    WsKeepAlive k;
+    if (!section || !section->is_object())
+        return k;
+    k.ping_after  = keepalive_seconds(*section, where, "ping_interval");
+    k.close_after = keepalive_seconds(*section, where, "ping_timeout");
+    return k;
 }
 
 // ── ws_upgrade ────────────────────────────────────────────────────────────────

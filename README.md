@@ -325,7 +325,11 @@ application passes to `setup_db()` (the template passes the settings).
 A custom process opens its pool (`postgres.helper`) lazily: no connection until
 its first query, so a process that never runs one holds none — and a wrong
 password or host shows in its log at that first query, not at start. Its LISTEN
-connection is opened by `listen()` as before.
+connection is opened by `listen()` as before. The connection is made after the
+process has switched to `process.user` — unless `on_start()` already sent a
+query — and `$HOME` stays the one the process started with: give the files
+libpq reads — a client key (`sslkey`), `.pgpass` (`PGPASSFILE`) — as absolute
+paths readable by that user, not only by root, or the first query fails.
 
 ### Connection lifetime
 
@@ -436,6 +440,39 @@ A failed connect moves the backoff (1, 2, then 4 s on) one step per round of
 attempts, not per connection: a pool and its listener that meet one dead
 server together count it once. A server back after a long outage is tried
 within 4 s.
+
+### WebSockets nobody writes to
+
+A WebSocket tunnel with no traffic can be cut on the way — a proxy's idle
+limit, a NAT entry, a peer gone without a FIN — and neither side learns of it.
+`WsKeepAlive` is the server's side of the answer (RFC 6455 §5.5.2): after
+`ping_after` of silence from the peer — no frame of any kind — a ping; nothing
+read within `close_after` of it — a close `1001` and `closed()`. The library
+does not hold the sessions a handler took over, so the module that holds them
+applies the rule from its `heartbeat()`, once a second, for each of them:
+
+```cpp
+// in the module's constructor: { "module": { "<Name>": { "ping_interval": 30, "ping_timeout": 30 } } }
+keepalive_ = WsKeepAlive::from_config(app.module_config("<Name>"), "module.<Name>");
+
+// in heartbeat(), before any throttle of its own: a session whose step() says
+// closed is torn down as any closed() one — collected first, removed after
+const auto now = std::chrono::steady_clock::now();
+std::vector<int> dead;
+for (auto& [fd, session] : sessions_)
+    if (keepalive_.step(*session->ws, now) == WsKeepAlive::Step::closed)
+        dead.push_back(fd);
+for (int fd : dead)
+    remove_session(fd);
+```
+
+`ping_interval` and `ping_timeout` are seconds, a number or a string of digits
+(`"${VAR}"`; unset or blank counts as absent). `ping_interval` `0` or absent —
+off, the default. `ping_timeout` `0` or absent — the same as `ping_interval`.
+Anything else throws `ConfigError` naming `module.<Name>.<key>` (pass the name
+as `from_config(section, "module.<Name>")`) — read at start, it fails the
+start. A backpressure tail that keeps draining counts as an answer: a peer that
+only receives, on a slow link, is not closed while it reads.
 
 ### Stopping without dropping the work in flight
 

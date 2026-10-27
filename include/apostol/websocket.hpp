@@ -3,13 +3,16 @@
 #include "apostol/http.hpp"
 #include "apostol/tcp.hpp"
 
+#include <nlohmann/json_fwd.hpp>
+
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
 
-namespace apostol { class EventLoop; }
+namespace apostol { class EventLoop; struct WsKeepAlive; }
 
 namespace apostol
 {
@@ -107,6 +110,10 @@ public:
     int  fd()     const noexcept { return conn_.fd(); }
     bool closed() const noexcept { return closed_; }
 
+    /// When bytes last came from the peer — a frame of any kind, a ping or a
+    /// pong included; the handshake (construction) counts as the first.
+    std::chrono::steady_clock::time_point last_read() const noexcept { return last_read_; }
+
     /// Bind an EventLoop so send_* can arm EPOLLOUT automatically when a
     /// write hits EAGAIN. Optional — without it the caller is responsible
     /// for watching EPOLLOUT and calling on_writable() themselves.
@@ -166,9 +173,58 @@ private:
     std::size_t   max_pending_{1024 * 1024};  // 1 MiB default cap
     std::size_t   pending_pos_{0};
 
+    std::chrono::steady_clock::time_point                last_read_{std::chrono::steady_clock::now()};
+    std::optional<std::chrono::steady_clock::time_point> keepalive_ping_at_;   // WsKeepAlive's ping, unanswered
+    std::chrono::steady_clock::time_point                drained_at_{};        // a backpressure tail last moved
+
+    friend struct WsKeepAlive;
+
     void send_raw(uint8_t opcode, std::string_view payload, bool fin = true);
     void arm_write_interest();
     void lost_watch();   // modify_io() failed: the loop let go of the fd (T607)
+};
+
+// ── WsKeepAlive ──────────────────────────────────────────────────────────────
+
+/// Liveness of the WebSockets a server holds. A tunnel nobody writes to can be
+/// cut on the way — a proxy's idle limit, a NAT entry, a peer that vanished
+/// without a FIN — and neither side learns of it: the server keeps the session,
+/// the client sees nothing until it sends. A ping from the server is answered
+/// by any conforming peer with a pong (RFC 6455 §5.5.2), browsers included,
+/// and the traffic keeps the path open.
+///
+/// The rule: after @c ping_after of silence from the peer — no frame of any
+/// kind — send a ping; if nothing at all is read within @c close_after of it,
+/// send a close (1001) and mark the connection closed(). Anything read, the
+/// pong or any other frame, ends the wait. So does a backpressure tail that
+/// keeps draining: the peer's kernel is acknowledging, and a ping queued
+/// behind the tail has not reached it yet.
+///
+/// The owner of the sessions applies it: step() once a heartbeat (a module's
+/// heartbeat() runs every second) for every connection it holds, and tears a
+/// session down when step() says closed — as for any closed() connection. Off
+/// by default: @c ping_after zero does nothing.
+struct WsKeepAlive
+{
+    std::chrono::seconds ping_after{0};    ///< silence before a ping; 0 — off
+    std::chrono::seconds close_after{0};   ///< no answer this long after the ping: close; 0 — as ping_after
+
+    bool enabled() const noexcept { return ping_after.count() > 0; }
+
+    enum class Step {
+        none,     ///< nothing to do: off, closed, within the norm, or waiting for the answer
+        pinged,   ///< a ping went out
+        closed,   ///< no answer: a close was queued (not flushed behind a tail), the connection is closed()
+    };
+
+    Step step(WsConnection& ws, std::chrono::steady_clock::time_point now) const;
+
+    /// From a module's section: "ping_interval" → ping_after and
+    /// "ping_timeout" → close_after, seconds (at most 999999999), a number or a
+    /// string of digits (a "${VAR}" from the environment arrives as a string).
+    /// Absent, null, an empty or blank string — 0. Anything else throws
+    /// ConfigError naming "<where>.<key>". @p section may be null: off.
+    static WsKeepAlive from_config(const nlohmann::json* section, std::string_view where = "module");
 };
 
 // ── HTTP → WebSocket upgrade ──────────────────────────────────────────────────
