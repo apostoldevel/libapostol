@@ -335,6 +335,10 @@ void Application::start_process()
                 settings_.server_port, settings_.server_backlog, settings_.server_listen);
             listen_fd_ = master_listener_->fd();
             http_port_ = master_listener_->local_port();
+            // Made once, kept over reloads: the workers' count may change.
+            if (!accept_balance_.create())
+                logger_->warn("master: no shared memory for the accept balance — "
+                              "a burst of connections may land on one worker");
             logger_->notice("master: bound listening socket on {}:{}",
                             settings_.server_listen.empty() ? "*" : settings_.server_listen,
                             http_port_);
@@ -1758,6 +1762,8 @@ void Application::reap_children()
 
     while ((pid = ::waitpid(-1, &status, WNOHANG)) > 0)
     {
+        accept_balance_.release(pid);
+
         auto it = std::find_if(children_.begin(), children_.end(),
             [pid](const ChildInfo& c) { return c.pid == pid; });
 
@@ -2425,6 +2431,8 @@ void Application::stop_http_server(EventLoop& loop)
         loop.remove_io(http_listen_fd_);
         http_listen_fd_ = -1;
     }
+    TcpConnection::observe_live(nullptr, nullptr);
+    accept_balance_.leave();
     close_listener();
 
     std::size_t closed = 0, open = 0;
@@ -2493,6 +2501,40 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
     // Under LT (flag OFF) the loop is equivalent — single accept per event
     // still works because LT re-fires until the queue empties, but the
     // drain shape is harmless and keeps one code path.
+    //
+    // Several workers share one listening socket: every one is woken by the
+    // same arrivals, and the one that runs first drains the whole burst —
+    // every client reconnecting at once lands on one worker. Under ET a
+    // worker that holds more connections than another leaves the queue to it
+    // (accept_balance.hpp): its listener stays unarmed for a while. Under LT,
+    // with one process or without the shared table, it drains as before.
+#ifdef APOSTOL_EPOLL_ET
+    if (listen_fd_ >= 0 && settings_.effective_workers() > 1) {
+        if (accept_balance_.join(::getpid())) {
+            // Every open and close is seen by the others at once: a count
+            // read late lets two workers each leave a connection to the
+            // other. The timers say only that this worker is alive — the
+            // first once its loop runs: until then the others must not
+            // leave it anything.
+            TcpConnection::observe_live(
+                [](void* ctx, int live, long long lived_ms) noexcept {
+                    auto* balance = static_cast<AcceptBalance*>(ctx);
+                    balance->closed(lived_ms);
+                    balance->publish(live);
+                },
+                &accept_balance_);
+            const auto alive = [this] {
+                if (http_listen_fd_ >= 0)
+                    accept_balance_.publish(TcpConnection::live());
+            };
+            loop.add_timer(std::chrono::milliseconds(1), alive, false);
+            loop.add_timer(std::chrono::seconds(1), alive);
+        } else if (accept_balance_.created()) {
+            logger_->warn("worker: no free slot in the accept balance — this worker takes "
+                          "whole bursts of connections");
+        }
+    }
+#endif
     int listen_fd = listener->fd();
     http_listen_fd_ = listen_fd;
     loop.add_io(listen_fd, EPOLLIN,
@@ -2502,8 +2544,9 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
             // after this event. Always rearm, even on exceptions from the
             // accept handlers — otherwise a single bad alloc or handler
             // throw would permanently stop accepting new connections.
+            bool rearm = true;
             try {
-                listener->accept_drain(
+                const TcpListener::AcceptHandler on_conn =
                     [this, &loop](TcpConnection raw_conn)
                     {
                         auto http_conn = std::make_shared<HttpConnection>(std::move(raw_conn), &loop, &logger());
@@ -2602,7 +2645,52 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
                                     loop.remove_io(conn_fd);
                                 }
                             });
-                    });
+                    };
+
+#ifdef APOSTOL_EPOLL_ET
+                if (accept_balance_.joined()) {
+                    // One at a time while no live worker holds fewer (each
+                    // accept is published by observe_live). Past that, the
+                    // listener stays unarmed and is looked at again shortly;
+                    // a queue the others leave for kDeferMs gives one
+                    // connection here, and the wait starts again.
+                    using clock = std::chrono::steady_clock;
+                    const auto now = clock::now();
+                    for (;;) {
+                        if (accept_balance_.may_accept(TcpConnection::live())) {
+                            accept_defer_since_ = {};   // the wait, if any, is over
+                        } else {
+                            if (accept_defer_since_ == clock::time_point{}
+                                || now - accept_defer_last_ > AcceptBalance::kEpisodeGapMs)
+                                accept_defer_since_ = now;
+                            accept_defer_last_ = now;
+                            if (now - accept_defer_since_ < AcceptBalance::kDeferMs) {
+                                bool timer = false;
+                                try {
+                                    loop.add_timer(AcceptBalance::kRecheckMs, [this, &loop, listen_fd] {
+                                        if (http_listen_fd_ == listen_fd)
+                                            loop.rearm_io(listen_fd);
+                                    }, false);
+                                    timer = true;
+                                } catch (const std::exception&) {
+                                    // No timer (descriptors exhausted): take
+                                    // the connection rather than spin here.
+                                }
+                                if (timer) {
+                                    // Only once the timer is set: without it
+                                    // the listener would never be armed again.
+                                    rearm = false;
+                                    break;
+                                }
+                            }
+                            accept_defer_since_ = now;
+                        }
+                        if (listener->accept_drain(on_conn, 1) == 0)
+                            break;
+                    }
+                } else
+#endif
+                listener->accept_drain(on_conn);
             } catch (const std::exception& e) {
                 if (logger_)
                     logger_->error("Accept loop threw: {} — listener will rearm", e.what());
@@ -2610,7 +2698,8 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
                 if (logger_)
                     logger_->error("Accept loop threw unknown exception — listener will rearm");
             }
-            loop.rearm_io(listen_fd);
+            if (rearm)
+                loop.rearm_io(listen_fd);
         });
 
     // Module heartbeat — every 1 second

@@ -12,6 +12,10 @@
 #include <stdexcept>
 #include <system_error>
 
+#include <atomic>
+
+#include <time.h>
+
 #include <fmt/format.h>
 
 namespace apostol
@@ -19,18 +23,61 @@ namespace apostol
 
 // ─── TcpConnection ────────────────────────────────────────────────────────────
 
+namespace
+{
+std::atomic<int>              g_live_connections{0};
+TcpConnection::LiveObserver   g_live_observer{nullptr};
+void*                         g_live_observer_ctx{nullptr};
+
+long long monotonic_ms() noexcept
+{
+    timespec ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<long long>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+
+void live_changed(int delta, long long lived_ms) noexcept
+{
+    const int now = g_live_connections.fetch_add(delta, std::memory_order_relaxed) + delta;
+    if (g_live_observer)
+        g_live_observer(g_live_observer_ctx, now, lived_ms);
+}
+} // namespace
+
+int TcpConnection::live() noexcept
+{
+    return g_live_connections.load(std::memory_order_relaxed);
+}
+
+void TcpConnection::observe_live(LiveObserver fn, void* ctx) noexcept
+{
+    g_live_observer     = fn;
+    g_live_observer_ctx = ctx;
+}
+
 TcpConnection::TcpConnection(int fd, sockaddr_storage peer_addr, socklen_t peer_len) noexcept
     : fd_(fd), peer_addr_(peer_addr), peer_len_(peer_len)
-{}
+{
+    if (fd_ >= 0) {
+        opened_ms_ = monotonic_ms();
+        live_changed(+1, -1);
+    }
+}
+
+void TcpConnection::closed() noexcept
+{
+    ::close(fd_);
+    live_changed(-1, monotonic_ms() - opened_ms_);
+}
 
 TcpConnection::~TcpConnection()
 {
     if (fd_ >= 0)
-        ::close(fd_);
+        closed();
 }
 
 TcpConnection::TcpConnection(TcpConnection&& o) noexcept
-    : fd_(o.fd_), peer_addr_(o.peer_addr_), peer_len_(o.peer_len_)
+    : fd_(o.fd_), peer_addr_(o.peer_addr_), peer_len_(o.peer_len_), opened_ms_(o.opened_ms_)
 {
     o.fd_ = -1;
 }
@@ -38,10 +85,12 @@ TcpConnection::TcpConnection(TcpConnection&& o) noexcept
 TcpConnection& TcpConnection::operator=(TcpConnection&& o) noexcept
 {
     if (this != &o) {
-        if (fd_ >= 0) ::close(fd_);
+        if (fd_ >= 0)
+            closed();
         fd_        = o.fd_;
         peer_addr_ = o.peer_addr_;
         peer_len_  = o.peer_len_;
+        opened_ms_ = o.opened_ms_;
         o.fd_      = -1;
     }
     return *this;
@@ -260,10 +309,12 @@ std::optional<TcpConnection> TcpListener::accept()
     return TcpConnection{conn_fd, peer, len};
 }
 
-int TcpListener::accept_drain(const AcceptHandler& on_conn)
+int TcpListener::accept_drain(const AcceptHandler& on_conn, int limit)
 {
     int count = 0;
     for (;;) {
+        if (limit > 0 && count >= limit)
+            return count;
         std::optional<TcpConnection> conn_opt;
         try {
             conn_opt = accept();

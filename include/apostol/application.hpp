@@ -2,6 +2,7 @@
 
 #include <map>
 
+#include "apostol/accept_balance.hpp"
 #include "apostol/config.hpp"
 #include "apostol/event_loop.hpp"
 #include "apostol/logger.hpp"
@@ -478,6 +479,13 @@ private:
     std::unique_ptr<Logger>  stream_logger_;
 
     std::unique_ptr<TcpListener> master_listener_;  // listening socket (master only)
+    // Workers sharing master_listener_: who holds how many connections (made
+    // by the master before fork; see accept_balance.hpp).
+    AcceptBalance accept_balance_;
+    // A worker leaving new connections to the others: since when, and when it
+    // last looked (a gap ends the wait). Zero — not waiting.
+    std::chrono::steady_clock::time_point accept_defer_since_{};
+    std::chrono::steady_clock::time_point accept_defer_last_{};
     int listen_fd_{-1};                              // fd inherited by workers via fork
 
     std::vector<ChildInfo>            children_;

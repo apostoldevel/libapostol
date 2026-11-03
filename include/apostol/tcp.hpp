@@ -34,6 +34,17 @@ public:
     std::string peer_address() const;   // e.g. "127.0.0.1"
     uint16_t    peer_port()    const noexcept;
 
+    /// TcpConnection objects this process holds open now, from construction
+    /// to close — the server's accepted connections (HTTP, then WebSocket
+    /// after an upgrade), and any socket a caller wraps in one.
+    static int live() noexcept;
+    /// Told every change of live(), in this process: @p fn(@p ctx, live,
+    /// lived_ms) — lived_ms is how long a closed one was open, -1 for an
+    /// open. One observer; nullptr — nobody. For the accept balance
+    /// (accept_balance.hpp).
+    using LiveObserver = void (*)(void* ctx, int live, long long lived_ms) noexcept;
+    static void observe_live(LiveObserver fn, void* ctx) noexcept;
+
     /// Non-blocking read.
     /// Returns: >0 bytes read, 0 on EOF (peer closed), -1 on EAGAIN/EWOULDBLOCK.
     ssize_t read(void* buf, std::size_t len) noexcept;
@@ -60,9 +71,12 @@ public:
     ssize_t write(const void* buf, std::size_t len) noexcept;
 
 private:
+    void closed() noexcept;
+
     int               fd_       {-1};
     sockaddr_storage  peer_addr_{};
     socklen_t         peer_len_ {0};
+    long long         opened_ms_{0};   // CLOCK_MONOTONIC, for lived_ms
 };
 
 // ─── TcpListener ─────────────────────────────────────────────────────────────
@@ -107,8 +121,12 @@ public:
     /// must drain the accept queue before returning, otherwise subsequent
     /// pending connections are stranded until the next new connect().
     /// Returns the number of connections accepted (≥ 0).
+    ///
+    /// @p limit > 0 stops after that many, the rest left in the queue. Under
+    /// APOSTOL_EPOLL_ET the caller's rearm_io() reports the listener ready
+    /// again while the queue is not empty, so nothing is stranded.
     using AcceptHandler = std::function<void(TcpConnection)>;
-    int accept_drain(const AcceptHandler& on_conn);
+    int accept_drain(const AcceptHandler& on_conn, int limit = 0);
 
 private:
     explicit TcpListener(int fd, bool owns) noexcept;

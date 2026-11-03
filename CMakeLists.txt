@@ -97,6 +97,7 @@ add_library(apostol STATIC
     src/core/crash_handler.cpp
     src/core/settings.cpp
     src/net/tcp.cpp
+    src/net/accept_balance.cpp
     src/net/http.cpp
     src/net/websocket.cpp
     src/net/udp.cpp
