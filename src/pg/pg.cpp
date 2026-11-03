@@ -1745,6 +1745,11 @@ void PgPool::enqueue(std::unique_ptr<PgQuery> q)
 
 bool PgPool::try_reconnect(PgConnection& conn)
 {
+    // A successor reset in place is no longer up: the connection it replaces
+    // stays until the reset is done. Set again when it is Ready.
+    if (&conn == successor_)
+        successor_up_ = false;
+
     int old_fd = conn.fd();
 
     // Attempt async reset (reuses existing PGconn handle — cheapest reconnect).
@@ -1974,6 +1979,11 @@ bool PgPool::start_retirement(PgConnection& conn, std::chrono::steady_clock::tim
 bool PgPool::finish_retirement()
 {
     if (!retiring_ || !successor_up_)
+        return false;
+    // Up means in service now, not once: a successor put into Error on a path
+    // that never reached try_reconnect() keeps the old connection too.
+    if (!successor_ || (successor_->state() != PgConnState::Ready
+                        && successor_->state() != PgConnState::Busy))
         return false;
 
     // Free: nothing in flight, no cancel on its way — and no transaction block

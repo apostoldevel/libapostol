@@ -364,7 +364,9 @@ that has lived this long is replaced by a new one:
 - Checked when a query completes and by the pool's heartbeat, once a minute:
   an idle connection goes at the first heartbeat past its term, the next idle
   one a minute later. A reconnect starts a new term; a connection being replaced
-  that reconnects is still closed once its replacement is up.
+  that reconnects is still closed once its replacement is up. A replacement
+  that loses its connection is not up again until it has reconnected: the
+  connection it replaces stays in service meanwhile.
 - Every pool — worker, helper, custom process, `db_pool(role)`; not the LISTEN
   connection, not the leader's lock connection. Logged at notice:
   `Past postgres.pool.lifetime (…s): opening its successor`, then

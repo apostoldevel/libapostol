@@ -1003,7 +1003,8 @@ private:
     std::minstd_rand     lifetime_rng_{static_cast<std::minstd_rand::result_type>(
         std::chrono::steady_clock::now().time_since_epoch().count())};
     // The connection past its term being retired, and its successor — opened
-    // first; successor_up_ once it has connected. All clear — no retirement in
+    // first; successor_up_ set when its connect or reset reaches Ready, cleared
+    // when a reset in place starts. All clear — no retirement in
     // progress. remove_connection() ends the retirement whichever of the two
     // it takes out of the pool.
     PgConnection*        retiring_{nullptr};
