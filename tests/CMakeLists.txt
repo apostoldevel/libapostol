@@ -51,6 +51,12 @@ target_link_libraries(ip_allow_list_test PRIVATE apostol)
 target_compile_options(ip_allow_list_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME ip_allow_list COMMAND ip_allow_list_test)
 
+# fetch_policy_test — FetchAddressPolicy in this process; no network, no files.
+add_executable(fetch_policy_test fetch_policy_test.cpp)
+target_link_libraries(fetch_policy_test PRIVATE apostol)
+target_compile_options(fetch_policy_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME fetch_policy COMMAND fetch_policy_test)
+
 # metrics_test — the metrics text, then a node of two workers, the helper and
 # "probe": with enable_metrics() (on), and with no channels at all (off).
 add_executable(metrics_test metrics_test.cpp)

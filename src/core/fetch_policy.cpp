@@ -164,6 +164,10 @@ FetchAddressPolicy FetchAddressPolicy::parse(bool deny_internal, const std::vect
         std::string_view e(entry);
         if (e.empty())
             throw bad("empty");
+        // inet_pton reads a C string: text after a NUL would never be checked.
+        // The error names the entry up to the NUL: what() would stop there.
+        if (auto nul = e.find('\0'); nul != std::string_view::npos)
+            throw std::invalid_argument(fmt::format("fetch.allow entry '{}': contains a NUL", e.substr(0, nul)));
 
         Rule r;
         std::string_view host = e;
@@ -238,13 +242,14 @@ FetchAddressPolicy FetchAddressPolicy::parse(bool deny_internal, const std::vect
         if (slash != std::string::npos) {
             if (r.port != 0)
                 throw bad("a network takes no port");
+            // Unsigned: from_chars then takes no sign ("-0" is not a length).
             auto len = std::string_view(h).substr(slash + 1);
-            int v = -1;
+            unsigned v = 0;
             auto [ptr, ec] = std::from_chars(len.data(), len.data() + len.size(), v);
-            int max = r.v4 ? 32 : 128;
-            if (len.empty() || ec != std::errc{} || ptr != len.data() + len.size() || v < 0 || v > max)
+            unsigned max = r.v4 ? 32 : 128;
+            if (len.empty() || ec != std::errc{} || ptr != len.data() + len.size() || v > max)
                 throw bad(fmt::format("prefix must be 0..{}", max));
-            r.prefix = v;
+            r.prefix = static_cast<int>(v);
         }
 
         p.allow_.push_back(std::move(r));
