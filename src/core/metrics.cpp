@@ -146,12 +146,19 @@ std::string merge_metrics(const std::vector<std::string_view>& texts)
     auto family_of = [&](std::string_view name) -> Family& {
         std::string key(name);
         if (!families.contains(key)) {
-            // A histogram's or a summary's samples belong to the declared base.
+            // A histogram's or a summary's samples belong to the declared base —
+            // only to a base declared as one: "x_count" next to a gauge "x" is a
+            // family of its own.
             for (std::string_view suffix : {"_bucket", "_sum", "_count"}) {
                 if (name.size() > suffix.size() && name.ends_with(suffix)) {
                     std::string base(name.substr(0, name.size() - suffix.size()));
-                    if (families.contains(base))
-                        return families[base];
+                    auto it = families.find(base);
+                    if (it == families.end())
+                        continue;
+                    const std::string_view type = it->second.type;
+                    if (type.ends_with(" histogram")
+                        || (suffix != "_bucket" && type.ends_with(" summary")))
+                        return it->second;
                 }
             }
             order.push_back(key);

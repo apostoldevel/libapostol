@@ -327,7 +327,10 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
 
     // ── requests ─────────────────────────────────────────────────────────────
 
-    void complete(std::uint32_t id, IpcResult result)
+    // The request ends now: no reply or timeout can reach it any more. @p later —
+    // its callback runs from the loop, not here: the caller may be inside
+    // request(), send() or a reply, which must not call back into their caller.
+    void complete(std::uint32_t id, IpcResult result, bool later = false)
     {
         auto it = pending.find(id);
         if (it == pending.end())
@@ -340,6 +343,13 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
         bump(stats.requests, p.type, ipc_error_name(result.error));
         if (!p.done)
             return;
+        if (later)
+        {
+            defer([done = std::move(p.done), result = std::move(result)]() mutable {
+                done(std::move(result));
+            });
+            return;
+        }
         try { p.done(std::move(result)); }
         catch (const std::exception& e) { warn("ipc: request callback failed: {}", e.what()); }
         catch (...) { warn("ipc: request callback failed"); }
@@ -380,7 +390,7 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
             if (p.slot == slot && p.generation == generation)
                 ids.push_back(id);
         for (auto id : ids)
-            complete(id, {error, {}});
+            complete(id, {error, {}}, /*later=*/true);
     }
 
     // ── sending ──────────────────────────────────────────────────────────────
@@ -464,13 +474,35 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
                 l.out.pop_front();
                 continue;
             }
-            if (errno == EINTR)
+            const int err = errno;
+            if (err == EINTR)
                 continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (err == EAGAIN || err == EWOULDBLOCK)
             {
                 ++stats.blocked;
                 watch_writable(slot, l);
                 return true;
+            }
+            if (err == ENOBUFS || err == ENOMEM)
+            {
+                // Short of kernel memory, not of room in the channel: no
+                // EPOLLOUT will tell when it passes. The queue stays; on_beat
+                // tries again.
+                ++stats.blocked;
+                if (l.watching && loop)
+                {
+                    loop->remove_io(l.fd);
+                    l.watching = false;
+                }
+                return true;
+            }
+            // EPIPE and the like: the process is gone. Anything else is not
+            // expected of a local socket — said, then treated the same way.
+            if (err != EPIPE && err != ECONNRESET && err != ECONNREFUSED)
+            {
+                const auto peer = peer_of(slot, l.generation);
+                warn("ipc: writing to '{}' (slot {}) failed: {} — the channel is closed",
+                     peer.name, slot, std::strerror(err));
             }
             link_dead(slot, l.generation);
             return false;
@@ -497,6 +529,7 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
     }
 
     // Everything owed to or expected from (slot, generation) ends: it is gone.
+    // Reached from inside a send — the callbacks of what ends run later.
     void forget(int slot, std::uint32_t generation)
     {
         if (auto h = held.find(slot); h != held.end())
@@ -517,7 +550,7 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
             if (v.empty())
                 held.erase(h);
             for (auto id : ids)
-                complete(id, {IpcError::gone, {}});
+                complete(id, {IpcError::gone, {}}, /*later=*/true);
         }
         for (auto p = parts.begin(); p != parts.end();)
         {
@@ -540,6 +573,11 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
             body.clear();
         }
         bump(stats.received, label(type), ipc_error_name(static_cast<IpcError>(status)));
+        // Detached (stopped; the master, which never attaches, still answers
+        // itself): no channel is left to carry it, and nothing would ever send
+        // it on. The asker gets its timeout, or "gone" when this process exits.
+        if (stopping && !attached)
+            return;
 
         if (is_self(slot, generation))
         {
@@ -651,14 +689,20 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
         {
             if (h.offset != 0)
                 return void(++stats.dropped);
+            parts.erase(key);
+            // What is being put together is bounded like a queue: by the
+            // totals announced, not by what has arrived so far.
+            std::size_t announced = h.total;
+            for (const auto& [k, q] : parts)
+                announced += q.total;
+            if (announced > Ipc::kMaxQueue)
+                return void(++stats.dropped);
             Part& p = parts[key];
-            p = Part{};
             p.type       = std::string(type_ptr, type_len);
             p.status     = h.status;
             p.timeout_ms = h.timeout_ms;
             p.total      = h.total;
             p.started_ms = now_ms();
-            p.body.reserve(h.total);
             p.body.append(body_ptr, payload);
             return;
         }
@@ -721,6 +765,8 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
             }
             // 0 — no writer left at all (the master is gone); an error: stop
             // watching, or the loop would spin on it.
+            warn("ipc: the inbox of '{}' is closed ({}) — no message reaches this process any more",
+                 me.name, n == 0 ? "no writer left" : std::strerror(errno));
             if (loop)
                 loop->remove_io(inbox_fd);
             close_fd(inbox_fd);
@@ -752,6 +798,9 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
             }
             if (n <= 0)
             {
+                warn("ipc: the control channel of '{}' is closed ({}) — no process of the node "
+                     "is opened or closed here any more", me.name,
+                     n == 0 ? "the master is gone" : std::strerror(errno));
                 if (loop)
                     loop->remove_io(control_fd);
                 close_fd(control_fd);
@@ -854,6 +903,13 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
         }
         for (auto id : ids)
             complete(id, {IpcError::unreachable, {}});
+        // Queues left by a write short of kernel memory (see flush).
+        std::vector<int> stuck;
+        for (const auto& [slot, l] : links)
+            if (!l.out.empty() && !l.watching)
+                stuck.push_back(slot);
+        for (int slot : stuck)
+            flush(slot);
         for (auto p = parts.begin(); p != parts.end();)
         {
             if (now - p->second.started_ms > kPartMs)
@@ -1148,16 +1204,18 @@ void Ipc::request(int slot, std::string_view type, std::string body, RequestDone
 
     const std::uint32_t id = c.new_id();
     const auto ms = std::max<long long>(1, timeout.count());
+    std::weak_ptr<detail::IpcCore> w = core_;
+    // The timer first: if it cannot be had, nothing is left waiting for it.
+    const auto timer = c.loop->add_timer(std::chrono::milliseconds(ms), [w, id] {
+        if (auto core = w.lock())
+            core->on_timeout(id);
+    }, /*repeat=*/false);
     auto& p = c.pending[id];
     p.slot       = slot;
     p.generation = generation;
     p.type       = std::string(type);
     p.done       = std::move(done);
-    std::weak_ptr<detail::IpcCore> w = core_;
-    p.timer = c.loop->add_timer(std::chrono::milliseconds(ms), [w, id] {
-        if (auto core = w.lock())
-            core->on_timeout(id);
-    }, /*repeat=*/false);
+    p.timer      = timer;
 
     const auto timeout_ms = static_cast<std::uint32_t>(std::min<long long>(ms, UINT32_MAX));
     if (self)
@@ -1285,7 +1343,16 @@ void Ipc::master_forked_child()
         return;
     c.is_master = false;
     c.loop = nullptr;                 // the master's loop: never touched from here
-    c.master_timer = EventLoop::kInvalidTimer;
+    // What the master may have had of its own is not the child's: its timers
+    // live on the master's loop (not cancelled — that is not ours either), its
+    // requests wait for answers addressed to the master.
+    c.master_timer = c.defer_timer = c.beat_timer = EventLoop::kInvalidTimer;
+    c.deferred.clear();
+    c.pending.clear();
+    c.held.clear();
+    c.parts.clear();
+    c.links.clear();
+    c.stats = {};
     const bool mine = c.prep.valid;
 
     // What the master holds for the others: their inboxes are ours to write to;
@@ -1456,9 +1523,12 @@ void Ipc::attach(EventLoop& loop, Logger& log, ProcessRole role, std::string_vie
             core->on_beat();
     });
     c.dir.stamp(c.me.slot);
-    // Datagrams may have arrived since fork: read them now, not at the next one.
+    // Who is on the node may have changed since fork: learn it now. The inbox
+    // waits for the loop — the handlers are registered after attach, and a
+    // message read now would find none. What arrived since fork is reported
+    // by the loop as readable all the same (EPOLL_CTL_ADD checks the state,
+    // edge-triggered too).
     c.on_control();
-    c.on_inbox();
 }
 
 void Ipc::ready()
@@ -1478,14 +1548,26 @@ void Ipc::detach()
         c.dir.mark(c.me.slot, NodeDirectory::State::retiring);
 
     // Work already deferred is finished — answers to ourselves, completions —
-    // so that every request still gets exactly one call of its callback.
-    for (int round = 0; round < 4 && !c.deferred.empty(); ++round)
+    // and what is still waiting ends as "stopping", so that every request gets
+    // exactly one call of its callback. A callback may ask again (it is told
+    // "stopping", through the same queue): rounds until nothing is left, with
+    // a bound against a callback that keeps asking.
+    constexpr int kRounds = 16;
+    for (int round = 0; round < kRounds; ++round)
+    {
         c.run_deferred();
-    std::vector<std::uint32_t> ids;
-    for (const auto& [id, p] : c.pending)
-        ids.push_back(id);
-    for (auto id : ids)
-        c.complete(id, {IpcError::stopping, {}});
+        std::vector<std::uint32_t> ids;
+        for (const auto& [id, p] : c.pending)
+            ids.push_back(id);
+        for (auto id : ids)
+            c.complete(id, {IpcError::stopping, {}});
+        if (c.deferred.empty() && c.pending.empty())
+            break;
+    }
+    if (!c.deferred.empty() || !c.pending.empty())
+        c.warn("ipc: detached with {} callback(s) and {} request(s) left after {} rounds — "
+               "a callback keeps asking while the process stops",
+               c.deferred.size(), c.pending.size(), kRounds);
     c.handlers.clear();
 
     if (c.loop)

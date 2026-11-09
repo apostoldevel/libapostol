@@ -44,7 +44,8 @@ public:
         free,
         starting,   // taken by the master, the process has not started yet
         live,       // started; a target of gather/broadcast
-        retiring,   // told to stop (reload, shutdown); still answers a request
+        retiring,   // told to stop (reload, shutdown); answers a request until
+                    // it detaches its channels on the way out
     };
 
     struct Entry

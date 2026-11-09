@@ -357,10 +357,18 @@ PgPool::QueryId NotifySubscriber::complete(const NotifyRow& row, std::string res
     }
     taken_.erase(it);
     ++acking_;
+    // A throw below means no ack is on its way: not in progress any more (the
+    // row comes back by its lease).
+    struct Unacked
+    {
+        std::size_t& n;
+        bool         sent{false};
+        ~Unacked() { if (!sent && n > 0) --n; }
+    } unacked{acking_};
 
     const std::int64_t id = row.id;
     std::weak_ptr<NotifySubscriber*> w = self_;
-    return pool_.execute(ack_sql(row, result_sql),
+    const auto query = pool_.execute(ack_sql(row, result_sql),
         [w, id, on_done = std::move(on_done), on_fail = std::move(on_fail)](std::vector<PgResult> results) {
             // Called whether or not the subscriber is still there; logged when it is.
             auto call = [&w](std::string_view what, auto&& f) {
@@ -406,6 +414,8 @@ PgPool::QueryId NotifySubscriber::complete(const NotifyRow& row, std::string res
                 call("fail handler", [&] { on_fail(Failure{bad->error_message(), bad->sqlstate()}, stale); });
         },
         {}, quiet);
+    unacked.sent = true;
+    return query;
 }
 
 void NotifySubscriber::refuse(const NotifyRow& row, std::string_view reason)

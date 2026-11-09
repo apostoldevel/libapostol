@@ -150,7 +150,11 @@ std::optional<NodeDirectory::Entry> NodeDirectory::get(int slot) const
     e.name = name;
 
     // Reused while read (freed and taken again): the fields may mix two
-    // processes — report nothing rather than a hybrid.
+    // processes — report nothing rather than a hybrid. The fence keeps the
+    // reads above before the re-check on a weakly ordered CPU (a seqlock
+    // read side); the plain copy of the name may still race a writer, the
+    // re-check is what discards such a copy.
+    std::atomic_thread_fence(std::memory_order_acquire);
     if (s.generation.load(std::memory_order_acquire) != gen
         || s.state.load(std::memory_order_acquire) == static_cast<std::uint8_t>(State::free))
         return std::nullopt;

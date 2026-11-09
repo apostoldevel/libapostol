@@ -18,10 +18,17 @@
 //      per neighbour; the master two per child (and each the listening socket);
 //   6. a worker killed with a request in flight: the sender gets "gone", not a
 //      timeout; the respawned worker takes a slot and answers again, and no
-//      process keeps the dead one's channel;
-//   7. a reload (SIGHUP): while the old generation is still stopping, a gather
+//      process keeps the dead one's channel. With the master stopped, the dead
+//      worker stays in the directory: a request to it finds its channel dead
+//      while being sent, and no callback runs before request() returns;
+//   7. a request sent to the respawned worker while it is still starting —
+//      held back before it attaches its channels — waits for its handlers
+//      instead of being refused as "no_handler";
+//   8. a reload (SIGHUP): while the old generation is still stopping, a gather
 //      answers once per worker number, and the new processes' first gathers
-//      are answered by everyone.
+//      are answered by everyone; each old worker, stopping with a request in
+//      flight since its start whose callback asks again, saw both callbacks
+//      run as "stopping".
 //
 // Usage: ipc_test -p <dir>/ -c <dir>/ipc_test.json   (ctest passes both)
 
@@ -70,6 +77,16 @@ int      g_base_sockets = 0;   // what main() was started with (ctest's stdio ma
 
 fs::path result_file() { return g_dir / "result"; }
 fs::path stage_file()  { return g_dir / "stage"; }
+fs::path slow_file()   { return g_dir / "slowstart"; }        // the next worker sleeps before it starts
+fs::path woke_file()   { return g_dir / "slowstart.woke"; }   // when it woke
+fs::path detach_file(pid_t pid) { return g_dir / fmt::format("detach.{}", pid); }
+
+// CLOCK_MONOTONIC: the same clock in every process of the host.
+long long mono_ms()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now().time_since_epoch()).count();
+}
 
 std::string read_file(const fs::path& p)
 {
@@ -219,13 +236,30 @@ void install(Application& app, EventLoop& loop)
 }
 
 // A worker that takes a while to stop: the old generation of a reload stays
-// on the node, retiring, while the new one answers.
+// on the node, retiring, while the new one answers. From its start it keeps a
+// request in flight (to itself, never answered) whose callback asks again:
+// when the worker stops, both callbacks must run as its channels are detached
+// — the verdict goes to detach.<pid>. (Not from on_stopping(): that runs after
+// the detach, when a request fails at once.)
 class SlowStop final : public Module
 {
 public:
+    explicit SlowStop(Application& app) : app_(app) {}
+
     std::string_view name() const override { return "SlowStop"; }
     bool enabled() const override { return true; }
     bool execute(const HttpRequest&, HttpResponse&) override { return false; }
+    void on_start() override
+    {
+        Application* app = &app_;
+        const int self = app->ipc().self().slot;
+        app->ipc().request(self, "hang", {}, [app, self](IpcResult first) {
+            app->ipc().request(self, "who", {}, [first = first.error](IpcResult second) {
+                write_file(detach_file(::getpid()), fmt::format("{} {}\n", ipc_error_name(first),
+                                                                ipc_error_name(second.error)));
+            }, 1s);
+        }, 600s);
+    }
     void on_stopping() override { since_ = Clock::now(); }
     bool busy() const override
     {
@@ -233,6 +267,7 @@ public:
     }
 
 private:
+    Application&      app_;
     Clock::time_point since_{};
 };
 
@@ -493,8 +528,11 @@ private:
         if (!expect(ipc().send(helpers.front().slot, "stall", "1500"), "stall: not sent"))
             return;
         const auto t0 = Clock::now();
-        ipc().request(victim.slot, "hang", {}, [this, victim, t0](IpcResult r) {
+        auto inside = std::make_shared<bool>(false);   // inside a call of request()
+        ipc().request(victim.slot, "hang", {}, [this, victim, t0, inside](IpcResult r) {
             const auto took = Clock::now() - t0;
+            if (!expect(!*inside, "kill: a callback ran inside request()"))
+                return;
             if (!expect(r.error == IpcError::gone,
                         fmt::format("request to a killed worker: {}, not gone",
                                     ipc_error_name(r.error))))
@@ -503,9 +541,60 @@ private:
                 return;
             note(fmt::format("killed worker: gone after {} ms",
                              std::chrono::duration_cast<std::chrono::milliseconds>(took).count()));
-            step_respawned(victim);
+            step_starting(victim, Clock::now() + 10s, [this, victim] { step_respawned(victim); });
         }, 15s);
-        after(300ms, [victim] { ::kill(victim.pid, SIGKILL); });
+        after(300ms, [this, victim, inside] {
+            // The respawned worker sleeps before it starts (step 7).
+            write_file(slow_file(), "1\n");
+            // The master stopped: it does not reap, the dead worker stays in the
+            // directory and its channel here stays open — the next write to it
+            // fails inside request() itself.
+            ::kill(master_, SIGSTOP);
+            ::kill(victim.pid, SIGKILL);
+            const auto until = Clock::now() + 2s;
+            while (alive(victim.pid) && Clock::now() < until)
+                std::this_thread::sleep_for(1ms);
+            const bool dead = !alive(victim.pid);
+            *inside = true;
+            ipc().request(victim.slot, "who", {}, [this, inside](IpcResult r) {
+                if (!expect(!*inside, "kill: request() called back before it returned"))
+                    return;
+                expect(r.error == IpcError::gone,
+                       fmt::format("request to a dead worker: {}, not gone", ipc_error_name(r.error)));
+            }, 3s);
+            *inside = false;
+            ::kill(master_, SIGCONT);
+            expect(dead, "kill: the worker did not die in 2 s");
+        });
+    }
+
+    // ── 7. a request to a worker that has not started yet ────────────────────
+
+    void step_starting(IpcPeer victim, Clock::time_point deadline, std::function<void()> next)
+    {
+        // The old process in the slot answers "gone" (or never got the
+        // request); the new one takes the same slot — the first free.
+        const long long sent = mono_ms();
+        ipc().request(victim.slot, "who", {}, [this, victim, deadline, next, sent](IpcResult r) {
+            if (r.error == IpcError::gone || r.error == IpcError::unreachable)
+            {
+                if (Clock::now() > deadline)
+                    return fail("starting: no new process in the slot of the killed worker");
+                return after(2ms, [this, victim, deadline, next] { step_starting(victim, deadline, next); });
+            }
+            if (!expect(r.ok() && r.body.find(std::to_string(victim.pid)) == std::string::npos,
+                        fmt::format("request to a starting worker: {} '{}'", ipc_error_name(r.error),
+                                    r.body)))
+                return;
+            const auto woke = read_file(woke_file());
+            if (!expect(!woke.empty() && sent < std::stoll(woke),
+                        fmt::format("starting: the request (at {}) was not sent before the worker "
+                                    "started (at '{}') — the case was not forced", sent, woke)))
+                return;
+            note(fmt::format("a request sent {} ms before the worker started was answered",
+                             std::stoll(woke) - sent));
+            next();
+        }, 5s);
     }
 
     void step_respawned(IpcPeer victim)
@@ -544,7 +633,7 @@ private:
         });
     }
 
-    // ── 7. reload ────────────────────────────────────────────────────────────
+    // ── 8. reload ────────────────────────────────────────────────────────────
 
     void step_reload()
     {
@@ -601,9 +690,25 @@ private:
                                         "of two generations was not observed"))
                     return;
                 note(fmt::format("reload gather: one per number, {} old still stopping", window));
-                check_first(ipc().peers(ipc_workers | ipc_helper), 0, [this] {
+                check_first(ipc().peers(ipc_workers | ipc_helper), 0, [this, old] {
                     note("new generation's first gathers answered by all");
-                    pass();
+                    wait_until([old] {
+                        for (auto o : *old)
+                            if (alive(o))
+                                return false;
+                        return true;
+                    }, Clock::now() + 10s, "the old workers to exit", [this, old] {
+                        for (auto o : *old)
+                        {
+                            const auto v = read_file(detach_file(o));
+                            if (!expect(v == "stopping stopping\n",
+                                        fmt::format("worker {} stopping with a request in flight: "
+                                                    "'{}', not both callbacks 'stopping'", o, v)))
+                                return;
+                        }
+                        note("old workers: both callbacks ran at detach");
+                        pass();
+                    });
                 });
             }, 3s);
         });
@@ -620,8 +725,21 @@ public:
 protected:
     void on_worker_start(EventLoop& loop) override
     {
-        module_manager().add_module(std::make_unique<SlowStop>());
+        module_manager().add_module(std::make_unique<SlowStop>(*this));
         install(*this, loop);
+    }
+
+    // Before the worker attaches its channels: the one the probe asked for
+    // (step 7) sleeps, so that a request reaches its inbox first.
+    void worker_run() override
+    {
+        std::error_code ec;
+        if (fs::remove(slow_file(), ec))
+        {
+            std::this_thread::sleep_for(500ms);
+            write_file(woke_file(), std::to_string(mono_ms()));
+        }
+        Application::worker_run();
     }
 
     void on_helper_start(EventLoop& loop) override { install(*this, loop); }

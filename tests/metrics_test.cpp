@@ -172,12 +172,16 @@ std::string check_text()
     {
         const std::string a = "# HELP a A.\n# TYPE a gauge\na 1\n"
                               "# TYPE h histogram\nh_bucket{le=\"1\"} 1\nh_sum 1\nh_count 1\n"
-                              "# a comment\n";
+                              "# a comment\n"
+                              "# TYPE g gauge\ng 1\n# TYPE g_count counter\ng_count 2\n"
+                              "# TYPE s summary\ns_sum 3\ns_count 1\n";
         const std::string b = "# HELP a other\n# TYPE a gauge\na{x=\"2\"} 2\n"
                               "h_bucket{le=\"1\"} 3\nloose 4\n";
         const std::string want = "# HELP a A.\n# TYPE a gauge\na 1\na{x=\"2\"} 2\n"
                                  "# TYPE h histogram\nh_bucket{le=\"1\"} 1\nh_sum 1\nh_count 1\n"
-                                 "h_bucket{le=\"1\"} 3\nloose 4\n";
+                                 "h_bucket{le=\"1\"} 3\n"
+                                 "# TYPE g gauge\ng 1\n# TYPE g_count counter\ng_count 2\n"
+                                 "# TYPE s summary\ns_sum 3\ns_count 1\nloose 4\n";
         const auto got = merge_metrics({a, b});
         if (got != want)
             return "merge_metrics:\n" + got + "--- want:\n" + want;
