@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -45,6 +46,22 @@ namespace apostol
 // level_from_string throws on an unknown or empty value, and AppSettings::validate()
 // reports a bad log.level without correcting it. A typo there must not take down a
 // worker that the master will then respawn forever.
+
+// worker#3 → 3; every other process 0. The number survives a respawn and a
+// reload (the new worker#3 is named as the old one), a slot does not.
+static int process_number(ProcessRole role, std::string_view name) noexcept
+{
+    if (role != ProcessRole::worker)
+        return 0;
+    const auto pos = name.rfind('#');
+    if (pos == std::string_view::npos)
+        return 0;
+    int n = 0;
+    const auto* first = name.data() + pos + 1;
+    const auto* last  = name.data() + name.size();
+    const auto [ptr, ec] = std::from_chars(first, last, n);
+    return ec == std::errc{} && ptr == last ? n : 0;
+}
 
 static LogLevel safe_log_level(const std::string& name)
 {
@@ -328,6 +345,10 @@ void Application::start_process()
         write_pid_file();
         on_start();
 
+        // After on_start(), where the application may have enabled it; before
+        // the first fork.
+        ipc_.master_create(*logger_);
+
         // Create listening socket BEFORE fork (nginx model).
         // Workers inherit fd and only call accept().
         if (settings_.server_port != 0) {
@@ -354,12 +375,8 @@ void Application::start_process()
             });
 #else
             auto fn = cp.fn; // copy for lambda capture
-            fork_child(ProcessRole::custom, cp.name, [this, fn] {
-                EventLoop loop;
-                loop.add_signal(SIGTERM, [&loop](const signalfd_siginfo&) { loop.stop(); });
-                loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
-                fn(loop);
-                loop.run();
+            fork_child(ProcessRole::custom, cp.name, [this, fn, name = cp.name] {
+                custom_fn_run(fn, name);
             });
 #endif
         }
@@ -826,6 +843,9 @@ void Application::master_run()
     // rather than run under a blocking ::sleep(). Cleared before the loop is
     // destroyed at the end of this function.
     master_loop_ = &loop;
+    // Control messages the children forked before this loop could not take at
+    // once go from here; and the watch over processes that do not start.
+    ipc_.master_attach(loop);
 
     // Timer ID for the SIGKILL escalation one-shot timer (armed on SIGTERM).
     EventLoop::TimerId kill_timer_id = EventLoop::kInvalidTimer;
@@ -917,6 +937,7 @@ void Application::master_run()
             if (child.role == ProcessRole::worker)
             {
                 child.shutting_down = true;
+                ipc_.master_retire(child.pid);
                 ::kill(child.pid, SIGQUIT);
             }
         }
@@ -936,6 +957,7 @@ void Application::master_run()
 
     loop.run();
 
+    ipc_.master_detach();
     master_loop_ = nullptr;
 
     logger_->notice("{} master process exiting", name_);
@@ -1213,6 +1235,7 @@ void Application::single_run()
 
     EventLoop loop;
     worker_loop_ = &loop;
+    ipc_.attach(loop, *logger_, ProcessRole::single, "single");
 
     loop.add_signal(SIGTERM, stop_signal(loop));
     // SIGINT stops at once, the second time as well: a developer's Ctrl-C.
@@ -1269,10 +1292,12 @@ void Application::single_run()
         // "Disconnected" into pg_logger_, already destroyed by then, and the
         // process sat on the dead logger's mutex with every signal blocked
         // for signalfd — only kill -9 ended it (T281).
+        ipc_.detach();
         stop_db();
         exit_code_ = 1;
         return;
     }
+    ipc_.ready();
 
     // Drop privileges after initialization (sockets bound, DB connected)
     set_user(cfg_user(), cfg_group());
@@ -1284,6 +1309,10 @@ void Application::single_run()
         : fmt::format("{}: single process ({})", name_, names));
 
     loop.run();
+
+    // First: a request still waiting here ends now, and nobody's reaches us
+    // while the work in flight is finished.
+    ipc_.detach();
 
     stop_http_server(loop);
     stop_modules(loop);
@@ -1308,6 +1337,8 @@ void Application::worker_run()
 
     EventLoop loop;
     worker_loop_ = &loop;
+    // Before the modules start: they register their handlers in on_start.
+    ipc_.attach(loop, *logger_, ProcessRole::worker, "worker");
 
     loop.add_signal(SIGTERM, stop_signal(loop));
     loop.add_signal(SIGQUIT, stop_signal(loop));
@@ -1328,10 +1359,12 @@ void Application::worker_run()
     catch (const std::exception& e)
     {
         logger_->error("{} worker startup failed: {}", name_, e.what());
+        ipc_.detach();
         stop_db();   // while the loop is alive, before ~Application — see single_run
         exit_code_ = 1;
         return;
     }
+    ipc_.ready();
 
     // Drop privileges after initialization (sockets bound, DB connected)
     set_user(cfg_user(), cfg_group());
@@ -1343,6 +1376,8 @@ void Application::worker_run()
         : fmt::format("{}: worker process ({})", name_, names));
 
     loop.run();
+
+    ipc_.detach();   // first — see single_run
 
     stop_http_server(loop);
     stop_modules(loop);
@@ -1363,6 +1398,7 @@ void Application::helper_run()
     set_limit_nofile(cfg_limit_nofile());
 
     EventLoop loop;
+    ipc_.attach(loop, *logger_, ProcessRole::helper, "helper");
 
     loop.add_signal(SIGTERM, stop_signal(loop));
     loop.add_signal(SIGQUIT, stop_signal(loop));
@@ -1446,6 +1482,7 @@ void Application::helper_run()
     catch (const std::exception& e)
     {
         logger_->error("{} helper startup failed: {}", name_, e.what());
+        ipc_.detach();
         exit_code_ = 1;
         return;
     }
@@ -1454,11 +1491,17 @@ void Application::helper_run()
     if (!start())
 #endif
     {
+        ipc_.detach();
         stop_db();   // while the loop is alive, before ~Application — see single_run
         return;
     }
+    // Started — or, under "process.leader", a standby waiting for the lock: it
+    // answers too (a gather sees it, with its modules not running).
+    ipc_.ready();
 
     loop.run();
+
+    ipc_.detach();   // first — see single_run
 
 #ifdef WITH_POSTGRESQL
     stopping = true;
@@ -1496,6 +1539,7 @@ void Application::custom_process_run(CustomProcess& proc)
 
     // 4. EventLoop + signal handlers
     EventLoop loop;
+    ipc_.attach(loop, *logger_, ProcessRole::custom, proc.name());
 
     loop.add_signal(SIGTERM, stop_signal(loop));
     loop.add_signal(SIGQUIT, stop_signal(loop));
@@ -1590,18 +1634,22 @@ void Application::custom_process_run(CustomProcess& proc)
         gate = lock.get();
     } catch (const std::exception& e) {
         logger_->error("{} process '{}' startup failed: {}", name_, proc.name(), e.what());
+        ipc_.detach();
         exit_code_ = 1;
         return;
     }
 
     if (!lock && !start()) {
+        ipc_.detach();
         stop_db();
         return;
     }
+    ipc_.ready();   // started, or a standby — see helper_run
 
     // 8. Event loop
     loop.run();
     stopping = true;
+    ipc_.detach();   // first — see single_run
 
     // 9. Cleanup: the heartbeats go first, so that finishing the work in flight
     // does not start a new pass; then on_stopping(), stop_work(), then stop_db()
@@ -1631,6 +1679,32 @@ void Application::custom_process_run(CustomProcess& proc)
         logger_->notice("{} process '{}' exiting (pid={})",
                         name_, proc.name(), ::getpid());
 }
+
+#else
+
+void Application::custom_fn_run(const std::function<void(EventLoop&)>& fn, std::string_view name)
+{
+    EventLoop loop;
+    ipc_.attach(loop, *logger_, ProcessRole::custom, name);
+    loop.add_signal(SIGTERM, [&loop](const signalfd_siginfo&) { loop.stop(); });
+    loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
+    try
+    {
+        fn(loop);
+    }
+    catch (...)
+    {
+        ipc_.detach();
+        throw;
+    }
+    ipc_.ready();
+    loop.run();
+    ipc_.detach();
+}
+
+#endif // WITH_POSTGRESQL
+
+#ifdef WITH_POSTGRESQL
 
 // ─── Leadership of a background role ─────────────────────────────────────────
 
@@ -1689,13 +1763,23 @@ std::unique_ptr<PgLeaderLock> Application::run_as_leader(
 pid_t Application::fork_child(ProcessRole role, std::string child_name,
                                std::function<void()> custom_fn)
 {
+    // A slot and the channels, before fork: the child inherits them, the
+    // master hands its inbox to the others. False — it runs without channels.
+    ipc_.master_prepare(role, child_name, process_number(role, child_name));
+
     pid_t pid = ::fork();
     if (pid < 0)
-        throw std::system_error(errno, std::system_category(), "fork");
+    {
+        const int err = errno;
+        ipc_.master_fork_failed();
+        throw std::system_error(err, std::system_category(), "fork");
+    }
 
     if (pid == 0)
     {
         // ── Child process ──────────────────────────────────────────────────
+        // First: what of the master's channels is not this child's is closed.
+        ipc_.master_forked_child();
         ::prctl(PR_SET_PDEATHSIG, SIGTERM);
 
         role_ = role;
@@ -1736,6 +1820,7 @@ pid_t Application::fork_child(ProcessRole role, std::string child_name,
     }
 
     // ── Parent (master) ────────────────────────────────────────────────────
+    ipc_.master_forked_parent(pid);
     logger_->notice("spawned {} '{}' pid={}", role_name(role), child_name, pid);
     children_.push_back({pid, role, std::move(child_name), false});
     return pid;
@@ -1763,6 +1848,7 @@ void Application::reap_children()
     while ((pid = ::waitpid(-1, &status, WNOHANG)) > 0)
     {
         accept_balance_.release(pid);
+        ipc_.master_reaped(pid);
 
         auto it = std::find_if(children_.begin(), children_.end(),
             [pid](const ChildInfo& c) { return c.pid == pid; });
@@ -1911,13 +1997,7 @@ void Application::reap_children()
 #else
                             auto fn = cp.fn;
                             fork_child(respawn_role, std::move(respawn_name),
-                                [this, fn] {
-                                    EventLoop loop;
-                                    loop.add_signal(SIGTERM, [&loop](const signalfd_siginfo&) { loop.stop(); });
-                                    loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
-                                    fn(loop);
-                                    loop.run();
-                                });
+                                [this, fn, name = cp.name] { custom_fn_run(fn, name); });
 #endif
                             found = true;
                             break;
@@ -1998,6 +2078,7 @@ void Application::fast_shutdown()
     for (auto& child : children_)
     {
         child.shutting_down = true;
+        ipc_.master_retire(child.pid);
         ::kill(child.pid, SIGTERM);
     }
     // Do NOT clear children_ here: SIGCHLD handler reaps them one-by-one
@@ -2018,6 +2099,7 @@ void Application::graceful_shutdown()
     for (auto& child : children_)
     {
         child.shutting_down = true;
+        ipc_.master_retire(child.pid);
         ::kill(child.pid, SIGQUIT);
     }
     // The master loop will call loop.stop() once children_ is empty (via SIGCHLD handler)
@@ -2054,7 +2136,11 @@ bool Application::rolling_restart()
     // Mark old workers and helpers for retirement
     // (custom processes are also restarted — mirrors v1 StartCustomProcesses(JUST_RESPAWN))
     for (auto& child : children_)
+    {
         child.shutting_down = true;
+        // Out of a gather from now on: the new generation answers for it.
+        ipc_.master_retire(child.pid);
+    }
 
     // Spawn fresh custom processes
     for (auto& cp : custom_processes_)
@@ -2065,12 +2151,8 @@ bool Application::rolling_restart()
         });
 #else
         auto fn = cp.fn;
-        fork_child(ProcessRole::custom, cp.name, [this, fn] {
-            EventLoop loop;
-            loop.add_signal(SIGTERM, [&loop](const signalfd_siginfo&) { loop.stop(); });
-            loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
-            fn(loop);
-            loop.run();
+        fork_child(ProcessRole::custom, cp.name, [this, fn, name = cp.name] {
+            custom_fn_run(fn, name);
         });
 #endif
     }

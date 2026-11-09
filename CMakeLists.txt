@@ -29,6 +29,10 @@ option(WITH_DB_PLATFORM "Build the db-platform integration layer" ON)
 # APOSTOL_EPOLL_ET=OFF rollback env var.
 option(APOSTOL_EPOLL_ET "Edge-triggered + one-shot epoll (defense-in-depth against forgotten remove_io spins)" OFF)
 
+# The library's own tests (ctest). Off by default: an application that adds the
+# library as a subdirectory builds none of them.
+option(APOSTOL_BUILD_TESTS "Build the libapostol tests" OFF)
+
 # ─── Dependencies (FetchContent) ─────────────────────────────────────────────
 
 include(FetchContent)
@@ -186,3 +190,10 @@ target_link_libraries(apostol
         llhttp_static
         dl      # crash_handler: backtrace_symbols, abi::__cxa_demangle
 )
+
+# ─── Tests ───────────────────────────────────────────────────────────────────
+
+if(APOSTOL_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

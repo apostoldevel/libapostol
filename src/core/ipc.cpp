@@ -421,6 +421,7 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
         if (held_bytes + bytes > Ipc::kMaxQueue)
             return IpcError::overflow;
         v.push_back({generation, std::move(frames), bytes, now_ms() + hold_ms, request_id});
+        ++stats.held;
         return IpcError::none;
     }
 
@@ -467,6 +468,7 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
+                ++stats.blocked;
                 watch_writable(slot, l);
                 return true;
             }

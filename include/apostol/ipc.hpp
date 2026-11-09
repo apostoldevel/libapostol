@@ -189,6 +189,8 @@ public:
         // (type, reason) → targets of a gather from here that did not answer
         std::map<std::pair<std::string, std::string>, std::uint64_t> gather_missing;
         std::uint64_t dropped{0};   // datagrams that could not be read or put together
+        std::uint64_t blocked{0};   // writes that found a channel full and waited for room
+        std::uint64_t held{0};      // messages kept until the channel to their process opened
     };
     const Stats& stats() const noexcept;
 

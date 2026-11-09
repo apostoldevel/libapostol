@@ -5,6 +5,7 @@
 #include "apostol/accept_balance.hpp"
 #include "apostol/config.hpp"
 #include "apostol/event_loop.hpp"
+#include "apostol/ipc.hpp"
 #include "apostol/logger.hpp"
 #include "apostol/module.hpp"
 #include "apostol/oauth_providers.hpp"
@@ -84,6 +85,11 @@ public:
     Logger&        logger()         noexcept { return *logger_; }
     const Config&  config()   const noexcept { return *config_; }
     ModuleManager& module_manager() noexcept { return module_manager_; }
+
+    /// Messages between the processes of this node. Without enable_ipc() —
+    /// and in a process with no master — it works alone: a request to this
+    /// process is answered, every other target is unreachable.
+    Ipc& ipc() noexcept { return ipc_; }
 
     /// Set up a non-blocking HTTP server on @p port (0 = OS picks).
     /// Registers accept + read handlers in @p loop, and a 1-second heartbeat
@@ -300,6 +306,11 @@ protected:
     // Override to register custom background processes via add_custom_process().
     virtual void create_custom_processes() {}
 
+    // Give the processes of this node channels to each other (see ipc.hpp).
+    // Call from the constructor or from on_start(): the master makes the
+    // channels before it forks, and does nothing without this call.
+    void enable_ipc() noexcept { ipc_.enable(); }
+
 private:
     // ── Startup ───────────────────────────────────────────────────────────────
     void parse_args(int argc, char* argv[]);
@@ -383,6 +394,13 @@ public:
     void add_custom_process(std::unique_ptr<ProcessModule> mod);
 #else
     void add_custom_process(std::string name, std::function<void(EventLoop&)> fn);
+#endif
+
+private:
+#ifndef WITH_POSTGRESQL
+    // The child's side of a custom process given as a function: its loop,
+    // stop signals, channels.
+    void custom_fn_run(const std::function<void(EventLoop&)>& fn, std::string_view name);
 #endif
 
 protected:
@@ -482,6 +500,9 @@ private:
     // Workers sharing master_listener_: who holds how many connections (made
     // by the master before fork; see accept_balance.hpp).
     AcceptBalance accept_balance_;
+    // After module_manager_ on purpose: it dies first, and the handlers it
+    // holds may point into modules.
+    Ipc ipc_;
     // A worker leaving new connections to the others: since when, and when it
     // last looked (a gap ends the wait). Zero — not waiting.
     std::chrono::steady_clock::time_point accept_defer_since_{};
