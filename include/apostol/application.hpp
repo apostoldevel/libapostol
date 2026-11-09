@@ -106,9 +106,13 @@ public:
     const std::string& metrics_prefix() const noexcept { return metrics_prefix_; }
 
     /// The rows of every live process of the node, merged, and
-    /// "<prefix>_process_up" for each: 1 — answered, 0 — live in the directory
-    /// but no answer within @p timeout (its rows are left out). @p done is
-    /// called once, on this loop. Without enable_metrics() — an empty text.
+    /// "<prefix>_process_up" for each: 1 — answered; 0 — no answer within
+    /// @p timeout and still live in the directory when the collection ends
+    /// (its rows are left out). No row at all for a process that left or began
+    /// to stop meanwhile (a reload, a shutdown), nor for any process that did
+    /// not answer when this process's own stop cut the collection short — then
+    /// ipc().stopping() is true in @p done. @p done is called once, on this
+    /// loop. Without enable_metrics() — an empty text.
     void collect_metrics(std::function<void(std::string)> done, std::chrono::milliseconds timeout);
 
     /// The rows of this process alone (what it answers a collection with).

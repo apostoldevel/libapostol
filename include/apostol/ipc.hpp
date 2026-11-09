@@ -153,6 +153,14 @@ public:
     /// Channels to the other processes of the node exist.
     bool connected() const noexcept;
 
+    /// The process is stopping: its channels are being closed, or are closed.
+    /// True from the moment the stop begins — so a callback of request(),
+    /// gather() or Application::collect_metrics() that the stop ends sees it
+    /// true, and can tell "this process is stopping" from "the others did not
+    /// answer". A request or a gather started from then on is refused as
+    /// `stopping`.
+    bool stopping() const noexcept;
+
     IpcPeer self() const;
     /// Live processes of the node in @p roles, this one included — the targets
     /// of a gather. Retiring ones (a reload, a shutdown) are left out.

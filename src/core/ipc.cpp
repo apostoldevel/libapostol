@@ -1093,6 +1093,7 @@ Ipc::Ipc() : core_(std::make_shared<detail::IpcCore>()) {}
 Ipc::~Ipc() = default;
 
 bool Ipc::connected() const noexcept { return core_->connected; }
+bool Ipc::stopping() const noexcept { return core_->stopping; }
 void Ipc::enable() noexcept { core_->enabled = true; }
 bool Ipc::enabled() const noexcept { return core_->enabled; }
 const Ipc::Stats& Ipc::stats() const noexcept { return core_->stats; }

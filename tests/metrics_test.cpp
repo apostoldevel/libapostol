@@ -14,7 +14,13 @@
 //        one TYPE per family and its samples together, a worker's own row
 //        with its labels, the channels' own counters of every process;
 //     2. the helper held busy past the timeout: t_process_up 0 for it and none
-//        of its rows; once it is free again, 1 and its rows are back.
+//        of its rows; once it is free again, 1 and its rows are back;
+//     3. the workers told to stop during a collection (SIGWINCH: the master
+//        marks them retiring, stops them and starts none): worker 1, held busy
+//        past the timeout, has no t_process_up row at all — not 0;
+//     4. the probe's own stop (SIGTERM to the node) cuts a collection short:
+//        its callback runs, sees ipc().stopping(), and the helper, held busy,
+//        has no row either.
 //   --mode off  neither enable_ipc() nor enable_metrics(): no channels at all
 //     — every process holds what it was started with and the listening socket,
 //     nothing more; a send is refused, a gather reaches only the process
@@ -379,8 +385,71 @@ private:
                 return fail("after the stall: the helper is not 1\n" + text);
             if (count(lines, R"(role="helper")") < 2)
                 return fail("after the stall: the helper's rows are not back\n" + text);
-            pass();
+            step_retiring();
         }, 2s);
+    }
+
+    int slot_of(unsigned roles, int number)
+    {
+        for (const auto& p : ipc().peers(roles))
+            if (p.number == number)
+                return p.slot;
+        return -1;
+    }
+
+    void step_retiring()
+    {
+        const int w1 = slot_of(ipc_workers, 1);
+        if (w1 < 0 || ipc().peers(ipc_workers).size() != kWorkers)
+            return fail("retiring: the workers are not live");
+        if (!ipc().send(w1, "stall", "3000"))
+            return fail("retiring: stall not sent");
+        after(100ms, [this] {
+            app_->collect_metrics([this](std::string text) {
+                const auto lines = lines_of(text);
+                if (auto bad = well_formed(lines); !bad.empty())
+                    return fail("retiring collection: " + bad + "\n" + text);
+                if (app_->ipc().stopping())
+                    return fail("retiring collection: stopping() in the probe, which is not stopping");
+                if (count(lines, R"(t_process_up{role="worker",worker="1")") != 0)
+                    return fail("retiring collection: a process_up row for worker 1, which was stopping\n" + text);
+                for (std::string_view u : {R"(t_process_up{role="worker",worker="2"} 1)",
+                                           R"(t_process_up{role="helper",worker="0"} 1)",
+                                           R"(t_process_up{role="probe",worker="0"} 1)"})
+                    if (count(lines, u) != 1)
+                        return fail(fmt::format("retiring collection: no single '{}'\n{}", u, text));
+                if (count(lines, "t_process_up{") != kAll - 1)
+                    return fail("retiring collection: process_up rows other than the three\n" + text);
+                app_->logger().notice("probe: 3. a process that began to stop meanwhile has no row, not 0");
+                step_own_stop();
+            }, 1500ms);
+            after(150ms, [this] { ::kill(master_, SIGWINCH); });
+        });
+    }
+
+    void step_own_stop()
+    {
+        const int helper = slot_of(ipc_helper, 0);
+        if (helper < 0)
+            return fail("own stop: no helper");
+        if (!ipc().send(helper, "stall", "2000"))
+            return fail("own stop: stall not sent");
+        after(100ms, [this] {
+            app_->collect_metrics([this](std::string text) {
+                // Runs as the probe's channels are detached: the loop is gone,
+                // the verdict is written here.
+                const auto lines = lines_of(text);
+                if (!app_->ipc().stopping())
+                    return fail("own stop: the callback ran, stopping() false\n" + text);
+                if (count(lines, R"(role="helper")") != 0)
+                    return fail("own stop: a row for the helper, whose answer the stop cut short\n" + text);
+                if (count(lines, R"(t_process_up{role="probe",worker="0"} 1)") != 1)
+                    return fail("own stop: the probe's own answer is lost\n" + text);
+                app_->logger().notice("probe: 4. the own stop: stopping(), no row for the unanswered");
+                pass();
+            }, 10s);
+            after(200ms, [this] { ::kill(master_, SIGTERM); });
+        });
     }
 
     // ── off ──────────────────────────────────────────────────────────────────

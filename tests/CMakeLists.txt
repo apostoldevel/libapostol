@@ -45,6 +45,12 @@ set(IPC_TEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/ipc_test.d")
 add_test(NAME ipc COMMAND ipc_test -p "${IPC_TEST_DIR}/" -c "${IPC_TEST_DIR}/ipc_test.json")
 set_tests_properties(ipc PROPERTIES TIMEOUT 120)
 
+# ip_allow_list_test — IpAllowList in this process; no node, no files.
+add_executable(ip_allow_list_test ip_allow_list_test.cpp)
+target_link_libraries(ip_allow_list_test PRIVATE apostol)
+target_compile_options(ip_allow_list_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME ip_allow_list COMMAND ip_allow_list_test)
+
 # metrics_test — the metrics text, then a node of two workers, the helper and
 # "probe": with enable_metrics() (on), and with no channels at all (off).
 add_executable(metrics_test metrics_test.cpp)

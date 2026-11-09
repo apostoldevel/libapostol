@@ -118,6 +118,7 @@ add_library(apostol STATIC
     src/core/http_client.cpp
     src/core/fetch_client.cpp
     src/core/fetch_policy.cpp
+    src/core/ip_allow_list.cpp
     src/core/route_manager.cpp
     src/core/routed_module.cpp
     src/core/yaml_writer.cpp

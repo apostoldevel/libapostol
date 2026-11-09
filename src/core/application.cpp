@@ -3004,9 +3004,21 @@ void Application::collect_metrics(std::function<void(std::string)> done, std::ch
         for (const auto& [peer, body] : g.replies)
             up.gauge("process_up", help, 1,
                      {{"role", metrics_role(peer)}, {"worker", std::to_string(peer.number)}});
-        for (const auto& [peer, error] : g.missing)
-            up.gauge("process_up", help, 0,
-                     {{"role", metrics_role(peer)}, {"worker", std::to_string(peer.number)}});
+        // Silent is 0 only for a process the directory still holds live, the
+        // same one (slot and generation): one that left or began to stop
+        // meanwhile is no process that hangs. Nor is anyone, when this
+        // process's own stop ended the wait — the caller reads ipc().stopping().
+        if (!g.missing.empty() && !ipc_.stopping()) {
+            const auto live = ipc_.peers(ipc_all);
+            for (const auto& [peer, error] : g.missing) {
+                const bool held = std::any_of(live.begin(), live.end(), [&p = peer](const IpcPeer& l) {
+                    return l.slot == p.slot && l.generation == p.generation;
+                });
+                if (held)
+                    up.gauge("process_up", help, 0,
+                             {{"role", metrics_role(peer)}, {"worker", std::to_string(peer.number)}});
+            }
+        }
         const std::string up_text = up.str();
         texts.push_back(up_text);
         for (const auto& [peer, body] : g.replies)

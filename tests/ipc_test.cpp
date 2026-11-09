@@ -28,7 +28,7 @@
 //      answers once per worker number, and the new processes' first gathers
 //      are answered by everyone; each old worker, stopping with a request in
 //      flight since its start whose callback asks again, saw both callbacks
-//      run as "stopping".
+//      run as "stopping", each with ipc().stopping() true (false in step 1).
 //
 // Usage: ipc_test -p <dir>/ -c <dir>/ipc_test.json   (ctest passes both)
 
@@ -254,9 +254,12 @@ public:
         Application* app = &app_;
         const int self = app->ipc().self().slot;
         app->ipc().request(self, "hang", {}, [app, self](IpcResult first) {
-            app->ipc().request(self, "who", {}, [first = first.error](IpcResult second) {
-                write_file(detach_file(::getpid()), fmt::format("{} {}\n", ipc_error_name(first),
-                                                                ipc_error_name(second.error)));
+            const bool first_stopping = app->ipc().stopping();
+            app->ipc().request(self, "who", {}, [app, first = first.error, first_stopping](IpcResult second) {
+                write_file(detach_file(::getpid()),
+                           fmt::format("{} {} {} {}\n", ipc_error_name(first), ipc_error_name(second.error),
+                                       first_stopping ? "stopping()" : "-",
+                                       app->ipc().stopping() ? "stopping()" : "-"));
             }, 1s);
         }, 600s);
     }
@@ -372,6 +375,8 @@ private:
         wait_until([this] { return all_live(); }, Clock::now() + 10s,
                    "three workers, the helper and the probe live", [this] {
             remember_workers();
+            if (!expect(!ipc().stopping(), "stopping() is true in a live process"))
+                return;
             if (!expect(workers_.size() == kWorkers && workers_.count(1) && workers_.count(2)
                             && workers_.count(3),
                         "worker numbers are not 1, 2, 3"))
@@ -701,9 +706,10 @@ private:
                         for (auto o : *old)
                         {
                             const auto v = read_file(detach_file(o));
-                            if (!expect(v == "stopping stopping\n",
+                            if (!expect(v == "stopping stopping stopping() stopping()\n",
                                         fmt::format("worker {} stopping with a request in flight: "
-                                                    "'{}', not both callbacks 'stopping'", o, v)))
+                                                    "'{}', not both callbacks 'stopping', each seeing "
+                                                    "stopping()", o, v)))
                                 return;
                         }
                         note("old workers: both callbacks ran at detach");
