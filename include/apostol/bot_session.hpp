@@ -79,7 +79,7 @@ public:
     /// an explicit session. Use this whenever the object was found by enumerating:
     /// act in the scope you found it in, not in whichever one happens to be first.
     /// `retry` as in PgPool::execute: by default an action lost with the connection
-    /// after it went out is reported, not sent again (T627).
+    /// after it went out is reported, not sent again.
     void execute_action(std::string_view session,
                         const std::string& id, std::string_view action,
                         PgQuery::ResultHandler    on_result,

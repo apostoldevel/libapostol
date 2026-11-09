@@ -85,7 +85,7 @@ private:
     // curl_easy callbacks (static)
     static size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdata);
     static size_t header_callback(char* buffer, size_t size, size_t nitems, void* userdata);
-    // Outbound address filter at connect time (T970) — set only when the
+    // Outbound address filter at connect time — set only when the
     // process policy (fetch.deny_internal) is on.
     static curl_socket_t open_socket_callback(void* clientp, curlsocktype purpose,
                                               struct curl_sockaddr* address);
@@ -101,7 +101,7 @@ private:
     // Track registered socket fds so we can clean up properly
     std::vector<curl_socket_t> registered_fds_;
 
-    // Sockets the loop stopped watching under curl (T607), reported back to
+    // Sockets the loop stopped watching under curl, reported back to
     // curl as errored from a one-shot timer — curl_multi_socket_action may
     // not be called from inside socket_callback.
     std::vector<curl_socket_t> lost_fds_;

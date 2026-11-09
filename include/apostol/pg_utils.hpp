@@ -99,7 +99,7 @@ int check_pg_error(std::string_view json, std::string& error_message,
 /// premise does not hold — read it before adding a member to HttpStatus.
 ///
 /// v1's ErrorCodeToStatus(), which this once mirrored, has neither the /100
-/// rule nor anything past the four codes above; a v1 and a v2 brand answer the
+/// rule nor anything past the four codes above; a v1 and a v2 application answer the
 /// same database refusal with different statuses.
 HttpStatus error_code_to_status(int error_code);
 

@@ -128,9 +128,9 @@ void HttpClient::request(std::string_view method, std::string_view url_str,
 {
     auto url = parse_url(url_str);
 
-    // HTTP(S) only: any other scheme went out as plain HTTP to its host:port —
-    // gopher://169.254.169.254:80/ became a request to the metadata service
-    // (T970). Reported from the loop, like the other errors of this client —
+    // HTTP(S) only: any other scheme is refused rather than sent as plain HTTP
+    // to its host:port.
+    // Reported from the loop, like the other errors of this client —
     // 1 ms, not 0: a zero timerfd is disarmed and never fires. The timer is
     // cancelled with the client.
     if (url.scheme != "http" && url.scheme != "https") {

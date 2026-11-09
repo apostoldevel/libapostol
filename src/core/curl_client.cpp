@@ -27,7 +27,7 @@ struct CurlClient::Transfer
     FailHandler  on_fail;
     WriteHandler on_write;
 
-    // Outbound address filter (T970): a snapshot of the process policy, so a
+    // Outbound address filter: a snapshot of the process policy, so a
     // reload mid-transfer does not change the rules under it; null when off.
     std::shared_ptr<const FetchAddressPolicy> policy;
     std::string  refused;       // why the filter refused a connection, if it did
@@ -96,8 +96,8 @@ void CurlClient::perform(std::string_view url,
     curl_easy_setopt(xfer->easy, CURLOPT_PRIVATE, xfer.get());
 
     // Protocols: HTTP(S) only, for the URL and for every redirect target.
-    // libcurl's default also allows gopher/dict/ftp/file/... — an SSRF primitive
-    // when the URL comes from the database (http.fetch). Fail closed if refused.
+    // libcurl's default also allows gopher/dict/ftp/file/..., which a URL taken
+    // from the database (http.fetch) must not reach. Fail closed if refused.
 #if LIBCURL_VERSION_NUM >= 0x075500   // 7.85.0: *_PROTOCOLS_STR, bitmask deprecated
     auto proto_rc = curl_easy_setopt(xfer->easy, CURLOPT_PROTOCOLS_STR, "http,https");
     if (proto_rc == CURLE_OK)
@@ -261,7 +261,7 @@ int CurlClient::socket_callback(CURL* /*easy*/, curl_socket_t s, int what,
 
     if (already) {
         if (!self->loop_.modify_io(static_cast<int>(s), events)) {
-            // Closed under curl (T607): the loop has dropped the handler, and
+            // Closed under curl: the loop has dropped the handler, and
             // curl, which waits on this socket, would wait for good unless the
             // transfer has a timeout. Forget the registration and tell curl
             // the socket failed — from a timer, not from inside this callback.

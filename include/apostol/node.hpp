@@ -10,7 +10,7 @@ namespace apostol
 //
 // One answer to "which copy of the application is this", shared by everything
 // that has to tell copies apart: the leader of a background role, a gateway's
-// node registry, a station server's connection owner.
+// node registry, a protocol server's connection owner.
 //
 // Before it every consumer invented its own: one read an environment variable
 // of its own name, another used a bare pid — which says nothing once two

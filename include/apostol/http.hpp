@@ -198,7 +198,7 @@ public:
 
     /// Stop after the request being dispatched: called from the handler, it
     /// makes feed() return with the bytes after that request unparsed, so
-    /// that the caller can answer it before reading the next one (T314).
+    /// that the caller can answer it before reading the next one.
     void hold() noexcept { hold_ = true; }
 
     /// Bytes of the last feed() that were parsed.
@@ -206,7 +206,7 @@ public:
 
     /// Go on parsing after an Upgrade request that was answered over HTTP/1.1
     /// (h2c): RFC 9110 §7.8 lets a server ignore Upgrade. A refused WebSocket
-    /// handshake does not come here — it closes after its answer (T621).
+    /// handshake does not come here — it closes after its answer.
     /// Returns false unless feed() stopped on exactly that.
     bool resume_after_upgrade() noexcept;
 
@@ -342,7 +342,7 @@ class HttpConnection
 public:
     using RequestHandler = std::function<void(const HttpRequest&, HttpResponse&)>;
 
-    // Backpressure on a client that does not read its answers (T343): while
+    // Backpressure on a client that does not read its answers: while
     // the buffered tail is over kWriteHighWater the socket is not read (EPOLLIN
     // off); reading resumes once the tail drains under kWriteLowWater. The
     // kernel buffer fills, the client's own write blocks — memory spent on a
@@ -352,7 +352,7 @@ public:
     static constexpr std::size_t kWriteLowWater  = 64u << 10;
 
     /// @param loop  If non-null, enables async write buffering + sendfile.
-    /// @param logger  Warn sink for a module's stray answer (T343); may be null.
+    /// @param logger  Warn sink for a module's stray answer; may be null.
     explicit HttpConnection(TcpConnection conn, EventLoop* loop = nullptr,
                             Logger* logger = nullptr);
     ~HttpConnection();
@@ -365,11 +365,11 @@ public:
     int fd() const noexcept { return conn_.fd(); }
     bool closed() const noexcept { return closed_; }
 
-    /// Buffered write tail in bytes (observability; T343 probe).
+    /// Buffered write tail in bytes (observability).
     std::size_t buffered_bytes() const noexcept
     { return write_buf_.size() - write_pos_; }
 
-    /// Answers sent with nothing owed on the connection (T343 detector).
+    /// Answers sent with nothing owed on the connection (stray-answer detector).
     std::size_t stray_answers() const noexcept { return stray_answers_; }
 
     /// Read available data, parse HTTP, and call @p handler for each complete
@@ -426,7 +426,7 @@ private:
     Logger*       logger_{nullptr};
     bool          closed_{false};
 
-    // One request in work per connection (T314; RFC 9112 §9.3.2 wants answers
+    // One request in work per connection (RFC 9112 §9.3.2 wants answers
     // in request order, and a module answering later through connection_ctx
     // does not say which request it answers). While an answer is owed —
     // deferred and not yet sent, or a file still being written — the parser
@@ -441,9 +441,9 @@ private:
     bool          answered_in_dispatch_{false};
     bool          close_after_send_{false};  // the request in work asked to close
     bool          stop_reading_{false};      // ... so nothing after it is parsed
-    bool          throttled_{false};         // write tail over kWriteHighWater (T343)
+    bool          throttled_{false};         // write tail over kWriteHighWater
     bool          draining_{false};          // stop_keep_alive(): each answer is the last
-    std::size_t   stray_answers_{0};         // answers sent with nothing owed (T343)
+    std::size_t   stray_answers_{0};         // answers sent with nothing owed
     std::string   pending_in_;               // read, not yet parsed
     uint32_t      mask_;                     // events last set on the loop
 
@@ -451,7 +451,7 @@ private:
     bool owed() const noexcept { return awaiting_ || file_fd_ >= 0; }
 
     /// Bytes already read wait to be parsed and nothing stops them — except
-    /// the write throttle (T343), which waits for the tail to drain.
+    /// the write throttle, which waits for the tail to drain.
     bool resumable() const noexcept;
 
     void response_started() noexcept;

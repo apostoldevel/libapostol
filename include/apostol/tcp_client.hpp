@@ -87,7 +87,7 @@ public:
 
     /// Called with the resolved address before connect(); a non-empty result
     /// refuses the connection with that message (on_error). Used by HttpClient
-    /// for the outbound address filter (T970).
+    /// for the outbound address filter.
     void set_address_check(std::function<std::string(const struct sockaddr*)> check)
     {
         address_check_ = std::move(check);

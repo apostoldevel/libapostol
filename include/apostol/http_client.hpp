@@ -80,7 +80,7 @@ private:
     EventLoop& loop_;
     std::chrono::milliseconds timeout_{30000};
     std::vector<std::unique_ptr<PendingRequest>> pending_;
-    std::vector<EventLoop::TimerId> refusal_timers_;  // scheme refusals in flight (T970)
+    std::vector<EventLoop::TimerId> refusal_timers_;  // scheme refusals in flight
 
 #ifdef WITH_SSL
     bool tls_enabled_{false};

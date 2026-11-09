@@ -66,8 +66,8 @@ public:
     using AcquiredHandler = std::function<void()>;
     using LostHandler     = std::function<void(std::string_view why)>;
 
-    /// @p key     — the role, e.g. "csms/helper"; hashed to the lock id.
-    /// @p holder  — who asks, e.g. "csms leader helper node-a:123";
+    /// @p key     — the role, e.g. "app/helper"; hashed to the lock id.
+    /// @p holder  — who asks, e.g. "app leader helper node-a:123";
     ///              becomes application_name (PostgreSQL keeps 63 bytes).
     /// @p logger  — may be null.
     PgLeaderLock(EventLoop& loop, std::string conninfo, std::string key,

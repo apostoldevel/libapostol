@@ -14,7 +14,7 @@ namespace apostol
 
 // ─── FetchAddressPolicy ─────────────────────────────────────────────────────
 //
-// Outbound address filter for CurlClient (T970). Applied at connect time, to
+// Outbound address filter for CurlClient. Applied at connect time, to
 // the address actually dialled — for the first URL, for every redirect target
 // and for every address a name resolves to — so neither a redirect nor a DNS
 // name pointing inside (127.0.0.1.nip.io, rebinding) gets past it. A check of
@@ -24,7 +24,7 @@ namespace apostol
 //
 //   "fetch": {
 //     "deny_internal": true,
-//     "allow": ["ocpp:9220", "minio", "10.1.2.0/24", "192.168.0.5:8080", "[fd00::1]:443"]
+//     "allow": ["backend:8080", "minio", "10.1.2.0/24", "192.168.0.5:8080", "[fd00::1]:443"]
 //   }
 //
 // deny_internal refuses loopback, private, link-local (cloud metadata
@@ -32,7 +32,7 @@ namespace apostol
 // and IPv6, with IPv4 embedded in IPv6 (::ffff:a.b.c.d, 64:ff9b::/96, 2002::/16)
 // judged as IPv4. An "allow" entry lets one through:
 //   - a name  — matched (case-insensitively, exactly) to the host of the URL being
-//               connected, whatever it resolves to: "ocpp" is the container;
+//               connected, whatever it resolves to: "backend" is a container;
 //   - an IP or CIDR — matched to the address being dialled;
 //   - an optional ":port" (IPv6 in brackets) — then the port must match too.
 //

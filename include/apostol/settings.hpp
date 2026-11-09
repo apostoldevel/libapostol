@@ -121,7 +121,7 @@ struct AppSettings
     std::vector<std::string> pg_reset{"current.area"};
 
     // ── Outbound fetch ────────────────────────────────────────────────────
-    // fetch.deny_internal + fetch.allow (T970); see fetch_policy.hpp.
+    // fetch.deny_internal + fetch.allow; see fetch_policy.hpp.
     FetchAddressPolicy fetch_policy;
 
     // ── Constructor: resolve default paths from prefix ────────────────────

@@ -75,7 +75,7 @@ std::string result_error_text(const PgResult& r)
     // an index row over roughly 2.7 KB is rejected, api.set_object_label swallows
     // that in its EXCEPTION block and returns false, and the C++ side discards the
     // result. The label would simply not be set, and nothing would say so: the
-    // very shape this card exists to remove, one floor down.
+    // same silent failure this error text exists to prevent, one floor down.
     //
     // Cut on a character boundary — messages are UTF-8 and some of this system's
     // are Russian, raised by db-platform itself rather than by PostgreSQL, so
@@ -499,7 +499,7 @@ bool PgConnection::send_query(const std::string& sql)
     // idle_session_timeout — sent FATAL and closed; PQstatus does not know
     // until something is read, and PQsendQuery into that socket succeeds. The
     // query would then be lost on a connection that never carried it, and the
-    // pool, which does not repeat a query once sent (T627, PgRetry::never),
+    // pool, which does not repeat a query once sent (PgRetry::never),
     // would fail it. Found here, the query is not sent: the caller re-queues it.
     //
     // Twice: libpq's read takes what is there and returns, so the first call
@@ -899,7 +899,7 @@ void PgPool::new_connection(Opening why)
     conns_.push_back(std::move(conn));
     registered_conns_.insert(raw);
 
-    // A connection epoll refused is not kept (T767): left in Connecting with no
+    // A connection epoll refused is not kept: left in Connecting with no
     // events, nothing would ever finish or replace it, and healthy_count()
     // would count it — ensure_min_connections() would not open another.
     try {
@@ -931,7 +931,7 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
             // 127.0.0.1), target_session_attrs — and the new one usually gets
             // the same number. Comparing numbers saw no change while epoll had
             // dropped the registration with the close, so modify_io() below
-            // failed with ENOENT and threw out of the loop (T596). Take the fd
+            // failed with ENOENT and threw out of the loop. Take the fd
             // out before polling and register whatever is there after — as
             // PgLeaderLock::on_io does.
             const int polled_fd = conn.fd();
@@ -1035,7 +1035,7 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                     // Fully flushed — only need EPOLLIN for results
                     if (!loop_.modify_io(conn.fd(), EPOLLIN)) {
                         // The loop no longer watches the socket (closed under
-                        // us, T607): no result will ever be read from it.
+                        // us): no result will ever be read from it.
                         // Lost like any other — the path PQconsumeInput
                         // failing takes below.
                         if (pg_logger_)
@@ -1112,7 +1112,7 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
             // quotes the statement back in its error text. Reduce that text
             // before anyone sees it: the log line below, the query's exception
             // handler (which modules log, and AuthServer answers a client with)
-            // and a caller reading error_message() itself (T306).
+            // and a caller reading error_message() itself.
             const bool quiet = conn.current_query() && conn.current_query()->quiet();
             if (quiet) {
                 for (auto& r : results)
@@ -1164,7 +1164,7 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
                         // did not test ok() — nearly all of them — then recorded the
                         // failure as a success: a scheduled job whose body threw came
                         // back 'enabled' with its next run time advanced, and nothing
-                        // was written anywhere a person would look (card T224).
+                        // was written anywhere a person would look.
                         auto bad = std::find_if(results.begin(), results.end(),
                             [](const PgResult& r) { return !r.ok(); });
 
@@ -1540,14 +1540,14 @@ void PgPool::dispatch_queue(PgConnection& conn)
     if (pg_logger_ && !queue_.front()->quiet())
         pg_logger_->debug("{} Query: {}", conn_tag(conn), queue_.front()->sql());
 
-    // Owned by inflight_ before the connection points at it — see execute() (T650).
+    // Owned by inflight_ before the connection points at it — see execute().
     PgQuery* raw_q = queue_.front().get();
     inflight_.push_back(std::move(queue_.front()));
     queue_.pop_front();
     conn.set_current_query(raw_q);
 
     // If flush was incomplete, need EPOLLOUT to continue flushing. A socket
-    // the loop no longer watches (T607) would leave the rest unsent for good;
+    // the loop no longer watches would leave the rest unsent for good;
     // the server has not got the whole statement, so it has not run it —
     // re-queued as when send_query fails.
     //
@@ -1570,7 +1570,7 @@ void PgPool::dispatch_queue(PgConnection& conn)
     }
 
     // Taken back and the connection marked before the log line: a throw from
-    // the log leaves no query that nothing points at (T650). Re-queue the
+    // the log leaves no query that nothing points at. Re-queue the
     // query instead of losing it (P1 Fix: retry).
     const int state = static_cast<int>(conn.state());
     conn.set_current_query(nullptr);
@@ -1636,19 +1636,19 @@ PgPool::QueryId PgPool::execute(std::string              sql,
             if (pg_logger_ && !q->quiet())
                 pg_logger_->debug("{} Query: {}", conn_tag(*c), q->sql());
 
-            // inflight_ owns the query before the connection points at it
-            // (T650): a throw in between leaves the pointer on a live query,
+            // inflight_ owns the query before the connection points at it:
+            // a throw in between leaves the pointer on a live query,
             // never on one the unwinding of this frame freed.
             PgQuery* raw_q = q.get();
             inflight_.push_back(std::move(q));
             c->set_current_query(raw_q);
 
-            // A partial flush on a socket the loop no longer watches (T607):
+            // A partial flush on a socket the loop no longer watches:
             // the rest would never go out, and the server, not having the
             // whole statement, has not run it — on to the next connection, as
             // when send_query fails (connection probably died).
             const bool sent = send_query(*c, *raw_q);
-            // modify_io may also throw — epoll out of memory (T767). The query
+            // modify_io may also throw — epoll out of memory. The query
             // is taken back below as on a lost socket and the exception passed
             // on: the caller learns nothing went out, and may send it again
             // without the pool flushing the tail of this copy behind it.
@@ -1687,7 +1687,7 @@ PgPool::QueryId PgPool::execute(std::string              sql,
             // itself throws (its own add_io — a second, independent epoll
             // failure), that exception escapes in place of the fault: the
             // query is already taken back either way. The connection is then
-            // in Error with a socket nothing watches (watch(), T789): out of
+            // in Error with a socket nothing watches (watch()): out of
             // healthy_count(), so the next query opens another one, and
             // replaced by heartbeat(). Not here: a module calling execute()
             // from a result callback runs inside on_io() of a connection that
@@ -1700,7 +1700,7 @@ PgPool::QueryId PgPool::execute(std::string              sql,
     }
 
     // No ready connection — queue. Connections first: opening one may throw
-    // (epoll, timerfd — T767), and a query already queued would then go out
+    // (epoll, timerfd), and a query already queued would then go out
     // with the next connection while its caller, told it failed, sends it
     // again. Nothing in here dispatches the queue, so the order is free.
     // Counted with this query: one more connection while the queue outgrows
@@ -1803,7 +1803,7 @@ void PgPool::watch(PgConnection& conn, uint32_t events)
     } catch (...) {
         // No event will come for this socket. Error keeps it out of
         // healthy_count() — the next query opens another connection at once —
-        // and heartbeat() replaces it (T789). Not replaced here: try_reconnect()
+        // and heartbeat() replaces it. Not replaced here: try_reconnect()
         // runs inside a module's call to execute() too, and that may be inside
         // on_io() of this very connection, which goes on using it.
         conn.set_state(PgConnState::Error);
@@ -2112,8 +2112,7 @@ void PgPool::fail_inflight_query(PgConnection& conn, std::string_view reason)
         // PQcancel did not get through). Re-queued, it ran a second time on the
         // new connection only for the answer to be discarded: dispatch_queue()
         // drops a canceled query by canceled_ids_, and an in-flight cancel()
-        // never puts its id there — it marks the query instead (seen in T619,
-        // card T627).
+        // never puts its id there — it marks the query instead.
         if (owned->canceled()) {
             if (pg_logger_)
                 pg_logger_->debug("Dropping canceled query {} after connection error: {}",
@@ -2147,7 +2146,7 @@ void PgPool::fail_inflight_query(PgConnection& conn, std::string_view reason)
         }
 
         // Sent whole: the server may have run it, committed it, and lost the
-        // connection only on the way back. Until T627 it was re-queued here
+        // connection only on the way back. Earlier it was re-queued here
         // regardless — and a statement with an effect ran twice: a second row,
         // a second charge, api.*_fail twice. Whether it ran is unknowable from
         // here, so it is not repeated: its caller is told, and decides. A
@@ -2363,7 +2362,7 @@ void PgPool::arm_handshake_watch() noexcept
     if (handshake_timer_ != EventLoop::kInvalidTimer)
         return;  // already armed; it re-arms itself while a handshake is in flight
 
-    // A timer the loop refuses (timerfd, epoll — T789) is no reason to fail
+    // A timer the loop refuses (timerfd, epoll) is no reason to fail
     // the connection that asked for it: thrown out of new_connection() or
     // try_reconnect(), it told execute()'s caller that a query failed with a
     // live connection under it; out of on_handshake_watch(), it left the
@@ -2790,7 +2789,7 @@ void PgPool::heartbeat()
     // path that sets Error goes on at once to try_reconnect() or
     // replace_connection(), and Error remains only when the reset could not
     // start (execute(), dispatch_queue() ignore try_reconnect()'s result), when
-    // the loop refused the new socket there (watch(), T789), or when a throw
+    // the loop refused the new socket there (watch()), or when a throw
     // cut that path short. No event will come for it: libpq closed its socket,
     // or the loop does not watch it. Collected first — replace_connection()
     // erases from conns_. A query still on it is failed as lost, not dropped
@@ -2873,7 +2872,7 @@ void PgPool::heartbeat()
     // in consume_notify() is only the fast path to it.
     //
     // It matters most where nobody is watching. A channel that is quiet by
-    // design (a vessel at sea) produces no events to ride on, and "no
+    // design (a site with no traffic for days) produces no events to ride on, and "no
     // notifications" is indistinguishable from "no subscription".
     upkeep(pg_logger_, "heartbeat: listener check", [this] {
         if (listener_) {
@@ -3388,7 +3387,7 @@ void PgPool::on_listener_io(uint32_t events)
     // connect reports EPOLLERR|EPOLLHUP, and connect_poll() is what moves on to
     // the next address or host — taking it for a death restarted the listener
     // from the first host every time, and with that host down it never
-    // subscribed (T596; the same as PgLeaderLock::on_io).
+    // subscribed (the same as PgLeaderLock::on_io).
     if ((events & (EPOLLERR | EPOLLHUP)) && listener_->state() != PgConnState::Connecting)
         listener_->set_state(PgConnState::Error);
 
@@ -3396,7 +3395,7 @@ void PgPool::on_listener_io(uint32_t events)
 
         case PgConnState::Connecting: {
             // The socket may be replaced inside the poll under the same number
-            // (see on_io, T596): out before polling, registered after.
+            // (see on_io): out before polling, registered after.
             const int polled_fd = listener_->fd();
             if (polled_fd >= 0)
                 loop_.remove_io(polled_fd);

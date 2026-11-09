@@ -386,7 +386,7 @@ void WsConnection::arm_write_interest()
 
 void WsConnection::lost_watch()
 {
-    // Closed under us (T607): the loop has dropped the handler, so neither
+    // Closed under us: the loop has dropped the handler, so neither
     // EPOLLOUT for the queued tail nor the peer's close will ever arrive. As
     // with a fatal write — closed(), and the session is torn down by whoever
     // polls it.

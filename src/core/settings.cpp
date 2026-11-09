@@ -159,7 +159,7 @@ void AppSettings::populate(const Config& cfg)
         }
     }
 
-    // Outbound address filter (T970). An entry that does not parse refuses the
+    // Outbound address filter. An entry that does not parse refuses the
     // file: a filter quietly missing one rule is either wider or narrower than
     // the operator wrote.
     std::vector<std::string> fetch_allow;

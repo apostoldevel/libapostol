@@ -181,7 +181,7 @@ private:
 
     void send_raw(uint8_t opcode, std::string_view payload, bool fin = true);
     void arm_write_interest();
-    void lost_watch();   // modify_io() failed: the loop let go of the fd (T607)
+    void lost_watch();   // modify_io() failed: the loop let go of the fd
 };
 
 // ── WsKeepAlive ──────────────────────────────────────────────────────────────

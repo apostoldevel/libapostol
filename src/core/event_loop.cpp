@@ -105,7 +105,7 @@ void EventLoop::poll_once(int timeout_ms)
         // (accept, connect, add_timer); the event still ahead in the batch was
         // raised for the old descriptor and would reach the new holder — a
         // peer's reset read as "connected" by a TcpClient still in SYN_SENT, a
-        // fresh timer fired at once (T619). Such events are dropped: nothing is
+        // fresh timer fired at once. Such events are dropped: nothing is
         // lost, EPOLL_CTL_ADD reports the new descriptor's own readiness to the
         // next epoll_wait, and a new timer has its own expiry. A live socket
         // taken off and registered again by another handler (curl does) is
@@ -165,8 +165,7 @@ void EventLoop::stop() noexcept
 // When APOSTOL_EPOLL_ET is enabled, user-facing I/O fds are registered with
 // edge-triggered + one-shot semantics: handlers must drain to EAGAIN and
 // explicitly re-arm (see rearm_io) or remove themselves. This is a
-// defence-in-depth property against forgotten remove_io spins — see the
-// plan docs/plans/2026-04-19-epoll-edge-triggered-migration.md.
+// defence-in-depth property against forgotten remove_io spins.
 // Internal fds registered directly via epoll_ctl (timer fds, signal fd)
 // continue to use level-triggered — they are owned by EventLoop and
 // drained internally.
@@ -210,11 +209,11 @@ bool registration_lost(int err) noexcept
 
 // An exception out of an I/O handler used to leave the loop and end the
 // process — a worker with every connection it served, for one bad frame on one
-// of them (T637). It is caught here, for this handler only: timers and signals
+// of them. It is caught here, for this handler only: timers and signals
 // still unwind, a process may be counting on that to be restarted.
 //
 // The loop tells the holder, not the peer. The fd is not closed — it is the
-// holder's, and a number closed behind its back is the next socket's (T619) —
+// holder's, and a number closed behind its back is the next socket's —
 // and not shut for writing: the peer would see the end before the holder
 // chose it (a leader lock released while its process still drains), and the
 // holder's own goodbye (TLS close_notify) could not go out. Its read side
@@ -338,7 +337,7 @@ bool EventLoop::modify_io(int fd, uint32_t events)
     // open reads a socket that is not its own. The loud path — the holder
     // drops the connection and makes a new one — is the one that cannot go
     // wrong quietly. A library that swaps sockets under its holder is fixed
-    // at the source (libpq, T596), not here.
+    // at the source (libpq), not here.
     io_handlers_.erase(it);
     if (Logger* log = g_diagnostics.load(std::memory_order_relaxed))
         log->error("epoll_ctl MOD fd={}: {} — handler dropped, the caller's socket is not watched",
@@ -448,7 +447,7 @@ void EventLoop::cancel_timer(TimerId id)
 void EventLoop::dispatch_timer(int timer_fd)
 {
     // Consume the expiration count — required to re-arm EPOLLIN
-    // Nothing read, nothing expired: the event was not this timer's (T619) or
+    // Nothing read, nothing expired: the event was not this timer's or
     // a nested run_for() already took the expiry. Fired anyway, it went off
     // early, or twice.
     uint64_t count = 0;

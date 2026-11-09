@@ -298,12 +298,13 @@ HttpStatus error_code_to_status(int error_code)
     // code all the same. It also rewrites the identifier into the three-digit
     // shape, so by the time it reaches this function a serial block is
     // indistinguishable from a deliberate group: the distinction cannot be
-    // made here, only where the code is minted. Two blocks exist today,
-    // ERR-402xx in debt-master (22 of them) and ERR-410xx in the v1 OCPI
-    // layer. Neither reaches this: 402 is no member below, and that OCPI layer
-    // is v1, which has its own mapping. Adding a member for a number some
-    // configuration hands out as a serial block would start relaying its
-    // business refusals as that status — silently, with no test to catch it.
+    // made here, only where the code is minted. Such blocks are in use
+    // (402xx, 410xx); none reaches this today: 402 is no member below, and
+    // 410xx is minted by a v1 application, which maps codes to statuses
+    // itself. Check the configurations in use before adding a member: one for
+    // a number some configuration hands out as a serial block would start
+    // relaying its business refusals as that status — silently, with no test
+    // to catch it.
     // So: settle the legacy format before widening the enum.
     if (error_code >= 400) {
         if (const auto status = status_from_code(error_code))

@@ -226,8 +226,8 @@ TcpListener::TcpListener(uint16_t port, int backlog, std::string_view address)
 
     // Bind to an address the machine has not been given yet — a DHCP lease, a
     // keepalived VIP, a tunnel that comes up later. Without this the process dies
-    // with EADDRNOTAVAIL and, under restart: unless-stopped, keeps dying; on a
-    // vessel nobody is reading that log.
+    // with EADDRNOTAVAIL and, under restart: unless-stopped, keeps dying; on an
+    // unattended host nobody is reading that log.
     ::setsockopt(fd_, IPPROTO_IP, IP_FREEBIND, &one, sizeof(one));
 
     sockaddr_in6 addr{};

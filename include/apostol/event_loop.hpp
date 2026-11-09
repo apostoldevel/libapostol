@@ -68,7 +68,7 @@ public:
     //
     // A registration can vanish under its holder: epoll drops it when the
     // descriptor is closed, whoever closed it. That used to throw out of the
-    // loop and take the process down (T596, T607). Now, on EBADF, ENOENT or
+    // loop and take the process down. Now, on EBADF, ENOENT or
     // EPERM the handler is dropped — a later socket with this number cannot
     // reach it — an error is logged through set_diagnostics(), and false is
     // returned: the caller's socket is not watched any more, and the caller
@@ -129,9 +129,9 @@ private:
     // seq — when the entry was registered, by registration_seq_. An epoll_wait
     // batch is collected before any of its handlers runs, so an event in it
     // for an entry newer than the batch was raised for whatever had the fd
-    // number before (T619).
+    // number before.
     // faulted — the handler threw; the loop shut the socket's read side and
-    // lets one more event through for the holder to see end of input (T639).
+    // lets one more event through for the holder to see end of input.
     struct IOEntry
     {
         uint32_t events;

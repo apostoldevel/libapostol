@@ -69,7 +69,7 @@ public:
     void           withhold_statement();
 
     /// An error result that carries only @p text — no connection's error
-    /// buffer, which for a quiet query may still quote the statement (T306).
+    /// buffer, which for a quiet query may still quote the statement.
     /// What a caller without an error handler receives in on_result when its
     /// statement is lost with the connection (PgPool::fail_inflight_query).
     static PgResult lost(std::string text);
@@ -104,7 +104,7 @@ private:
 // ── PgRetry ───────────────────────────────────────────────────────────────────
 
 /// What the pool does with a query whose connection is lost after the query was
-/// sent whole — when the server may or may not have run it (T627).
+/// sent whole — when the server may or may not have run it.
 ///
 ///   never    — it is not sent again: the caller gets an error, "connection lost
 ///              … may or may not have been executed" (on_exception, or a result
@@ -112,8 +112,8 @@ private:
 ///              safe answer for a statement with an effect: repeated, it ran
 ///              twice — a second row, a second charge — and the caller saw one
 ///              success.
-///   if_lost  — it is sent again on a new connection, as the pool did for every
-///              query before T627. For statements whose repetition is harmless
+///   if_lost  — it is sent again on a new connection, as the pool once did for
+///              every query. For statements whose repetition is harmless
 ///              or wanted (a read, an idempotent write, a claim that expires),
 ///              chosen at the call site where that is known.
 ///
@@ -288,7 +288,7 @@ public:
     ///
     /// It exists because the asynchronous PQconnectPoll does not honour
     /// connect_timeout at all: a server that accepts TCP and never answers held
-    /// a connection in Connecting for good (T606). The limit is only kept here;
+    /// a connection in Connecting for good. The limit is only kept here;
     /// PgPool is what acts on it, through handshake_expired().
     std::chrono::seconds handshake_limit() const { return handshake_limit_; }
 
@@ -760,7 +760,7 @@ public:
     ///
     /// For shutdown, between the drain of work in flight and on_stop(): a module
     /// tears down in on_stop() what its callbacks use, and a result that arrived
-    /// after that would be handed to the remains (T659 — TaskScheduler released its
+    /// after that would be handed to the remains (TaskScheduler released its
     /// BotSession in on_stop(), the drain delivered a late job result into it, and
     /// the process died on a null pointer). The handlers themselves are kept, not
     /// destroyed: what they captured goes with the pool, as it did before.
@@ -798,7 +798,7 @@ private:
     void replace_connection(PgConnection& conn);
 
     /// Register a pool connection's socket with the loop. When epoll refuses
-    /// (T789) the connection is put in Error before the exception goes on:
+    /// the socket, the connection is put in Error before the exception goes on:
     /// left as it was — Connecting, or Ready — nothing would drive it, yet
     /// healthy_count() would count it. heartbeat() replaces it.
     void watch(PgConnection& conn, uint32_t events);
@@ -915,7 +915,7 @@ private:
     // Sent whole, lost with the connection, not to be repeated: waiting for
     // deliver_lost() to tell their callers. Kept here rather than in a bare timer
     // so that outstanding() counts them and detach() reaches them — a failure
-    // delivered to a module after its on_stop() is exactly T659.
+    // delivered to a module after its on_stop() is exactly what this prevents.
     struct Lost
     {
         std::unique_ptr<PgQuery> query;
@@ -979,7 +979,7 @@ private:
     /// with no retry — see start_listener()/on_listener_io()).
     void schedule_reconnect_timer();
 
-    // ── Handshake watch (T606) ────────────────────────────────────────────────
+    // ── Handshake watch ───────────────────────────────────────────────────────
     // PQconnectPoll keeps no time: a server that takes the TCP connection and
     // never answers, or a SYN nobody answers, leaves the handshake waiting for
     // an event that will not come (or comes when the kernel gives up), and
@@ -989,7 +989,7 @@ private:
     // expired TCP connect is given up and libpq tries the next address
     // (give_up_tcp_connect()), any other expired handshake is dropped as a
     // failed connect — pool or listener alike, with the backoff. A timer the
-    // loop refuses (T789) is logged, not thrown: the handshake goes on without
+    // loop refuses is logged, not thrown: the handshake goes on without
     // its limit until the next start or heartbeat() arms the watch again.
     void arm_handshake_watch() noexcept;
     void on_handshake_watch();

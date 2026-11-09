@@ -156,17 +156,16 @@ void BotSession::execute_action(std::string_view session,
 {
     // Two refusals, two texts — deliberately, and in this order.
     //
-    // They shared one text ("not authenticated") until 08.09.2026, and it named the
-    // wrong layer. A production stack spent a day writing
+    // With one shared text ("not authenticated") a line such as
     //
     //   TaskScheduler: action 'cancel' failed for <uuid>: BotSession: not authenticated
     //
-    // and the search went into OAuth2 and the apibot account, where nothing was
-    // broken. In that incident the bot held a session the whole time; the caller had
-    // handed over an empty one, for an object it no longer tracked. One string turned
-    // a one-layer defect into a three-layer search (cards T192, T217).
+    // points at OAuth2 and the apibot account even when the bot holds a session
+    // and the caller handed over an empty one, for an object it no longer tracks.
+    // Each refusal therefore names its own layer.
     //
-    // That is the incident, not a general rule. Some callers keep no valid() gate of
+    // That combination (a valid bot session, an empty one passed in) is only one
+    // way to get here. Some callers keep no valid() gate of
     // their own (MessageServer::do_send, ReportServer::do_complete and do_abort), and
     // a gate that is kept may have been passed before an asynchronous callback rather
     // than inside one, in which case it is stale by the time the call lands. The first
@@ -183,7 +182,7 @@ void BotSession::execute_action(std::string_view session,
     // string that is itself empty leaves sessions_ non-empty, so valid() stays true
     // while session() is empty, and the second branch does fire for what the bot
     // produced. Its root is the emptiness filter in refresh_if_needed, which tests the
-    // raw value before the JSON is parsed — not this order of tests (card T217).
+    // raw value before the JSON is parsed — not this order of tests.
     //
     // Behaviour is unchanged either way: both branches refuse before the database is
     // touched.
@@ -222,8 +221,8 @@ void BotSession::sign_out()
     // equal to userid), and that user holds no logout right — deliberately: it is
     // a donor of the system session, never a party to a login. SessionOut checks
     // the logout bit of the session's current user and refuses, then records
-    // "Access denied" under code 9001. Ten of those per stack restart, in a log
-    // kept for ten years.
+    // "Access denied" under code 9001 — one refusal per session, on every
+    // process stop, kept in the event log for good.
     //
     // Nor is there anything to reclaim: api.get_sessions matches on
     // (suid, scope, agent) and hands the same rows back on the next start. The

@@ -20,13 +20,13 @@ option(WITH_DB_PLATFORM "Build the db-platform integration layer" ON)
 
 # Edge-triggered + one-shot epoll — defense-in-depth against the class of
 # "forgotten remove_io" bugs that spin the event loop at 100% CPU on a
-# closed socket (see a3660c2 / 23347f6 production fixes).
+# closed socket (see a3660c2).
 # When ON, EventLoop::add_io registers fds with EPOLLET|EPOLLONESHOT;
 # handlers must drain to EAGAIN and call rearm_io() after each event, or
 # the fd goes idle (no spin, by design).
-# Default OFF here so downstreams opt in explicitly; apostol-csms's
-# backend/configure and Dockerfile default it to ON with an
-# APOSTOL_EPOLL_ET=OFF rollback env var.
+# Default OFF here so downstreams opt in explicitly; an application's
+# configure script and Dockerfile may default it to ON and keep an
+# APOSTOL_EPOLL_ET=OFF environment variable as the rollback.
 option(APOSTOL_EPOLL_ET "Edge-triggered + one-shot epoll (defense-in-depth against forgotten remove_io spins)" OFF)
 
 # The library's own tests (ctest). Off by default: an application that adds the

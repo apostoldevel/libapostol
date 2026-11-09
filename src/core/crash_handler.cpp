@@ -11,7 +11,7 @@
 //       + abi::__cxa_demangle if addr2line is unavailable or returns "??").
 //   4. Re-raises the signal with SIG_DFL so the kernel generates a core dump.
 //
-// Death is guaranteed (T648). The report calls what may take a lock the
+// Death is guaranteed. The report calls what may take a lock the
 // crashed code holds: a stack overflow lands inside malloc, and once the
 // process has had a thread (curl's resolver) malloc locks its arena — the
 // handler then waited on it forever, the worker never died, and the master,
@@ -203,7 +203,7 @@ static bool addr2line_resolve(void* addr,
 // ─── Crash handler ───────────────────────────────────────────────────────────
 
 // The signal's description without gettext: strsignal() translates, and under
-// any locale but C its first call allocates (T648).
+// any locale but C its first call allocates.
 static const char* signal_name(int signo) noexcept
 {
 #if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 32))
@@ -417,7 +417,7 @@ void install_crash_handler(std::string_view log_file) noexcept
     setup_crash_altstack();
 
     // Load now what the handler's first backtrace() and localtime_r() would
-    // load then — by dlopen and malloc, under a lock the crash may hold (T648).
+    // load then — by dlopen and malloc, under a lock the crash may hold.
     // Installed in the master before fork, so every child inherits it loaded.
     {
         void* frame[1];

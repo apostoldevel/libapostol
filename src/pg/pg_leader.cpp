@@ -95,7 +95,7 @@ bool PgLeaderLock::fresh()
     // A stall shorter than answer_timeout() passes the age check, and its
     // queued events come at once in any order: a timer could run the
     // leader's work before the socket saying the session was killed while
-    // the process stood — and a standby already holding the role (T589).
+    // the process stood — and a standby already holding the role.
     // The socket is asked now instead — has the server closed its side? Not
     // by reading: a killed session sends FATAL and then FIN, one read takes
     // only the FATAL (libpq hands it to the notice processor while idle) and
@@ -267,7 +267,7 @@ void PgLeaderLock::on_io(std::uint32_t events)
         case PgConnState::Busy: {
             if ((events & EPOLLOUT) && conn_->needs_flush() && conn_->flush() &&
                 !loop_.modify_io(conn_->fd(), EPOLLIN)) {
-                drop("the socket is no longer watched");   // closed under us (T607)
+                drop("the socket is no longer watched");   // closed under us
                 return;
             }
 
@@ -355,7 +355,7 @@ void PgLeaderLock::send(Ask what)
 
     if (conn_->needs_flush() && conn_->fd() >= 0 &&
         !loop_.modify_io(conn_->fd(), EPOLLIN | EPOLLOUT))
-        drop("the socket is no longer watched");   // closed under us (T607)
+        drop("the socket is no longer watched");   // closed under us
 }
 
 void PgLeaderLock::handle(std::vector<PgResult>& results)

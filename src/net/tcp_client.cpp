@@ -349,7 +349,7 @@ bool TcpClient::watch(uint32_t events)
     if (loop_.modify_io(fd_, events))
         return true;
 
-    // Closed under us (T607): the loop has dropped the handler, so no event
+    // Closed under us: the loop has dropped the handler, so no event
     // will come for this socket — without a timer the client would wait
     // forever. Nothing left to remove_io.
     io_registered_ = false;
@@ -529,7 +529,7 @@ ssize_t TcpClient::ssl_write(const void* buf, size_t len)
     }
 
     // The socket's own error (EPIPE, ECONNRESET) says what happened to the
-    // peer; EIO only when OpenSSL left none (T649).
+    // peer; EIO only when OpenSSL left none.
     errno = (ssl_err == SSL_ERROR_SYSCALL && sys_err != 0) ? sys_err : EIO;
     return -1;
 }

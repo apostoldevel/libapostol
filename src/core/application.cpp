@@ -163,7 +163,7 @@ int Application::run(int argc, char* argv[])
     // default action ends the process without a line in the log — a worker
     // with every connection it served. send() here passes MSG_NOSIGNAL, but
     // sendfile(2) (HttpConnection::drain_file) and OpenSSL's socket BIO
-    // (SSL_write, SSL_shutdown) cannot (T649). Ignored, the write fails with
+    // (SSL_write, SSL_shutdown) cannot. Ignored, the write fails with
     // EPIPE and its caller tears the connection down as for any other error.
     // Set before the first fork: master, every child and a daemonized copy
     // inherit it.
@@ -632,8 +632,8 @@ Application::StagedConfig Application::read_config(bool reload) const
     // unit tests hold it — but a process must not run without it: a provider
     // that disappears over a typo turns every token of its audience into
     // "unknown audience", a site into the wrong one, and a server running
-    // quietly without a provider is worse than one that did not start (the
-    // owner's word, T312 item 1). -t says so, a start does not happen, a reload
+    // quietly without a provider is worse than one that did not start.
+    // -t says so, a start does not happen, a reload
     // keeps what it had.
     const auto skipped = staged.providers.skipped().size() + staged.sites.skipped().size();
     if (skipped > 0)
@@ -666,7 +666,7 @@ void Application::apply_config(StagedConfig&& staged)
     sites_     = std::move(staged.sites);
 
     // Every CurlClient of this process — and of the children forked from it —
-    // takes its outbound address filter from here (T970).
+    // takes its outbound address filter from here.
     FetchAddressPolicy::set_process_default(settings_.fetch_policy);
 
     // The locale into effect — here, so that a start and both reloads do it
@@ -1042,7 +1042,7 @@ void Application::detach_db() noexcept
 // what keeps away a result later than that. Either alone leaves a window: without
 // the finish an HTTP request in flight at SIGTERM would lose its answer to the
 // detach, and without the detach a query outlasting the finish would still reach
-// the module after on_stop() (T659). Notifications are muted before the finish,
+// the module after on_stop(). Notifications are muted before the finish,
 // not at the detach: each one starts new work (WebSocketAPI answers a NOTIFY with a
 // query per session), and a wait that keeps being fed never reaches zero. For the
 // same reason the listening socket leaves the loop and keep-alive ends first
@@ -1138,7 +1138,7 @@ bool Application::finish_work(EventLoop& loop,
             strand_timer.id = loop.add_timer(round,
                 [&failed, &fail_stranded, round] { failed += fail_stranded(round); });
         } catch (const std::exception& e) {
-            // Refused by the loop (T789): the finish runs as it did before.
+            // Refused by the loop: the finish runs as it did before.
             if (logger_)
                 logger_->warn("{} shutdown: queries with no connection will not be failed: {}",
                               name_, e.what());
@@ -1294,7 +1294,7 @@ void Application::single_run()
         // alive and before ~Application. Left to ~Application it logged
         // "Disconnected" into pg_logger_, already destroyed by then, and the
         // process sat on the dead logger's mutex with every signal blocked
-        // for signalfd — only kill -9 ended it (T281).
+        // for signalfd — only kill -9 ended it.
         detach_ipc();
         stop_db();
         exit_code_ = 1;
@@ -1795,8 +1795,8 @@ pid_t Application::fork_child(ProcessRole role, std::string child_name,
         // child's own loop used to reach the catch in run() through them: the
         // copy of ~EventLoop took the signalfd off the epoll instance the child
         // shares with the master, and the master stopped hearing signals —
-        // SIGCHLD and SIGTERM pending, children left as zombies, only kill -9
-        // (T597). std::exception only, as run() catches: anything else still
+        // SIGCHLD and SIGTERM pending, children left as zombies, only kill -9.
+        // std::exception only, as run() catches: anything else still
         // terminates without unwinding. The log line is guarded too — a throw
         // from it (a failed write, a rotation) would leave by the same road.
         try
@@ -1873,8 +1873,8 @@ void Application::reap_children()
         // A crash-looping child, once its backoff has latched at the ceiling, would
         // otherwise repeat its per-event lines below — this exit notice, the backoff
         // warning, the respawn notice — every few seconds for as long as it lasts:
-        // thousands of lines a day on a shipboard server nobody restarts before port.
-        // We never stop retrying (a process that gives up for good is worse at sea),
+        // thousands of lines a day on an unattended server nobody restarts for months.
+        // We never stop retrying (a process that gives up for good is worse there),
         // but past the ceiling we stop narrating each attempt and print one summary
         // line every few minutes instead. The ramp up to the ceiling still logs each
         // step. The storm is latched and read per child name, so one child's flood

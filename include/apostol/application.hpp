@@ -214,7 +214,7 @@ public:
     ///   3. detach — whatever is still outstanding will not be delivered;
     ///   4. @p on_stop — modules release what their callbacks used;
     ///   5. drain — what on_stop() queued, and only that.
-    /// Until T659 it was on_stop() first and one drain after it, and the drain
+    /// Earlier it was on_stop() first and one drain after it, and the drain
     /// handed results of earlier queries to modules already torn down: a
     /// TaskScheduler job answering after SIGTERM reached a released BotSession
     /// through a null pointer (SIGSEGV, fault 0xb0).
@@ -513,7 +513,7 @@ private:
     // The logger before the pools on purpose: members die in reverse order,
     // and ~PgPool logs "Disconnected" into pg_logger_. Declared the other way
     // round, a pool that outlived stop_db() logged into a destroyed Logger and
-    // hung on its dead mutex (T281). stop_db() is still the rule — ~PgPool
+    // hung on its dead mutex. stop_db() is still the rule — ~PgPool
     // also needs the EventLoop alive — this only removes the second trap.
     std::unique_ptr<Logger>   pg_logger_;
     std::unique_ptr<PgPool>   db_pool_;
@@ -558,7 +558,7 @@ private:
     // Respawn state, per child name. It has to be per child, not per application:
     // once it gates log suppression (below), a global storm would hide a second
     // child's crashes behind the first child's summary — the very failure the
-    // throttling exists to prevent on a ship. Keying by name also stops one child's
+    // throttling exists to prevent on an unattended server. Keying by name also stops one child's
     // crash frequency from setting another's backoff.
     //
     //   rapid_count  — consecutive rapid respawns; drives the exponential backoff

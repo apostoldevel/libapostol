@@ -826,7 +826,7 @@ bool HttpConnection::on_readable(RequestHandler handler)
     // Throttled counts too: its tail is still going out, but the peer that
     // half-closed under it (EPOLLRDHUP is level-triggered and stays asserted)
     // would spin this callback forever — under LT, an unread RDHUP fires again
-    // at once, round after round (T343).
+    // at once, round after round.
     if (owed() || stop_reading_ || throttled_) {
         closed_ = true;
         return false;
@@ -858,8 +858,8 @@ bool HttpConnection::on_readable(RequestHandler handler)
         // closed_) was refused — 401, 403, 400, now or deferred. Its client
         // waits for 101 or for the close, never sends another request, and
         // there is no idle timer: kept alive, the socket stays until the
-        // client goes, and a station retrying with a wrong name holds one fd
-        // per attempt (T621). Close once the refusal is out, as before T314.
+        // client goes, and a client retrying with a wrong path or credentials holds one fd
+        // per attempt. Close once the refusal is out.
         // Only for "Upgrade: websocket" — any other Upgrade (h2c from curl
         // --http2) is an ordinary request answered over HTTP/1.1, and its
         // connection stays open.
@@ -1044,7 +1044,7 @@ void HttpConnection::shutdown_and_drain() noexcept
 bool HttpConnection::resumable() const noexcept
 {
     // Held bytes are fed when the callback next runs on an EPOLLOUT wake —
-    // but not under the write throttle (T343): feeding them would only grow
+    // but not under the write throttle: feeding them would only grow
     // the held tail. The flag clears on the drain below the low water, and
     // the next wake resumes the parsing.
     return !closed_ && !owed() && !stop_reading_ && !throttled_ && !pending_in_.empty();
@@ -1058,7 +1058,7 @@ void HttpConnection::response_started() noexcept
         answered_in_dispatch_ = true;
         return;
     }
-    // T343: an answer outside a dispatch, with no deferred answer awaited and
+    // An answer outside a dispatch, with no deferred answer awaited and
     // no file in flight, owes nothing to the pipeline. A module sending one
     // (a double answer for one request, an answer to a request it already
     // answered) would have it taken for the debt of a pipelined request
@@ -1118,7 +1118,7 @@ void HttpConnection::send_response(const HttpResponse& resp)
     if (write_pos_ < write_buf_.size() || file_fd_ >= 0) {
         write_buf_.append(data);
         if (buffered_bytes() > kWriteHighWater)
-            throttled_ = true;   // T343: bound memory of a non-reading client
+            throttled_ = true;   // bound memory of a non-reading client
         after_response();
         return;
     }
@@ -1197,7 +1197,7 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
     if (write_pos_ < write_buf_.size() || file_fd_ >= 0) {
         write_buf_.append(headers);
         if (buffered_bytes() > kWriteHighWater)
-            throttled_ = true;   // T343: headers behind a held tail count too
+            throttled_ = true;   // headers behind a held tail count too
         // Can't queue two files — fallback to buffered read
         if (file_fd_ >= 0) {
             // Read entire file into write buffer (rare edge case)
@@ -1273,7 +1273,7 @@ bool HttpConnection::on_writable()
 
     // All out: close if asked, otherwise drop EPOLLOUT and read again.
     if (throttled_ && !has_pending_writes())
-        throttled_ = false;   // T343: the tail is gone — nothing to wait for
+        throttled_ = false;   // the tail is gone — nothing to wait for
     after_response();
 
     return false;
@@ -1308,7 +1308,7 @@ bool HttpConnection::drain_buffer()
         }
         write_pos_ += static_cast<std::size_t>(n);
         if (throttled_ && buffered_bytes() <= kWriteLowWater)
-            throttled_ = false;   // T343: tail under the low water — read again
+            throttled_ = false;   // tail under the low water — read again
     }
     write_buf_.clear();
     write_pos_ = 0;
