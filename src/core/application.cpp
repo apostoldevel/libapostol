@@ -2889,9 +2889,27 @@ std::string Application::process_metrics() const
             return;   // no LISTEN connection is wanted
         m.gauge("db_listener_up", "1 — the pool's LISTEN connection is up.",
                 pool.listener_up() ? 1 : 0, pl);
-        for (const auto& ch : channels)
-            m.gauge("db_listen", "1 — the server confirmed LISTEN on the channel.",
-                    pool.listening(ch) ? 1 : 0, {{"pool", name}, {"channel", ch}});
+
+        // A subscriber's personal channel carries its number, which changes
+        // with every new subscription: the row is named by the channel's code
+        // and listen="personal", so it outlives a resubscription. Two of one
+        // channel in a process: live only if both are.
+        std::map<std::string, std::string> personal;   // listened name → channel code
+#ifdef WITH_DB_PLATFORM
+        for (const auto* s : db_platform::NotifySubscriber::all())
+            if (&s->pool() == &pool && !s->personal_listen().empty())
+                personal.emplace(s->personal_listen(), s->channel());
+#endif
+        std::map<std::pair<std::string, std::string>, bool> rows;   // (code, listen) → live
+        for (const auto& ch : channels) {
+            const auto it   = personal.find(ch);
+            const bool mine = it != personal.end();
+            auto [row, fresh] = rows.try_emplace({mine ? it->second : ch, mine ? "personal" : "shared"}, true);
+            row->second = row->second && pool.listening(ch);
+        }
+        for (const auto& [key, live] : rows)
+            m.gauge("db_listen", "1 — the server confirmed LISTEN on the channel.", live ? 1 : 0,
+                    {{"pool", name}, {"channel", key.first}, {"listen", key.second}});
     };
     if (db_pool_)
         pool_rows(*db_pool_, "default");

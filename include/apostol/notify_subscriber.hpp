@@ -227,6 +227,10 @@ public:
     const std::string& policy_problem() const { return policy_problem_; }
 
     const std::string& channel() const { return options_.channel; }
+    /// The personal channel "<channel>:<number>" listened to now; empty — none.
+    const std::string& personal_listen() const { return listening_; }
+    /// The pool the subscriber listens on.
+    const PgPool& pool() const { return pool_; }
 
     /// The statement of complete(), for a module that sends it itself: the
     /// result followed by the confirmation.
