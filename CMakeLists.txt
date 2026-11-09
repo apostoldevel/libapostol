@@ -108,6 +108,8 @@ add_library(apostol STATIC
     src/core/file_utils.cpp
     src/core/http_utils.cpp
     src/core/node.cpp
+    src/core/node_directory.cpp
+    src/core/ipc.cpp
     src/core/http_client.cpp
     src/core/fetch_client.cpp
     src/core/fetch_policy.cpp
