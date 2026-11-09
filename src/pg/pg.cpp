@@ -2945,6 +2945,7 @@ void PgPool::unlisten(std::string_view channel)
     pending_listens_.erase(ch);
     sent_listens_.erase(ch);
     confirmed_listens_.erase(ch);
+    live_listens_.erase(ch);
 
     single_listens_.erase(ch);
     rejected_listens_.erase(ch);
@@ -3233,6 +3234,27 @@ bool PgPool::listener_is_dead() const
     return listener_->fd() < 0 || !listener_->connected();
 }
 
+std::vector<std::string> PgPool::listens() const
+{
+    std::vector<std::string> out;
+    out.reserve(notify_handlers_.size());
+    for (const auto& [ch, _] : notify_handlers_)
+        out.push_back(ch);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+bool PgPool::listener_up() const
+{
+    return listener_ && listener_->state() != PgConnState::Connecting && !listener_is_dead();
+}
+
+bool PgPool::listening(std::string_view channel) const
+{
+    return listener_up() && live_listens_gen_ == listener_gen_ &&
+           live_listens_.contains(std::string(channel));
+}
+
 void PgPool::restart_listener(std::string_view reason)
 {
     // Copy first: `reason` is usually PQerrorMessage() pointing into the
@@ -3488,6 +3510,11 @@ void PgPool::on_listener_io(uint32_t events)
                 for (const auto& ch : sent_listens_)
                     rejected_listens_.erase(ch);
                 confirmed_listens_.insert(sent_listens_.begin(), sent_listens_.end());
+                if (live_listens_gen_ != listener_gen_) {
+                    live_listens_.clear();
+                    live_listens_gen_ = listener_gen_;
+                }
+                live_listens_.insert(sent_listens_.begin(), sent_listens_.end());
             } else if (sent_batch_size_ > 1) {
                 // Which one is bad is unknown; the rest are innocent. Before,
                 // the whole batch was dropped here with one error line.
@@ -3501,6 +3528,7 @@ void PgPool::on_listener_io(uint32_t events)
             } else if (!sent_listens_.empty()) {
                 const auto& ch = *sent_listens_.begin();
                 rejected_listens_.insert(ch);
+                live_listens_.erase(ch);
                 if (pg_logger_)
                     pg_logger_->error("{} LISTEN {} rejected by the server — channel NOT subscribed until the listener is replaced",
                                       conn_tag(*listener_), pq_quote_ident(ch));

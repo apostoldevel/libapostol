@@ -203,6 +203,25 @@ public:
     void stop(std::string_view reason = "stopping: the process stopped before the work was finished");
 
     int  number()    const { return number_; }
+
+    /// What this subscriber has done since it was made — for a metrics endpoint.
+    struct Stats
+    {
+        std::uint64_t taken{0};     ///< rows handed to the module
+        std::uint64_t retries{0};   ///< of them, a repeated delivery (attempts > 1)
+        std::uint64_t acked{0};     ///< complete() confirmed by the database
+        std::uint64_t nacked{0};    ///< notify.nack sent: refuse(), and stop() for the rows left
+        std::uint64_t failed{0};    ///< complete() not confirmed: stale token, an error, no answer
+    };
+    const Stats& stats() const noexcept { return stats_; }
+
+    /// Rows taken and not confirmed yet: with the module, or their completion
+    /// sent and not answered. A completion canceled by PgPool::cancel() calls
+    /// no handler, so it stays counted here (and in neither acked nor failed).
+    std::size_t in_progress() const noexcept { return taken_.size() + acking_; }
+
+    /// The subscribers alive in this process, in the order they were made.
+    static const std::vector<const NotifySubscriber*>& all() noexcept;
     bool policy_ok() const { return policy_ok_; }
     /// Why policy_ok() is false; empty when it is true.
     const std::string& policy_problem() const { return policy_problem_; }
@@ -259,6 +278,9 @@ private:
 
     // id → row: with the module (taken, no complete()/refuse() yet).
     std::map<std::int64_t, NotifyRow> taken_;
+    // complete() sent, its answer not read.
+    std::size_t acking_{0};
+    Stats       stats_;
 
     bool started_{false};
     bool subscribing_{false};

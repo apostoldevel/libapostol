@@ -77,7 +77,20 @@ std::chrono::seconds seconds_of(const PgResult& r, int col, std::chrono::seconds
     return v > 0 ? std::chrono::seconds(v) : fallback;
 }
 
+// The subscribers of this process. One thread per process, so no lock; made
+// after fork, so a child never sees its parent's.
+std::vector<const NotifySubscriber*>& registry() noexcept
+{
+    static std::vector<const NotifySubscriber*> all;
+    return all;
+}
+
 } // namespace
+
+const std::vector<const NotifySubscriber*>& NotifySubscriber::all() noexcept
+{
+    return registry();
+}
 
 NotifySubscriber::NotifySubscriber(PgPool& pool, EventLoop& loop, Logger& log, Options options,
                                    RowHandler on_row, LegacyHandler on_legacy,
@@ -93,10 +106,12 @@ NotifySubscriber::NotifySubscriber(PgPool& pool, EventLoop& loop, Logger& log, O
     , self_(std::make_shared<NotifySubscriber*>(this))
     , spread_(static_cast<std::minstd_rand::result_type>(::getpid()))
 {
+    registry().push_back(this);
 }
 
 NotifySubscriber::~NotifySubscriber()
 {
+    std::erase(registry(), this);
     self_.reset();
     cancel_timers();
 }
@@ -306,6 +321,9 @@ void NotifySubscriber::take(std::int64_t id)
             row.attempts = static_cast<int>(std::strtol(r->value(0, 3), nullptr, 10));
 
             self.taken_.emplace(id, row);
+            ++self.stats_.taken;
+            if (row.attempts > 1)
+                ++self.stats_.retries;
 
             if (self.stopped_) {
                 self.refuse(row, "stopping: taken after the stop");
@@ -338,6 +356,7 @@ PgPool::QueryId NotifySubscriber::complete(const NotifyRow& row, std::string res
         return 0;
     }
     taken_.erase(it);
+    ++acking_;
 
     const std::int64_t id = row.id;
     std::weak_ptr<NotifySubscriber*> w = self_;
@@ -354,6 +373,16 @@ PgPool::QueryId NotifySubscriber::complete(const NotifyRow& row, std::string res
             };
             auto bad = std::find_if(results.begin(), results.end(),
                 [](const PgResult& r) { return !r.ok(); });
+
+            if (auto p = w.lock()) {
+                auto& self = **p;
+                if (self.acking_ > 0)
+                    --self.acking_;
+                if (bad == results.end())
+                    ++self.stats_.acked;
+                else
+                    ++self.stats_.failed;
+            }
 
             if (bad == results.end()) {
                 if (!results.empty())
@@ -387,6 +416,7 @@ void NotifySubscriber::refuse(const NotifyRow& row, std::string_view reason)
         return;
     }
     taken_.erase(it);
+    ++stats_.nacked;
 
     const std::int64_t id = row.id;
     std::weak_ptr<NotifySubscriber*> w = self_;
@@ -470,6 +500,7 @@ void NotifySubscriber::stop(std::string_view reason)
             row.id, row.token, pq_quote_literal(why));
     }
     const std::size_t refused = taken_.size();
+    stats_.nacked += refused;
     taken_.clear();
 
     if (number_ != 0)

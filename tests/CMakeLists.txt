@@ -44,3 +44,16 @@ target_compile_options(ipc_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-par
 set(IPC_TEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/ipc_test.d")
 add_test(NAME ipc COMMAND ipc_test -p "${IPC_TEST_DIR}/" -c "${IPC_TEST_DIR}/ipc_test.json")
 set_tests_properties(ipc PROPERTIES TIMEOUT 120)
+
+# metrics_test — the metrics text, then a node of two workers, the helper and
+# "probe": with enable_metrics() (on), and with no channels at all (off).
+add_executable(metrics_test metrics_test.cpp)
+target_link_libraries(metrics_test PRIVATE apostol)
+target_compile_options(metrics_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+
+foreach(mode on off)
+    set(METRICS_TEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/metrics_test_${mode}.d")
+    add_test(NAME metrics_${mode}
+             COMMAND metrics_test --mode ${mode} -p "${METRICS_TEST_DIR}/" -c "${METRICS_TEST_DIR}/metrics_test.json")
+    set_tests_properties(metrics_${mode} PROPERTIES TIMEOUT 60)
+endforeach()

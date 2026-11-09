@@ -7,6 +7,7 @@
 #include "apostol/event_loop.hpp"
 #include "apostol/ipc.hpp"
 #include "apostol/logger.hpp"
+#include "apostol/metrics.hpp"
 #include "apostol/module.hpp"
 #include "apostol/oauth_providers.hpp"
 #include "apostol/site_config.hpp"
@@ -90,6 +91,28 @@ public:
     /// and in a process with no master — it works alone: a request to this
     /// process is answered, every other target is unreachable.
     Ipc& ipc() noexcept { return ipc_; }
+
+    // ── Metrics of the node (see metrics.hpp) ─────────────────────────────────
+
+    /// Rows a module adds to this process's answer — its own counters, say.
+    /// Called on this process's loop, at every collection. Returns an id for
+    /// remove_metrics(); a module removes its source in on_stop().
+    using MetricsSource = std::function<void(MetricsText&)>;
+    std::size_t add_metrics(MetricsSource source);
+    void        remove_metrics(std::size_t id);
+
+    /// enable_metrics() was called.
+    bool metrics_enabled() const noexcept { return metrics_enabled_; }
+    const std::string& metrics_prefix() const noexcept { return metrics_prefix_; }
+
+    /// The rows of every live process of the node, merged, and
+    /// "<prefix>_process_up" for each: 1 — answered, 0 — live in the directory
+    /// but no answer within @p timeout (its rows are left out). @p done is
+    /// called once, on this loop. Without enable_metrics() — an empty text.
+    void collect_metrics(std::function<void(std::string)> done, std::chrono::milliseconds timeout);
+
+    /// The rows of this process alone (what it answers a collection with).
+    std::string process_metrics() const;
 
     /// Set up a non-blocking HTTP server on @p port (0 = OS picks).
     /// Registers accept + read handlers in @p loop, and a 1-second heartbeat
@@ -311,6 +334,11 @@ protected:
     // channels before it forks, and does nothing without this call.
     void enable_ipc() noexcept { ipc_.enable(); }
 
+    // Every process answers a collection of metrics (type "metrics" over
+    // ipc()) with its own rows; names start with @p prefix. Implies
+    // enable_ipc(). Same place to call it as enable_ipc().
+    void enable_metrics(std::string prefix = "apostol");
+
 private:
     // ── Startup ───────────────────────────────────────────────────────────────
     void parse_args(int argc, char* argv[]);
@@ -503,6 +531,18 @@ private:
     // After module_manager_ on purpose: it dies first, and the handlers it
     // holds may point into modules.
     Ipc ipc_;
+    // Every role's loop: ipc_.attach(), and the "metrics" handler when enabled.
+    void attach_ipc(EventLoop& loop, ProcessRole role, std::string_view name);
+    // ipc_.detach(): no handler runs after it — what they read may go next.
+    void detach_ipc();
+    bool        metrics_enabled_{false};
+    std::string metrics_prefix_;
+    std::map<std::size_t, MetricsSource> metrics_sources_;
+    std::size_t metrics_next_id_{1};
+#ifdef WITH_POSTGRESQL
+    // The lock of this process's role while it runs under "leader"; null otherwise.
+    const PgLeaderLock* leader_lock_{nullptr};
+#endif
     // A worker leaving new connections to the others: since when, and when it
     // last looked (a gap ends the wait). Zero — not waiting.
     std::chrono::steady_clock::time_point accept_defer_since_{};

@@ -11,6 +11,9 @@
 #ifdef WITH_POSTGRESQL
 #include "apostol/pg.hpp"
 #endif
+#if defined(WITH_POSTGRESQL) && defined(WITH_DB_PLATFORM)
+#include "apostol/notify_subscriber.hpp"
+#endif
 #include "apostol/websocket.hpp"
 
 #include <algorithm>
@@ -1235,7 +1238,7 @@ void Application::single_run()
 
     EventLoop loop;
     worker_loop_ = &loop;
-    ipc_.attach(loop, *logger_, ProcessRole::single, "single");
+    attach_ipc(loop, ProcessRole::single, "single");
 
     loop.add_signal(SIGTERM, stop_signal(loop));
     // SIGINT stops at once, the second time as well: a developer's Ctrl-C.
@@ -1292,7 +1295,7 @@ void Application::single_run()
         // "Disconnected" into pg_logger_, already destroyed by then, and the
         // process sat on the dead logger's mutex with every signal blocked
         // for signalfd — only kill -9 ended it (T281).
-        ipc_.detach();
+        detach_ipc();
         stop_db();
         exit_code_ = 1;
         return;
@@ -1312,7 +1315,7 @@ void Application::single_run()
 
     // First: a request still waiting here ends now, and nobody's reaches us
     // while the work in flight is finished.
-    ipc_.detach();
+    detach_ipc();
 
     stop_http_server(loop);
     stop_modules(loop);
@@ -1338,7 +1341,7 @@ void Application::worker_run()
     EventLoop loop;
     worker_loop_ = &loop;
     // Before the modules start: they register their handlers in on_start.
-    ipc_.attach(loop, *logger_, ProcessRole::worker, "worker");
+    attach_ipc(loop, ProcessRole::worker, "worker");
 
     loop.add_signal(SIGTERM, stop_signal(loop));
     loop.add_signal(SIGQUIT, stop_signal(loop));
@@ -1359,7 +1362,7 @@ void Application::worker_run()
     catch (const std::exception& e)
     {
         logger_->error("{} worker startup failed: {}", name_, e.what());
-        ipc_.detach();
+        detach_ipc();
         stop_db();   // while the loop is alive, before ~Application — see single_run
         exit_code_ = 1;
         return;
@@ -1377,7 +1380,7 @@ void Application::worker_run()
 
     loop.run();
 
-    ipc_.detach();   // first — see single_run
+    detach_ipc();   // first — see single_run
 
     stop_http_server(loop);
     stop_modules(loop);
@@ -1398,7 +1401,7 @@ void Application::helper_run()
     set_limit_nofile(cfg_limit_nofile());
 
     EventLoop loop;
-    ipc_.attach(loop, *logger_, ProcessRole::helper, "helper");
+    attach_ipc(loop, ProcessRole::helper, "helper");
 
     loop.add_signal(SIGTERM, stop_signal(loop));
     loop.add_signal(SIGQUIT, stop_signal(loop));
@@ -1478,11 +1481,12 @@ void Application::helper_run()
         lock = run_as_leader(loop, "helper", settings_.leader, stopping,
                              [&start, &loop] { if (!start()) loop.stop(); });
         gate = lock.get();
+        leader_lock_ = lock.get();
     }
     catch (const std::exception& e)
     {
         logger_->error("{} helper startup failed: {}", name_, e.what());
-        ipc_.detach();
+        detach_ipc();
         exit_code_ = 1;
         return;
     }
@@ -1491,7 +1495,7 @@ void Application::helper_run()
     if (!start())
 #endif
     {
-        ipc_.detach();
+        detach_ipc();
         stop_db();   // while the loop is alive, before ~Application — see single_run
         return;
     }
@@ -1501,7 +1505,7 @@ void Application::helper_run()
 
     loop.run();
 
-    ipc_.detach();   // first — see single_run
+    detach_ipc();   // first — see single_run
 
 #ifdef WITH_POSTGRESQL
     stopping = true;
@@ -1539,7 +1543,7 @@ void Application::custom_process_run(CustomProcess& proc)
 
     // 4. EventLoop + signal handlers
     EventLoop loop;
-    ipc_.attach(loop, *logger_, ProcessRole::custom, proc.name());
+    attach_ipc(loop, ProcessRole::custom, proc.name());
 
     loop.add_signal(SIGTERM, stop_signal(loop));
     loop.add_signal(SIGQUIT, stop_signal(loop));
@@ -1632,15 +1636,16 @@ void Application::custom_process_run(CustomProcess& proc)
             config_->get_bool(fmt::format("module.{}.leader", proc.name()), settings_.leader),
             stopping, [&start, &loop] { if (!start()) loop.stop(); });
         gate = lock.get();
+        leader_lock_ = lock.get();
     } catch (const std::exception& e) {
         logger_->error("{} process '{}' startup failed: {}", name_, proc.name(), e.what());
-        ipc_.detach();
+        detach_ipc();
         exit_code_ = 1;
         return;
     }
 
     if (!lock && !start()) {
-        ipc_.detach();
+        detach_ipc();
         stop_db();
         return;
     }
@@ -1649,7 +1654,7 @@ void Application::custom_process_run(CustomProcess& proc)
     // 8. Event loop
     loop.run();
     stopping = true;
-    ipc_.detach();   // first — see single_run
+    detach_ipc();   // first — see single_run
 
     // 9. Cleanup: the heartbeats go first, so that finishing the work in flight
     // does not start a new pass; then on_stopping(), stop_work(), then stop_db()
@@ -1685,7 +1690,7 @@ void Application::custom_process_run(CustomProcess& proc)
 void Application::custom_fn_run(const std::function<void(EventLoop&)>& fn, std::string_view name)
 {
     EventLoop loop;
-    ipc_.attach(loop, *logger_, ProcessRole::custom, name);
+    attach_ipc(loop, ProcessRole::custom, name);
     loop.add_signal(SIGTERM, [&loop](const signalfd_siginfo&) { loop.stop(); });
     loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
     try
@@ -1694,12 +1699,12 @@ void Application::custom_fn_run(const std::function<void(EventLoop&)>& fn, std::
     }
     catch (...)
     {
-        ipc_.detach();
+        detach_ipc();
         throw;
     }
     ipc_.ready();
     loop.run();
-    ipc_.detach();
+    detach_ipc();
 }
 
 #endif // WITH_POSTGRESQL
@@ -2803,6 +2808,193 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
             });
     }
 #endif
+}
+
+// ─── Metrics of the node ─────────────────────────────────────────────────────
+
+namespace
+{
+
+// The `role` label: a custom process is named by itself.
+std::string metrics_role(const IpcPeer& p)
+{
+    switch (p.role) {
+        case ProcessRole::worker: return "worker";
+        case ProcessRole::helper: return "helper";
+        case ProcessRole::single: return "single";
+        case ProcessRole::custom: return p.name;
+        default:                  return "other";
+    }
+}
+
+} // namespace
+
+void Application::enable_metrics(std::string prefix)
+{
+    metrics_enabled_ = true;
+    metrics_prefix_  = std::move(prefix);
+    ipc_.enable();
+}
+
+std::size_t Application::add_metrics(MetricsSource source)
+{
+    const auto id = metrics_next_id_++;
+    metrics_sources_.emplace(id, std::move(source));
+    return id;
+}
+
+void Application::remove_metrics(std::size_t id)
+{
+    metrics_sources_.erase(id);
+}
+
+void Application::attach_ipc(EventLoop& loop, ProcessRole role, std::string_view name)
+{
+    ipc_.attach(loop, *logger_, role, name);
+    if (!metrics_enabled_)
+        return;
+    ipc_.on("metrics", [this](const IpcPeer&, std::string_view, IpcReply reply) {
+        reply.send(process_metrics());
+    });
+}
+
+void Application::detach_ipc()
+{
+    ipc_.detach();
+#ifdef WITH_POSTGRESQL
+    leader_lock_ = nullptr;
+#endif
+}
+
+std::string Application::process_metrics() const
+{
+    if (!metrics_enabled_)
+        return {};
+
+    const IpcPeer me = ipc_.self();
+    MetricsText m(metrics_prefix_, {{"role", metrics_role(me)}, {"worker", std::to_string(me.number)}});
+
+#ifdef WITH_POSTGRESQL
+    auto pool_rows = [&m](const PgPool& pool, const std::string& name) {
+        const MetricLabels pl{{"pool", name}};
+        m.gauge("worker_db_pool_connections", "Connections of the process's database pool.",
+                static_cast<double>(pool.connection_count()), pl);
+        m.gauge("worker_db_pool_queued", "Queries waiting for a free connection of the pool.",
+                static_cast<double>(pool.queue_size()), pl);
+        m.gauge("worker_db_pool_outstanding", "Queries queued or sent whose result is awaited.",
+                static_cast<double>(pool.outstanding()), pl);
+
+        const auto channels = pool.listens();
+        if (channels.empty())
+            return;   // no LISTEN connection is wanted
+        m.gauge("db_listener_up", "1 — the pool's LISTEN connection is up.",
+                pool.listener_up() ? 1 : 0, pl);
+        for (const auto& ch : channels)
+            m.gauge("db_listen", "1 — the server confirmed LISTEN on the channel.",
+                    pool.listening(ch) ? 1 : 0, {{"pool", name}, {"channel", ch}});
+    };
+    if (db_pool_)
+        pool_rows(*db_pool_, "default");
+    for (const auto& [name, pool] : named_pools_)
+        pool_rows(*pool, name);
+
+    if (leader_lock_)
+        m.gauge("leader", "1 — the process holds the leader lock of its role.",
+                leader_lock_->held() ? 1 : 0);
+#endif
+
+#if defined(WITH_POSTGRESQL) && defined(WITH_DB_PLATFORM)
+    {
+        // Per channel: two subscribers of one channel in a process add up.
+        struct Channel
+        {
+            bool        subscribed{true};
+            std::size_t in_progress{0};
+            db_platform::NotifySubscriber::Stats stats;
+        };
+        std::map<std::string, Channel> channels;
+        for (const auto* s : db_platform::NotifySubscriber::all()) {
+            auto& c = channels[s->channel()];
+            c.subscribed  = c.subscribed && s->number() != 0 && s->policy_ok();
+            c.in_progress += s->in_progress();
+            const auto& st = s->stats();
+            c.stats.taken   += st.taken;
+            c.stats.retries += st.retries;
+            c.stats.acked   += st.acked;
+            c.stats.nacked  += st.nacked;
+            c.stats.failed  += st.failed;
+        }
+        for (const auto& [ch, c] : channels) {
+            const MetricLabels cl{{"channel", ch}};
+            m.gauge("notify_subscribed",
+                    "1 — subscribed to the notify channel, and its policy matches the mode expected.",
+                    c.subscribed ? 1 : 0, cl);
+            m.gauge("notify_in_progress", "Rows taken and not confirmed yet.",
+                    static_cast<double>(c.in_progress), cl);
+            const char* handled = "Rows handled: success — acknowledged; error — refused (nack); "
+                                  "failed — the acknowledgement was not confirmed.";
+            m.counter("notify_handled_total", handled, static_cast<double>(c.stats.acked),
+                      {{"channel", ch}, {"result", "success"}});
+            m.counter("notify_handled_total", handled, static_cast<double>(c.stats.nacked),
+                      {{"channel", ch}, {"result", "error"}});
+            m.counter("notify_handled_total", handled, static_cast<double>(c.stats.failed),
+                      {{"channel", ch}, {"result", "failed"}});
+            m.counter("notify_retries_total", "Rows taken on a repeated delivery.",
+                      static_cast<double>(c.stats.retries), cl);
+        }
+    }
+#endif
+
+    const auto& st = ipc_.stats();
+    for (const auto& [key, n] : st.received)
+        m.counter("ipc_messages_total", "Messages handled by this process, by type and result.",
+                  static_cast<double>(n), {{"type", key.first}, {"result", key.second}});
+    for (const auto& [key, n] : st.requests)
+        m.counter("ipc_requests_total", "Requests sent from this process, by type and how they ended.",
+                  static_cast<double>(n), {{"type", key.first}, {"result", key.second}});
+    for (const auto& [key, n] : st.gather_missing)
+        m.counter("ipc_gather_missing_total", "Targets of a gather from this process that did not answer.",
+                  static_cast<double>(n), {{"type", key.first}, {"reason", key.second}});
+    m.counter("ipc_dropped_total", "Datagrams that could not be read or put together.",
+              static_cast<double>(st.dropped));
+    m.counter("ipc_blocked_total", "Writes that found a channel full and waited for room.",
+              static_cast<double>(st.blocked));
+    m.counter("ipc_held_total", "Messages kept until the channel to their process opened.",
+              static_cast<double>(st.held));
+
+    for (const auto& [id, source] : metrics_sources_) {
+        try {
+            source(m);
+        } catch (const std::exception& e) {
+            logger_->error("metrics source {} threw: {}", id, e.what());
+        }
+    }
+    return m.str();
+}
+
+void Application::collect_metrics(std::function<void(std::string)> done, std::chrono::milliseconds timeout)
+{
+    if (!metrics_enabled_) {
+        done({});
+        return;
+    }
+    ipc_.gather(ipc_all, "metrics", {}, [this, done = std::move(done)](IpcGathered g) {
+        MetricsText up(metrics_prefix_);
+        const char* help = "1 — the process answered the collection; 0 — live in the directory, no answer.";
+        std::vector<std::string_view> texts;
+        texts.reserve(g.replies.size() + 1);
+        for (const auto& [peer, body] : g.replies)
+            up.gauge("process_up", help, 1,
+                     {{"role", metrics_role(peer)}, {"worker", std::to_string(peer.number)}});
+        for (const auto& [peer, error] : g.missing)
+            up.gauge("process_up", help, 0,
+                     {{"role", metrics_role(peer)}, {"worker", std::to_string(peer.number)}});
+        const std::string up_text = up.str();
+        texts.push_back(up_text);
+        for (const auto& [peer, body] : g.replies)
+            texts.push_back(body);
+        done(merge_metrics(texts));
+    }, timeout);
 }
 
 } // namespace apostol

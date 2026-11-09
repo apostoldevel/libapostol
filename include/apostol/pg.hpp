@@ -700,6 +700,19 @@ public:
     std::size_t connection_count() const { return conns_.size(); }
     std::size_t queue_size()       const { return queue_.size(); }
 
+    /// The channels listen() registered, whatever the server said of them.
+    std::vector<std::string> listens() const;
+
+    /// The LISTEN connection is up: it exists, its handshake is over and it is
+    /// not dead. False while it connects and when there is none.
+    bool listener_up() const;
+
+    /// The server confirmed LISTEN @p channel on the listener that is up now.
+    /// False until the answer is read, after unlisten(), when the server refused
+    /// it, and as soon as that listener is dead or replaced — the next one has
+    /// to confirm it again.
+    bool listening(std::string_view channel) const;
+
     /// Queries queued or already sent — on the pool or on the listener
     /// (listener_execute()) — whose result somebody still waits for. Zero
     /// means nothing is outstanding — used to end a shutdown drain as soon as it is
@@ -1104,6 +1117,11 @@ private:
     // Refused by the server on this listener, alone. Stays unsubscribed until
     // the listener is replaced; counted out of the "LISTEN active" line.
     std::unordered_set<std::string>                             rejected_listens_;
+    // Confirmed by the listener of generation live_listens_gen_, for as long as
+    // it lives — unlike confirmed_listens_, which only waits for on_ready.
+    // Read by listening(); a different generation means the set is stale.
+    std::unordered_set<std::string>                             live_listens_;
+    std::uint64_t                                               live_listens_gen_{0};
     // How many channels the query in flight carried when it was shipped.
     // unlisten() shrinks sent_listens_, so its size cannot tell a lone refusal
     // from a batch rolled back around an innocent channel.
