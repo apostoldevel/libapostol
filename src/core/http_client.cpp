@@ -1,5 +1,6 @@
 #include "apostol/http_client.hpp"
 #include "apostol/fetch_policy.hpp"
+#include "net/url_target.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -41,51 +42,36 @@ HttpClient::ParsedUrl HttpClient::parse_url(std::string_view url)
 {
     ParsedUrl result;
 
-    // Scheme
-    auto scheme_end = url.find("://");
-    if (scheme_end != std::string_view::npos) {
-        result.scheme = std::string(url.substr(0, scheme_end));
-        // Case-insensitive (RFC 3986): "HTTPS" takes port 443 and TLS too.
-        std::transform(result.scheme.begin(), result.scheme.end(), result.scheme.begin(),
-            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        url.remove_prefix(scheme_end + 3);
-    } else {
+    // Scheme, case-insensitive (RFC 3986): "HTTPS" takes port 443 and TLS too.
+    // None written — http. A malformed scheme leaves both scheme and host
+    // empty; a URL with no target to connect to leaves the host empty: request()
+    // refuses either as "invalid URL".
+    std::string_view rest;
+    if (!detail::split_url_scheme(url, result.scheme, rest))
+        return result;
+    if (result.scheme.empty())
         result.scheme = "http";
-    }
 
-    // Host[:port] / path
-    auto slash = url.find('/');
-    std::string_view authority = (slash != std::string_view::npos)
-        ? url.substr(0, slash)
-        : url;
+    // Host, port, path — read as WsClient reads them.
+    detail::UrlTarget target;
+    if (!detail::parse_url_target(rest, target))
+        return result;
 
-    auto colon = authority.find(':');
-    if (colon != std::string_view::npos) {
-        result.host = std::string(authority.substr(0, colon));
-        auto port_sv = authority.substr(colon + 1);
-        result.port = 0;
-        for (char c : port_sv) {
-            if (c >= '0' && c <= '9')
-                result.port = result.port * 10 + static_cast<uint16_t>(c - '0');
-        }
-    } else {
-        result.host = std::string(authority);
-        result.port = (result.scheme == "https") ? 443 : 80;
-    }
-
-    // Path (including query string)
-    if (slash != std::string_view::npos)
-        result.path = std::string(url.substr(slash));
-    else
-        result.path = "/";
-
+    result.host = std::move(target.host);
+    result.port = target.port ? target.port : default_port(result.scheme);
+    result.path = std::move(target.path);
     return result;
+}
+
+std::uint16_t HttpClient::default_port(std::string_view scheme)
+{
+    return scheme == "https" ? 443 : 80;
 }
 
 // ─── Request Serialization ───────────────────────────────────────────────────
 
 static std::string serialize_request(std::string_view method,
-                                      std::string_view host,
+                                      std::string_view host,   // the Host header's value
                                       std::string_view path,
                                       std::string_view body,
                                       const HttpClient::Headers& headers)
@@ -129,21 +115,14 @@ void HttpClient::request(std::string_view method, std::string_view url_str,
     auto url = parse_url(url_str);
 
     // HTTP(S) only: any other scheme is refused rather than sent as plain HTTP
-    // to its host:port.
-    // Reported from the loop, like the other errors of this client —
-    // 1 ms, not 0: a zero timerfd is disarmed and never fires. The timer is
-    // cancelled with the client.
-    if (url.scheme != "http" && url.scheme != "https") {
-        auto id = std::make_shared<EventLoop::TimerId>(EventLoop::kInvalidTimer);
-        *id = loop_.add_timer(std::chrono::milliseconds(1),
-            [this, id, on_error = std::move(on_error), scheme = url.scheme] {
-                refusal_timers_.erase(
-                    std::remove(refusal_timers_.begin(), refusal_timers_.end(), *id),
-                    refusal_timers_.end());
-                if (on_error)
-                    on_error(fmt::format("unsupported URL scheme '{}'", scheme));
-            }, false);
-        refusal_timers_.push_back(*id);
+    // to its host:port. A URL with no target to connect to — see parse_url —
+    // is refused too, rather than dialled somewhere it does not name.
+    if (!url.scheme.empty() && url.scheme != "http" && url.scheme != "https") {
+        refuse(std::move(on_error), fmt::format("unsupported URL scheme '{}'", url.scheme));
+        return;
+    }
+    if (url.host.empty()) {
+        refuse(std::move(on_error), "invalid URL");
         return;
     }
 
@@ -172,7 +151,8 @@ void HttpClient::request(std::string_view method, std::string_view url_str,
     }
 
     // Capture serialized request for on_connect
-    auto serialized = serialize_request(method, url.host, url.path, body, headers);
+    auto serialized = serialize_request(method,
+        detail::host_header(url.host, url.port, default_port(url.scheme)), url.path, body, headers);
 
     ptr->parser.set_handler([ptr, this](HttpClientResponse resp) {
         if (ptr->done) return;
@@ -213,6 +193,23 @@ void HttpClient::request(std::string_view method, std::string_view url_str,
     ptr->tcp.connect(url.host, url.port);
 
     pending_.push_back(std::move(req));
+}
+
+// A refusal before anything is dialled: reported from the loop, never from
+// inside request() — 1 ms, not 0: a zero timerfd is disarmed and never fires.
+// The timer is cancelled with the client.
+void HttpClient::refuse(ErrorHandler on_error, std::string message)
+{
+    auto id = std::make_shared<EventLoop::TimerId>(EventLoop::kInvalidTimer);
+    *id = loop_.add_timer(std::chrono::milliseconds(1),
+        [this, id, on_error = std::move(on_error), message = std::move(message)] {
+            refusal_timers_.erase(
+                std::remove(refusal_timers_.begin(), refusal_timers_.end(), *id),
+                refusal_timers_.end());
+            if (on_error)
+                on_error(message);
+        }, false);
+    refusal_timers_.push_back(*id);
 }
 
 void HttpClient::get(std::string_view url, const Headers& headers,

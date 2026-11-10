@@ -5,6 +5,7 @@
 #include "apostol/tcp_client.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -41,6 +42,12 @@ public:
     HttpClient& operator=(HttpClient&&)      = delete;
 
     /// Full request with method, url, body, headers.
+    /// The scheme is http or https (any case; none written — http); any other
+    /// is refused with "unsupported URL scheme '<s>'". A URL without a host, with
+    /// userinfo, an IPv6 address outside brackets, a port that is not 1..65535 in
+    /// digits, or a blank or control byte is refused with "invalid URL". Both are
+    /// reported from the loop. The Host header carries the port unless it is the
+    /// scheme's default, and an IPv6 address in brackets.
     void request(std::string_view method, std::string_view url,
                  std::string_view body, const Headers& headers,
                  ResponseHandler on_response, ErrorHandler on_error);
@@ -66,13 +73,15 @@ public:
 
 private:
     struct ParsedUrl {
-        std::string scheme;   // "http" or "https"
-        std::string host;
+        std::string scheme;   // lower case; "http" when none is written
+        std::string host;     // empty: no target to connect to; IPv6 without brackets
         uint16_t    port{0};
         std::string path;     // includes query string
     };
 
     static ParsedUrl parse_url(std::string_view url);
+    static std::uint16_t default_port(std::string_view scheme);
+    void refuse(ErrorHandler on_error, std::string message);
     void cleanup_done();
 
     struct PendingRequest;
@@ -80,7 +89,7 @@ private:
     EventLoop& loop_;
     std::chrono::milliseconds timeout_{30000};
     std::vector<std::unique_ptr<PendingRequest>> pending_;
-    std::vector<EventLoop::TimerId> refusal_timers_;  // scheme refusals in flight
+    std::vector<EventLoop::TimerId> refusal_timers_;  // refusals in flight: scheme, invalid URL
 
 #ifdef WITH_SSL
     bool tls_enabled_{false};

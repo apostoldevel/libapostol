@@ -1,5 +1,6 @@
 #include "apostol/ws_client.hpp"
 #include "apostol/base64.hpp"
+#include "net/url_target.hpp"
 
 #include <fmt/format.h>
 
@@ -64,45 +65,29 @@ WsMessage WsMessage::from_json(std::string_view text)
 
 WsClient::ParsedUrl WsClient::parse_url(std::string_view url)
 {
-    ParsedUrl result;
+    // Read as HttpClient reads it (net/url_target.hpp). A URL that is not a
+    // target to connect to — no scheme or a malformed one, an empty host,
+    // userinfo, an IPv6 address without brackets, a port that is not 1..65535
+    // in digits, a blank or a control byte — leaves the URL without a host.
+    ParsedUrl        result;
+    std::string_view rest;
+    if (!detail::split_url_scheme(url, result.scheme, rest) || result.scheme.empty())
+        return {};
 
-    auto pos = url.find("://");
-    if (pos == std::string_view::npos) return result;
-    result.scheme = std::string(url.substr(0, pos));
-    url.remove_prefix(pos + 3);
+    detail::UrlTarget target;
+    if (!detail::parse_url_target(rest, target))
+        return {.scheme = std::move(result.scheme), .host = {}, .port = 0, .path = {}};
 
-    // The fragment is never sent; the authority ends at the first '/' or '?'.
-    if (auto hash = url.find('#'); hash != std::string_view::npos)
-        url = url.substr(0, hash);
-    auto end = url.find_first_of("/?");
-    auto host_port = url.substr(0, end);
-
-    auto colon = host_port.rfind(':');
-    if (colon != std::string_view::npos) {
-        // The port is digits only, 1..65535: a sign, a blank, a suffix or an
-        // empty port leaves the URL without a host, and connect() refuses it.
-        auto port_sv = host_port.substr(colon + 1);
-        unsigned port_val = 0;
-        auto [ptr, ec] = std::from_chars(port_sv.data(),
-                                          port_sv.data() + port_sv.size(),
-                                          port_val);
-        if (port_sv.empty() || ec != std::errc{} || ptr != port_sv.data() + port_sv.size()
-            || port_val == 0 || port_val > 65535)
-            return ParsedUrl{};
-        result.host = std::string(host_port.substr(0, colon));
-        result.port = static_cast<uint16_t>(port_val);
-    } else {
-        result.host = std::string(host_port);
-        result.port = (result.scheme == "wss") ? 443 : 80;
-    }
-
-    if (end == std::string_view::npos)
-        result.path = "/";
-    else if (url[end] == '/')
-        result.path = std::string(url.substr(end));
-    else
-        result.path = "/" + std::string(url.substr(end));   // "?query" right after the authority
+    // "WSS" is wss: the scheme is in lower case.
+    result.host   = std::move(target.host);
+    result.port   = target.port ? target.port : default_port(result.scheme);
+    result.path   = std::move(target.path);
     return result;
+}
+
+std::uint16_t WsClient::default_port(std::string_view scheme)
+{
+    return scheme == "wss" ? 443 : 80;
 }
 
 // ── Key / ID generation ──────────────────────────────────────────────────────
@@ -152,6 +137,10 @@ void WsClient::connect(std::string_view url,
 
     // A URL that does not parse leaves the last good one in place.
     auto parsed = parse_url(url);
+    if (!parsed.scheme.empty() && parsed.scheme != "ws" && parsed.scheme != "wss") {
+        enter_error(fmt::format("unsupported URL scheme '{}'", parsed.scheme));
+        return;
+    }
     if (parsed.host.empty()) {
         enter_error("invalid URL");
         return;
@@ -233,15 +222,13 @@ void WsClient::send_upgrade_request()
 
     std::string request = fmt::format(
         "GET {} HTTP/1.1\r\n"
-        "Host: {}{}\r\n"
+        "Host: {}\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Version: 13\r\n"
         "Sec-WebSocket-Key: {}\r\n",
         url_.path,
-        url_.host,
-        (url_.port != 80 && url_.port != 443)
-            ? fmt::format(":{}", url_.port) : "",
+        detail::host_header(url_.host, url_.port, default_port(url_.scheme)),
         ws_key_);
 
     if (!protocols_.empty()) {

@@ -466,8 +466,12 @@ void TcpClient::do_tls_handshake()
         }
         ::SSL_set_fd(ssl_.get(), fd_);
 
-        // SNI: tell the server which hostname we're connecting to
-        if (!hostname_.empty())
+        // SNI: tell the server which hostname we're connecting to — a name
+        // only: RFC 6066 §3 leaves a literal IPv4 or IPv6 address out.
+        in_addr  a4{};
+        in6_addr a6{};
+        if (!hostname_.empty() && ::inet_pton(AF_INET, hostname_.c_str(), &a4) != 1
+            && ::inet_pton(AF_INET6, hostname_.c_str(), &a6) != 1)
             ::SSL_set_tlsext_host_name(ssl_.get(), hostname_.c_str());
     }
 

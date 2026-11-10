@@ -152,6 +152,7 @@ private:
     };
 
     static ParsedUrl parse_url(std::string_view url);
+    static std::uint16_t default_port(std::string_view scheme);
     static std::string generate_key();
 
     void do_connect();

@@ -76,3 +76,12 @@ target_link_libraries(ws_client_test PRIVATE apostol)
 target_compile_options(ws_client_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME ws_client COMMAND ws_client_test)
 set_tests_properties(ws_client PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+# url_test — how HttpClient and WsClient read a URL, against listeners on
+# 127.0.0.1; url_ipv6 — on [::1], skipped where [::1] is not reachable.
+add_executable(url_test url_test.cpp)
+target_link_libraries(url_test PRIVATE apostol)
+target_compile_options(url_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME url COMMAND url_test)
+add_test(NAME url_ipv6 COMMAND url_test --ipv6)
+set_tests_properties(url url_ipv6 PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
