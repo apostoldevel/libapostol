@@ -79,14 +79,25 @@ IpAllowList IpAllowList::parse(const std::vector<std::string>& entries, const st
 {
     IpAllowList list;
 
-    for (const auto& e : entries.empty() ? defaults : entries) {
+    const auto& list_in = entries.empty() ? defaults : entries;
+    for (std::size_t i = 0; i < list_in.size(); ++i) {
+        const auto& e = list_in[i];
+        // what() would end at a raw NUL: the error names the entry by its index
+        // (from 0) and the offset of the NUL, the text with the NUL as "\0".
+        if (const auto nul = e.find('\0'); nul != std::string::npos) {
+            std::string shown;
+            for (char c : e)
+                shown += c == '\0' ? std::string_view("\\0") : std::string_view(&c, 1);
+            throw std::invalid_argument(fmt::format("entry {} '{}': contains a NUL at offset {}", i, shown, nul));
+        }
+
         const auto slash = e.find('/');
         const std::string_view host = std::string_view(e).substr(0, slash);
 
         Net  n;
         bool mapped = false;
         if (!parse_ip(host, n.addr, n.v4, mapped))
-            throw std::invalid_argument(fmt::format("'{}' is not an IP address or a CIDR", e));
+            throw std::invalid_argument(fmt::format("entry {} '{}': not an IP address or a CIDR", i, e));
 
         n.prefix = n.v4 ? 32 : 128;
         if (slash != std::string::npos) {
@@ -99,7 +110,7 @@ IpAllowList IpAllowList::parse(const std::vector<std::string>& entries, const st
             const int max = n.v4 && !mapped ? 32 : 128;
             if (bits.empty() || bits.find_first_not_of("0123456789") != std::string_view::npos
                 || ec != std::errc{} || end != bits.data() + bits.size() || p < min || p > max)
-                throw std::invalid_argument(fmt::format("'{}' has a bad prefix length", e));
+                throw std::invalid_argument(fmt::format("entry {} '{}': bad prefix length", i, e));
             n.prefix = p - min;
         }
         list.nets_.push_back(n);

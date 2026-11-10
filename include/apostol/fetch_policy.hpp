@@ -33,7 +33,10 @@ namespace apostol
 // judged as IPv4. An "allow" entry lets one through:
 //   - a name  — matched (case-insensitively, exactly) to the host of the URL being
 //               connected, whatever it resolves to: "backend" is a container;
-//   - an IP or CIDR — matched to the address being dialled;
+//   - an IP or CIDR — matched to the address being dialled; ::ffff:a.b.c.d is
+//               the IPv4 address, its prefix length counted in IPv6 bits, 96
+//               to 128 (::ffff:10.0.0.0/104 is 10.0.0.0/8); a shorter length
+//               is refused;
 //   - an optional ":port" (IPv6 in brackets) — then the port must match too.
 //
 // Applies to CurlClient (every connection, redirects included) and to the
@@ -53,7 +56,8 @@ class FetchAddressPolicy
 public:
     FetchAddressPolicy() = default;
 
-    /// Throws std::invalid_argument naming the entry that does not parse.
+    /// Throws std::invalid_argument naming the entry that does not parse:
+    /// "fetch.allow entry <index from 0> '<entry>': <why>", a NUL shown as "\0".
     static FetchAddressPolicy parse(bool deny_internal, const std::vector<std::string>& allow);
 
     bool enabled() const noexcept { return deny_internal_; }

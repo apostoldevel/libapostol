@@ -156,18 +156,25 @@ FetchAddressPolicy FetchAddressPolicy::parse(bool deny_internal, const std::vect
     FetchAddressPolicy p;
     p.deny_internal_ = deny_internal;
 
-    for (const auto& entry : allow) {
-        auto bad = [&entry](std::string_view why) {
-            return std::invalid_argument(fmt::format("fetch.allow entry '{}': {}", entry, why));
+    for (std::size_t i = 0; i < allow.size(); ++i) {
+        const auto& entry = allow[i];
+        auto bad = [&entry, i](std::string_view why) {
+            return std::invalid_argument(fmt::format("fetch.allow entry {} '{}': {}", i, entry, why));
         };
 
         std::string_view e(entry);
         if (e.empty())
             throw bad("empty");
         // inet_pton reads a C string: text after a NUL would never be checked.
-        // The error names the entry up to the NUL: what() would stop there.
-        if (auto nul = e.find('\0'); nul != std::string_view::npos)
-            throw std::invalid_argument(fmt::format("fetch.allow entry '{}': contains a NUL", e.substr(0, nul)));
+        // what() would end at the NUL: the error names the entry by its index
+        // (from 0) and the offset of the NUL, the text with the NUL as "\0".
+        if (auto nul = e.find('\0'); nul != std::string_view::npos) {
+            std::string shown;
+            for (char c : e)
+                shown += c == '\0' ? std::string_view("\\0") : std::string_view(&c, 1);
+            throw std::invalid_argument(fmt::format("fetch.allow entry {} '{}': contains a NUL at offset {}",
+                                                    i, shown, nul));
+        }
 
         Rule r;
         std::string_view host = e;
@@ -206,13 +213,16 @@ FetchAddressPolicy FetchAddressPolicy::parse(bool deny_internal, const std::vect
         std::string ip = slash == std::string::npos ? h : h.substr(0, slash);
 
         std::uint8_t buf[16] = {};
+        bool mapped = false;
         if (::inet_pton(AF_INET, ip.c_str(), buf) == 1) {
             r.v4 = true;
             std::memcpy(r.net.data(), buf, 4);
             r.prefix = 32;
         } else if (::inet_pton(AF_INET6, ip.c_str(), buf) == 1) {
-            static constexpr std::uint8_t mapped[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
-            if (std::memcmp(buf, mapped, 12) == 0) {
+            static constexpr std::uint8_t kMapped[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+            if (std::memcmp(buf, kMapped, 12) == 0) {
+                // Judged as IPv4, like the peer it stands for (see to_addr).
+                mapped = true;
                 r.v4 = true;
                 std::memcpy(r.net.data(), buf + 12, 4);
                 r.prefix = 32;
@@ -246,10 +256,14 @@ FetchAddressPolicy FetchAddressPolicy::parse(bool deny_internal, const std::vect
             auto len = std::string_view(h).substr(slash + 1);
             unsigned v = 0;
             auto [ptr, ec] = std::from_chars(len.data(), len.data() + len.size(), v);
-            unsigned max = r.v4 ? 32 : 128;
-            if (len.empty() || ec != std::errc{} || ptr != len.data() + len.size() || v > max)
-                throw bad(fmt::format("prefix must be 0..{}", max));
-            r.prefix = static_cast<int>(v);
+            // A mapped entry's length counts in IPv6 bits, as written:
+            // ::ffff:10.0.0.0/104 is 10.0.0.0/8, ::ffff:0:0/96 every IPv4 address.
+            // Shorter than 96 it would reach past the mapped range: refused.
+            const unsigned min = mapped ? 96 : 0;
+            const unsigned max = r.v4 && !mapped ? 32 : 128;
+            if (len.empty() || ec != std::errc{} || ptr != len.data() + len.size() || v < min || v > max)
+                throw bad(fmt::format("prefix must be {}..{}", min, max));
+            r.prefix = static_cast<int>(v - min);
         }
 
         p.allow_.push_back(std::move(r));

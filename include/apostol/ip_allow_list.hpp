@@ -49,7 +49,9 @@ public:
     static const std::vector<std::string>& loopback();
 
     /// @p entries, or @p defaults when @p entries is empty (both empty — admits
-    /// nobody). Throws std::invalid_argument naming the entry that does not parse.
+    /// nobody). Throws std::invalid_argument naming the entry that does not parse:
+    /// "entry <index from 0 in the list parsed> '<entry>': <why>", a NUL shown as
+    /// "\0". From configured() the list is the one read — a string after it is split.
     static IpAllowList parse(const std::vector<std::string>& entries,
                              const std::vector<std::string>& defaults = {});
 

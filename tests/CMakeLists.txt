@@ -69,3 +69,10 @@ foreach(mode on off)
              COMMAND metrics_test --mode ${mode} -p "${METRICS_TEST_DIR}/" -c "${METRICS_TEST_DIR}/metrics_test.json")
     set_tests_properties(metrics_${mode} PROPERTIES TIMEOUT 60)
 endforeach()
+
+# ws_client_test — the port of a WsClient URL against a listener on 127.0.0.1.
+add_executable(ws_client_test ws_client_test.cpp)
+target_link_libraries(ws_client_test PRIVATE apostol)
+target_compile_options(ws_client_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME ws_client COMMAND ws_client_test)
+set_tests_properties(ws_client PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)

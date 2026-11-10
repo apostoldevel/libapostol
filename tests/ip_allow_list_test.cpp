@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace apostol;
@@ -149,6 +150,23 @@ void bad_entries()
     // A bad default is the caller's error, and closes the list just the same.
     std::string error;
     check(IpAllowList::configured(nullptr, kKey, {"nope"}, error).empty() && !error.empty(), "bad default: not closed");
+
+    // A NUL: the error names the entry by its index, shows the whole text with
+    // the NUL as "\0" and the offset — what() ends at a raw NUL.
+    using namespace std::string_literals;
+    for (const auto& [entry, shown, offset] :
+         {std::tuple{"10.0.0.1\0x"s, "10.0.0.1\\0x"s, 8}, std::tuple{"\0::1"s, "\\0::1"s, 0},
+          std::tuple{"10.0.0.0/8\0"s, "10.0.0.0/8\\0"s, 10}}) {
+        const auto want = std::string(kKey) + ": entry 1 '" + shown + "': contains a NUL at offset " + std::to_string(offset);
+        check(closed(nlohmann::json::array({"127.0.0.1", entry}), "NUL") == want, "NUL: want '" + want + "'");
+        bool named = false;
+        try {
+            (void) IpAllowList::parse({"127.0.0.1", entry});
+        } catch (const std::invalid_argument& e) {
+            named = std::string(e.what()) == want.substr(kKey.size() + 2);
+        }
+        check(named, "parse with a NUL: the error does not name the entry");
+    }
 }
 
 void matching()

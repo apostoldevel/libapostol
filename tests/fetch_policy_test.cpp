@@ -3,12 +3,15 @@
 //
 //   1. a prefix length is digits only, 0..32 for IPv4 and 0..128 for IPv6: a
 //      sign, a blank, a suffix or an empty length is refused as a bad prefix;
-//      an entry with a NUL inside is refused; parse() names the entry;
+//      a mapped entry (::ffff:a.b.c.d) takes 96..128, counted in IPv6 bits;
+//      an entry with a NUL inside is refused, the error naming it by index and
+//      showing the NUL; parse() names the entry;
 //   2. the forms it took before are taken as before (names, ports, brackets,
 //      leading zeros in a length) and make the same rules;
 //   3. a network entry lets through the internal addresses inside it and
 //      nothing outside; /0 lets through every internal address of its family;
-//      a port rule matches the port of an IPv4 and of an IPv6 peer.
+//      a port rule matches the port of an IPv4 and of an IPv6 peer; a mapped
+//      network is the IPv4 network it holds.
 //
 // Usage: fetch_policy_test
 
@@ -25,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace apostol;
@@ -101,12 +105,32 @@ void bad_entries()
               "'" + b + "': the error '" + error + "' does not name the entry");
     }
 
-    // The error names the entry up to the NUL.
+    // A NUL: the error names the entry by its index, shows the whole text with
+    // the NUL as "\0" and the offset — what() ends at a raw NUL.
     using namespace std::string_literals;
-    for (const auto& b : {"127.0.0.1\0x"s, "10.0.0.0\0x/8"s, "10.0.0.0/8\0"s, "backend\0"s, "::1\0"s}) {
+    struct Nul { std::string entry; std::string shown; std::size_t offset; };
+    for (const auto& b : {Nul{"127.0.0.1\0x"s, "127.0.0.1\\0x", 9}, Nul{"10.0.0.0\0x/8"s, "10.0.0.0\\0x/8", 8},
+                          Nul{"10.0.0.0/8\0"s, "10.0.0.0/8\\0", 10}, Nul{"backend\0"s, "backend\\0", 7},
+                          Nul{"\0::1"s, "\\0::1", 0}, Nul{"a\0b\0"s, "a\\0b\\0", 1}}) {
+        const auto error = refusal(b.entry);
+        const auto want = "fetch.allow entry 1 '" + b.shown + "': contains a NUL at offset " + std::to_string(b.offset);
+        check(error == want, "an entry with a NUL inside: the error '" + error + "', want '" + want + "'");
+        check(error.find('\0') == std::string::npos, "a NUL in the error text");
+    }
+    // ...and counts from 0.
+    try {
+        (void) FetchAddressPolicy::parse(true, {"x\0"s});
+        check(false, "'x\\0' alone: no error");
+    } catch (const std::invalid_argument& e) {
+        check(std::string(e.what()).rfind("fetch.allow entry 0 '", 0) == 0, std::string("'x\\0' alone: ") + e.what());
+    }
+
+    // A mapped entry's length counts in IPv6 bits, 96..128.
+    for (const std::string b : {"::ffff:10.0.0.0/8", "::ffff:10.0.0.0/32", "::ffff:10.0.0.0/95", "::ffff:10.0.0.0/0",
+                                "::ffff:10.0.0.0/129", "[::ffff:10.0.0.0/-96]", "::ffff:10.0.0.0/+104"}) {
         const auto error = refusal(b);
-        check(error.find("'" + b.substr(0, b.find('\0')) + "': contains a NUL") != std::string::npos,
-              "an entry with a NUL inside: the error '" + error + "'");
+        check(error.find("'" + b + "'") != std::string::npos && error.find("prefix must be 96..128") != std::string::npos,
+              "'" + b + "': the error '" + error + "' is not 'prefix must be 96..128' naming the entry");
     }
 }
 
@@ -116,6 +140,7 @@ void good_entries()
         "10.0.0.0/0", "10.0.0.0/8", "10.0.0.0/08", "10.0.0.0/32", "10.0.0.5",
         "::/0", "fd00::/7", "::1/128", "[fd00::/8]", "[fd00::1]:443", "::1",
         "backend", "backend:8080", "MinIO", "192.168.0.5:8080", "::ffff:10.0.0.1",
+        "::ffff:0:0/96", "::ffff:10.0.0.0/104", "::ffff:10.0.0.1/128", "[::ffff:10.0.0.0/104]",
     };
 
     for (const auto& g : good) {
@@ -169,6 +194,19 @@ void matching()
     check(lets_through(forms, "172.17.0.2", 80, "backend") && lets_through(forms, "172.17.0.2", 1, "[BACKEND]")
           && !lets_through(forms, "172.17.0.2", 80, "backend2"), "name: any port, any case");
 
+    // A mapped network is the IPv4 network it holds: /104 = /8, /96 every IPv4, /128 one.
+    const auto m104 = FetchAddressPolicy::parse(true, {"::ffff:10.0.0.0/104"});
+    check(lets_through(m104, "10.200.0.1") && lets_through(m104, "::ffff:10.1.1.1") && !lets_through(m104, "172.16.0.1")
+          && !lets_through(m104, "127.0.0.1") && !lets_through(m104, "::1") && !lets_through(m104, "fd12::1"),
+          "::ffff:10.0.0.0/104 = 10.0.0.0/8");
+    const auto m96 = FetchAddressPolicy::parse(true, {"::ffff:0:0/96"});
+    check(lets_through(m96, "127.0.0.1") && lets_through(m96, "::ffff:169.254.169.254") && !lets_through(m96, "::1")
+          && !lets_through(m96, "fd12::1"), "::ffff:0:0/96: every internal IPv4, no IPv6");
+    const auto m128 = FetchAddressPolicy::parse(true, {"::ffff:10.0.0.1/128"});
+    check(lets_through(m128, "10.0.0.1") && !lets_through(m128, "10.0.0.2"), "::ffff:10.0.0.1/128 = 10.0.0.1");
+    const auto m120 = FetchAddressPolicy::parse(true, {"::ffff:10.0.0.0/120"});
+    check(lets_through(m120, "10.0.0.255") && !lets_through(m120, "10.0.1.0"), "::ffff:10.0.0.0/120 = 10.0.0.0/24");
+
     const auto port = FetchAddressPolicy::parse(true, {"10.0.0.5:8080", "backend:9000", "[fd00::1]:443",
                                                        "[::ffff:10.0.0.6]:8443"});
     check(lets_through(port, "fd00::1", 443) && !lets_through(port, "fd00::1", 444) && !lets_through(port, "fd00::2", 443),
@@ -189,9 +227,15 @@ void matching()
 
 int main()
 {
-    bad_entries();
-    good_entries();
-    matching();
+    // An exception out of a section is its FAIL, not the end of the run.
+    for (const auto& [name, section] : {std::pair{"bad_entries", bad_entries}, std::pair{"good_entries", good_entries},
+                                        std::pair{"matching", matching}}) {
+        try {
+            section();
+        } catch (const std::exception& e) {
+            check(false, std::string(name) + " threw: " + e.what());
+        }
+    }
     std::printf("fetch_policy_test: %s\n", g_failed == 0 ? "PASS" : "FAIL");
     return g_failed == 0 ? 0 : 1;
 }

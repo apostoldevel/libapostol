@@ -71,26 +71,37 @@ WsClient::ParsedUrl WsClient::parse_url(std::string_view url)
     result.scheme = std::string(url.substr(0, pos));
     url.remove_prefix(pos + 3);
 
-    auto slash = url.find('/');
-    auto host_port = (slash != std::string_view::npos) ? url.substr(0, slash) : url;
+    // The fragment is never sent; the authority ends at the first '/' or '?'.
+    if (auto hash = url.find('#'); hash != std::string_view::npos)
+        url = url.substr(0, hash);
+    auto end = url.find_first_of("/?");
+    auto host_port = url.substr(0, end);
 
     auto colon = host_port.rfind(':');
     if (colon != std::string_view::npos) {
-        result.host = std::string(host_port.substr(0, colon));
+        // The port is digits only, 1..65535: a sign, a blank, a suffix or an
+        // empty port leaves the URL without a host, and connect() refuses it.
         auto port_sv = host_port.substr(colon + 1);
-        int port_val = 0;
+        unsigned port_val = 0;
         auto [ptr, ec] = std::from_chars(port_sv.data(),
                                           port_sv.data() + port_sv.size(),
                                           port_val);
-        result.port = (ec == std::errc{})
-            ? static_cast<uint16_t>(port_val) : 0;
+        if (port_sv.empty() || ec != std::errc{} || ptr != port_sv.data() + port_sv.size()
+            || port_val == 0 || port_val > 65535)
+            return ParsedUrl{};
+        result.host = std::string(host_port.substr(0, colon));
+        result.port = static_cast<uint16_t>(port_val);
     } else {
         result.host = std::string(host_port);
         result.port = (result.scheme == "wss") ? 443 : 80;
     }
 
-    result.path = (slash != std::string_view::npos)
-        ? std::string(url.substr(slash)) : "/";
+    if (end == std::string_view::npos)
+        result.path = "/";
+    else if (url[end] == '/')
+        result.path = std::string(url.substr(end));
+    else
+        result.path = "/" + std::string(url.substr(end));   // "?query" right after the authority
     return result;
 }
 
@@ -139,11 +150,13 @@ void WsClient::connect(std::string_view url,
         return;
     }
 
-    url_ = parse_url(url);
-    if (url_.host.empty()) {
+    // A URL that does not parse leaves the last good one in place.
+    auto parsed = parse_url(url);
+    if (parsed.host.empty()) {
         enter_error("invalid URL");
         return;
     }
+    url_ = std::move(parsed);
 
     protocols_ = protocols;
     extra_headers_ = headers;
@@ -514,6 +527,12 @@ void WsClient::reconnect()
 {
     if (state_ == WsClientState::Reconnecting)
         return;
+
+    // Never connected to a valid URL: nothing to dial again.
+    if (url_.host.empty()) {
+        enter_error("reconnect() without a valid URL");
+        return;
+    }
 
     cancel_ping_timer();
     state_ = WsClientState::Reconnecting;
