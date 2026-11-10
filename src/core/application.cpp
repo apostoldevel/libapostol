@@ -1085,7 +1085,9 @@ bool Application::finish_work(EventLoop& loop,
         return 0;
 #endif
     };
-    auto done = [&] { return queries() == 0 && http_busy() == 0 && !(busy && busy()); };
+    auto done = [&] {
+        return queries() == 0 && http_busy() == 0 && ipc_.owed() == 0 && !(busy && busy());
+    };
 
     // Best effort by definition, and every step of it — a module's busy()
     // included — inside the try: an exception here must not skip the rest of
@@ -1170,10 +1172,11 @@ bool Application::finish_work(EventLoop& loop,
             // time — something stopped the loop — it says so instead.
             std::string modules = busy && busy() && busy_names ? busy_names() : std::string{};
             logger_->warn("{} shutdown: work in flight {} {} ms "
-                          "(queries: {}, HTTP answers: {}, busy modules: {}) — process.stop_timeout is {} s",
+                          "(queries: {}, HTTP answers: {}, IPC answers: {}, busy modules: {}) — "
+                          "process.stop_timeout is {} s",
                           name_, cut_short ? "cut short after" : "did not finish in",
                           static_cast<long long>(cut_short ? took.count() : budget.count()),
-                          queries(), http_busy(), modules.empty() ? "none" : modules,
+                          queries(), http_busy(), ipc_.owed(), modules.empty() ? "none" : modules,
                           settings_.stop_timeout);
         }
         return finished;
@@ -1313,12 +1316,16 @@ void Application::single_run()
 
     loop.run();
 
-    // First: a request still waiting here ends now, and nobody's reaches us
-    // while the work in flight is finished.
-    detach_ipc();
+    // First: a request still waiting here ends now, and a new one from another
+    // process is answered "stopping" while the work in flight is finished.
+    // The channels stay open until the modules have stopped: an answer owed
+    // to another process — given while the work is finished, or by on_stop()
+    // as "failed" — still leaves, as an HTTP answer does.
+    retire_ipc();
 
     stop_http_server(loop);
     stop_modules(loop);
+    detach_ipc();
     stop_db();
     logger_->notice("{} single process exiting (pid={})", name_, ::getpid());
 }
@@ -1380,10 +1387,11 @@ void Application::worker_run()
 
     loop.run();
 
-    detach_ipc();   // first — see single_run
+    retire_ipc();   // first — see single_run
 
     stop_http_server(loop);
     stop_modules(loop);
+    detach_ipc();
     stop_db();
     logger_->notice("{} worker process exiting (pid={})", name_, ::getpid());
 }
@@ -1505,7 +1513,7 @@ void Application::helper_run()
 
     loop.run();
 
-    detach_ipc();   // first — see single_run
+    retire_ipc();   // first — see single_run
 
 #ifdef WITH_POSTGRESQL
     stopping = true;
@@ -1513,6 +1521,7 @@ void Application::helper_run()
     close_listener();
     if (started)
         stop_modules(loop);
+    detach_ipc();
     stop_db();
 #ifdef WITH_POSTGRESQL
     // Last: the lock goes with its connection, and a standby elsewhere starts
@@ -1654,7 +1663,7 @@ void Application::custom_process_run(CustomProcess& proc)
     // 8. Event loop
     loop.run();
     stopping = true;
-    detach_ipc();   // first — see single_run
+    retire_ipc();   // first — see single_run
 
     // 9. Cleanup: the heartbeats go first, so that finishing the work in flight
     // does not start a new pass; then on_stopping(), stop_work(), then stop_db()
@@ -1675,6 +1684,7 @@ void Application::custom_process_run(CustomProcess& proc)
                   [] {},
                   [&proc] { proc.on_stop(); });
     }
+    detach_ipc();
     stop_db();
     // Last: the lock goes with its connection, and a standby elsewhere starts
     // only once this process has finished its work.
@@ -2858,10 +2868,17 @@ void Application::attach_ipc(EventLoop& loop, ProcessRole role, std::string_view
     });
 }
 
+void Application::retire_ipc()
+{
+    ipc_.retire();
+}
+
 void Application::detach_ipc()
 {
     ipc_.detach();
 #ifdef WITH_POSTGRESQL
+    // Only the metrics' view of the lock, read by the "metrics" handler, which
+    // is gone; the lock itself is released after the pools, by its owner.
     leader_lock_ = nullptr;
 #endif
 }

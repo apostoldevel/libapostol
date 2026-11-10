@@ -202,12 +202,15 @@ public:
     std::chrono::milliseconds stop_budget() const noexcept;
 
     /// The shutdown order of every process kind, after the loop has stopped, the
-    /// heartbeats have been latched off and the modules told (on_stopping):
+    /// IPC channels have been retired (Ipc: own requests ended, new ones
+    /// answered "stopping", the channels still open), the heartbeats have been
+    /// latched off and the modules told (on_stopping):
     ///   0. quiesce — notifications are no longer dispatched (they are new work);
     ///   1. finish — the loop runs until nothing is in flight — no query of a
-    ///      pool outstanding, no answer owed on an HTTP connection, @p busy
-    ///      false — or until stop_budget() runs out; the modules are intact and
-    ///      execute() still serves the connections already open; every
+    ///      pool outstanding, no answer owed on an HTTP connection, none owed
+    ///      to another process of the node whose request is still waiting
+    ///      (Ipc), @p busy false — or until stop_budget() runs out; the modules
+    ///      are intact and execute() still serves the connections already open; every
     ///      k_shutdown_drain (a quarter of the budget or of the master's
     ///      SIGKILL time, "process.stop_timeout", if less) a query with
     ///      nowhere to run and no reconnect due before the next time is failed
@@ -218,6 +221,10 @@ public:
     ///   3. detach — whatever is still outstanding will not be delivered;
     ///   4. @p on_stop — modules release what their callbacks used;
     ///   5. drain — what on_stop() queued, and only that.
+    /// The IPC channels close after it (Ipc detach), before the pools: an
+    /// answer on_stop() gave still leaves. A process stopped without this —
+    /// a failed start, a custom process without PostgreSQL — closes them at
+    /// once, and what it owed is lost.
     /// Earlier it was on_stop() first and one drain after it, and the drain
     /// handed results of earlier queries to modules already torn down: a
     /// TaskScheduler job answering after SIGTERM reached a released BotSession
@@ -537,7 +544,10 @@ private:
     Ipc ipc_;
     // Every role's loop: ipc_.attach(), and the "metrics" handler when enabled.
     void attach_ipc(EventLoop& loop, ProcessRole role, std::string_view name);
-    // ipc_.detach(): no handler runs after it — what they read may go next.
+    // ipc_.retire(), first in a stop: no handler runs after it — what they
+    // read may go next; answers owed to others still leave.
+    void retire_ipc();
+    // ipc_.detach(), last in a stop, after the modules: the channels close.
     void detach_ipc();
     bool        metrics_enabled_{false};
     std::string metrics_prefix_;

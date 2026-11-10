@@ -436,8 +436,8 @@ private:
             return fail("own stop: stall not sent");
         after(100ms, [this] {
             app_->collect_metrics([this](std::string text) {
-                // Runs as the probe's channels are detached: the loop is gone,
-                // the verdict is written here.
+                // Runs as the probe's stop begins (Ipc::retire): the loop has
+                // stopped, the verdict is written here.
                 const auto lines = lines_of(text);
                 if (!app_->ipc().stopping())
                     return fail("own stop: the callback ran, stopping() false\n" + text);

@@ -14,6 +14,7 @@
 #include <deque>
 #include <exception>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace apostol
 {
@@ -228,6 +229,13 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
         std::string   body;
         long long     started_ms{0};
     };
+    struct OwedKey              // a request of another process, its answer not given yet
+    {
+        int           slot;
+        std::uint32_t generation;
+        std::uint32_t id;
+        auto operator<=>(const OwedKey&) const = default;
+    };
 
     bool    connected{false};   // forked by a master that gave it channels
     bool    attached{false};
@@ -240,7 +248,12 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
     std::unordered_map<int, std::vector<Held>> held;
     std::unordered_map<std::uint32_t, Pending> pending;
     std::map<PartKey, Part>                    parts;
+    // Asker → until when it waits. A stop waits for these (Application::
+    // finish_work), as it waits for HTTP answers.
+    std::map<OwedKey, long long>               owed;
+    EventLoop::TimerId                         owed_timer{EventLoop::kInvalidTimer};
     std::unordered_map<std::string, Ipc::Handler> handlers;
+    std::unordered_set<std::string>            retired_types;   // handlers dropped by retire()
     std::uint32_t                              next_id{1};
     std::deque<std::function<void()>>          deferred;
     EventLoop::TimerId                         defer_timer{EventLoop::kInvalidTimer};
@@ -271,7 +284,8 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
 
     std::string_view label(std::string_view type) const
     {
-        return handlers.count(std::string(type)) ? type : std::string_view("other");
+        const std::string t(type);
+        return handlers.count(t) || retired_types.count(t) ? type : std::string_view("other");
     }
 
     IpcPeer peer_of(int slot, std::uint32_t generation) const
@@ -559,7 +573,67 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
             else
                 ++p;
         }
+        std::erase_if(owed, [&](const auto& o) {   // nobody is left to wait for the answer
+            return o.first.slot == slot && o.first.generation <= generation;
+        });
         fail_pending(slot, generation, IpcError::gone);
+    }
+
+    // How long the asker of a request waits for its answer.
+    static long long wait_ms(std::uint32_t timeout_ms) noexcept
+    {
+        return timeout_ms ? static_cast<long long>(timeout_ms) : kHoldMs;
+    }
+
+    // Answers owed whose askers still wait; the others are forgotten. An asker
+    // waits until its timeout, and only while it is the same process, not
+    // stopping: a stopping process has ended its own requests (retire), and a
+    // slot taken by another generation is another process.
+    std::size_t owed_now()
+    {
+        const long long now = now_ms();
+        std::erase_if(owed, [&](const auto& o) {
+            if (o.second <= now || !connected)
+                return true;
+            const auto e = dir.get(o.first.slot);
+            return !e || e->generation != o.first.generation
+                || (e->state != NodeDirectory::State::starting && e->state != NodeDirectory::State::live);
+        });
+        return owed.size();
+    }
+
+    // Messages given but not sent yet: queued for a channel, or held for one.
+    std::size_t leaving() const
+    {
+        std::size_t n = 0;
+        for (const auto& [slot, l] : links)
+            n += l.out.size();
+        for (const auto& [slot, v] : held)
+            n += v.size();
+        return n;
+    }
+
+    // Own pending requests end as "stopping" and deferred work runs, so that
+    // every request gets exactly one call of its callback. A callback may ask
+    // again (it is told "stopping", through the same queue): rounds until
+    // nothing is left, with a bound against a callback that keeps asking.
+    void end_waiting()
+    {
+        constexpr int kRounds = 16;
+        for (int round = 0; round < kRounds; ++round)
+        {
+            run_deferred();
+            std::vector<std::uint32_t> ids;
+            for (const auto& [id, p] : pending)
+                ids.push_back(id);
+            for (auto id : ids)
+                complete(id, {IpcError::stopping, {}});
+            if (deferred.empty() && pending.empty())
+                return;
+        }
+        warn("ipc: stopping with {} callback(s) and {} request(s) left after {} rounds — "
+             "a callback keeps asking while the process stops",
+             deferred.size(), pending.size(), kRounds);
     }
 
     // ── answering ────────────────────────────────────────────────────────────
@@ -573,9 +647,11 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
             body.clear();
         }
         bump(stats.received, label(type), ipc_error_name(static_cast<IpcError>(status)));
-        // Detached (stopped; the master, which never attaches, still answers
-        // itself): no channel is left to carry it, and nothing would ever send
-        // it on. The asker gets its timeout, or "gone" when this process exits.
+        owed.erase({slot, generation, id});
+        // Detached — the stop has ended (the master, which never attaches,
+        // still answers itself): no channel is left to carry it, and nothing
+        // would ever send it on. The asker gets its timeout, or "gone" when
+        // this process exits. Retiring is not detached: the answer leaves.
         if (stopping && !attached)
             return;
 
@@ -591,7 +667,7 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
         if (!connected)
             return;
         auto frames = make_frames(k_reply, status, me.slot, me.generation, id, 0, {}, body);
-        const long long hold = timeout_ms ? static_cast<long long>(timeout_ms) : kHoldMs;
+        const long long hold = wait_ms(timeout_ms);
         enqueue(slot, generation, std::move(frames), hold, 0);
     }
 
@@ -625,6 +701,12 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
         IpcReply r;
         if (is_request)
         {
+            // Before the handler: it may answer at once. A request to itself
+            // is not owed — its asker stops waiting when the stop begins. The
+            // time counts from the arrival here: a request read late is owed a
+            // little longer than its asker waits; the stop's budget bounds it.
+            if (!is_self(from.slot, from.generation))
+                owed[{from.slot, from.generation, id}] = now_ms() + wait_ms(timeout_ms);
             r.core_       = weak_from_this();
             r.slot_       = from.slot;
             r.generation_ = from.generation;
@@ -1347,11 +1429,13 @@ void Ipc::master_forked_child()
     // What the master may have had of its own is not the child's: its timers
     // live on the master's loop (not cancelled — that is not ours either), its
     // requests wait for answers addressed to the master.
-    c.master_timer = c.defer_timer = c.beat_timer = EventLoop::kInvalidTimer;
+    c.master_timer = c.defer_timer = c.beat_timer = c.owed_timer = EventLoop::kInvalidTimer;
     c.deferred.clear();
     c.pending.clear();
     c.held.clear();
     c.parts.clear();
+    c.owed.clear();
+    c.retired_types.clear();
     c.links.clear();
     c.stats = {};
     const bool mine = c.prep.valid;
@@ -1539,37 +1623,82 @@ void Ipc::ready()
         c.dir.mark(c.me.slot, NodeDirectory::State::live);
 }
 
-void Ipc::detach()
+void Ipc::retire()
 {
     auto& c = *core_;
-    if (!c.attached)
+    if (!c.attached || c.stopping)
         return;
     c.stopping = true;
     if (c.connected)
         c.dir.mark(c.me.slot, NodeDirectory::State::retiring);
 
     // Work already deferred is finished — answers to ourselves, completions —
-    // and what is still waiting ends as "stopping", so that every request gets
-    // exactly one call of its callback. A callback may ask again (it is told
-    // "stopping", through the same queue): rounds until nothing is left, with
-    // a bound against a callback that keeps asking.
-    constexpr int kRounds = 16;
-    for (int round = 0; round < kRounds; ++round)
-    {
-        c.run_deferred();
-        std::vector<std::uint32_t> ids;
-        for (const auto& [id, p] : c.pending)
-            ids.push_back(id);
-        for (auto id : ids)
-            c.complete(id, {IpcError::stopping, {}});
-        if (c.deferred.empty() && c.pending.empty())
-            break;
-    }
-    if (!c.deferred.empty() || !c.pending.empty())
-        c.warn("ipc: detached with {} callback(s) and {} request(s) left after {} rounds — "
-               "a callback keeps asking while the process stops",
-               c.deferred.size(), c.pending.size(), kRounds);
+    // and what is still waiting ends as "stopping".
+    c.end_waiting();
+    // No handler runs from here on: what they use may be released next. A
+    // message that still arrives is answered "stopping" (deliver_message).
+    // Their names stay known to the counters: an answer given later is still
+    // counted under its type.
+    for (const auto& [type, h] : c.handlers)
+        c.retired_types.insert(type);
     c.handlers.clear();
+
+    // A stop waiting for the answers owed (Application::finish_work) looks
+    // again when something happens on the loop — the beat, once a second, at
+    // least: wake it when the last asker stops waiting, not up to a second
+    // later.
+    if (c.loop && c.owed_now() > 0)
+    {
+        long long last = 0;
+        for (const auto& [key, until] : c.owed)
+            last = std::max(last, until);
+        const auto in = std::chrono::milliseconds(std::max<long long>(1, last - now_ms() + 1));
+        std::weak_ptr<detail::IpcCore> w = core_;
+        try {
+            c.owed_timer = c.loop->add_timer(in, [w] {
+                if (auto core = w.lock())
+                    core->owed_timer = EventLoop::kInvalidTimer;
+            }, /*repeat=*/false);
+        } catch (const std::exception& e) {
+            c.warn("ipc: no timer for the answers owed ({}) — the stop waits for them "
+                   "until something else wakes it", e.what());
+        }
+    }
+}
+
+std::size_t Ipc::owed()
+{
+    return core_->owed_now() + core_->leaving();
+}
+
+void Ipc::detach()
+{
+    auto& c = *core_;
+    if (!c.attached)
+        return;
+    retire();
+    // A request made since — by a callback, or by a module in on_stop() — is
+    // refused, its callback queued: it runs here, after the modules stopped
+    // and before they are destroyed.
+    c.end_waiting();
+    // What arrived while the loop no longer ran is answered "stopping" now,
+    // instead of being lost with the inbox: its asker learns it at once.
+    if (c.inbox_fd >= 0)
+        c.on_inbox();
+
+    // What is still queued gets one more chance to leave, without waiting.
+    std::vector<int> queued;
+    for (const auto& [slot, l] : c.links)
+        if (!l.out.empty())
+            queued.push_back(slot);
+    for (int slot : queued)
+        c.flush(slot);
+    const auto lost = c.owed_now();
+    const auto unsent = c.leaving();
+    if (lost > 0 || unsent > 0)
+        c.warn("ipc: by the end of the stop {} answer(s) owed to other processes not given, "
+               "{} message(s) not sent — their askers get a timeout, or 'gone' when this "
+               "process exits", lost, unsent);
 
     if (c.loop)
     {
@@ -1577,6 +1706,8 @@ void Ipc::detach()
             c.loop->cancel_timer(c.defer_timer);
         if (c.beat_timer != EventLoop::kInvalidTimer)
             c.loop->cancel_timer(c.beat_timer);
+        if (c.owed_timer != EventLoop::kInvalidTimer)
+            c.loop->cancel_timer(c.owed_timer);
         if (c.inbox_fd >= 0)
             c.loop->remove_io(c.inbox_fd);
         if (c.control_fd >= 0)
@@ -1585,8 +1716,9 @@ void Ipc::detach()
             if (l.watching)
                 c.loop->remove_io(l.fd);
     }
-    c.defer_timer = c.beat_timer = EventLoop::kInvalidTimer;
+    c.defer_timer = c.beat_timer = c.owed_timer = EventLoop::kInvalidTimer;
     c.deferred.clear();
+    c.owed.clear();
     // Closing the inbox now: whoever writes to us from here on learns at once
     // that we are gone, instead of waiting for the exit.
     close_fd(c.inbox_fd);

@@ -105,6 +105,14 @@ enum IpcRoles : unsigned
 /// The answer to one request — given once, now or later (after a query, say).
 /// Dropped unanswered, it answers `failed`. For a message sent without
 /// expecting an answer it does nothing.
+///
+/// A stopping process still delivers it: a stop that finishes the work in
+/// flight (Application::stop_work) waits for answers owed to other processes
+/// as it waits for HTTP answers — until each asker's timeout, the asker's own
+/// stop or the stop's budget, whichever comes first — and the channels close
+/// only after the modules have stopped. An answer given after that, or by a
+/// process stopped without finishing its work (a failed start), is lost; the
+/// asker gets its timeout, or `gone` when the process exits.
 class IpcReply
 {
 public:
@@ -153,12 +161,13 @@ public:
     /// Channels to the other processes of the node exist.
     bool connected() const noexcept;
 
-    /// The process is stopping: its channels are being closed, or are closed.
-    /// True from the moment the stop begins — so a callback of request(),
-    /// gather() or Application::collect_metrics() that the stop ends sees it
-    /// true, and can tell "this process is stopping" from "the others did not
-    /// answer". A request or a gather started from then on is refused as
-    /// `stopping`.
+    /// The process is stopping: it takes no new message, and its channels
+    /// close once its modules have stopped. True from the moment the stop
+    /// begins — so a callback of request(), gather() or
+    /// Application::collect_metrics() that the stop ends sees it true, and can
+    /// tell "this process is stopping" from "the others did not answer". A
+    /// request or a gather started from then on is refused as `stopping`; a
+    /// request arriving from another process is answered `stopping`.
     bool stopping() const noexcept;
 
     IpcPeer self() const;
@@ -222,7 +231,15 @@ private:
     // ── Application: every process that runs a loop ──────────────────────────
     void attach(EventLoop& loop, Logger& log, ProcessRole role, std::string_view name);
     void ready();     // started: live in the directory
-    void detach();    // stopping: pending requests fail, handlers are dropped
+    /// The stop begins: retiring in the directory, own pending requests end as
+    /// `stopping`, handlers are dropped, what arrives is answered `stopping`.
+    /// The channels stay open, so that answers owed to others still leave.
+    void retire();
+    /// Answers owed to other processes whose askers still wait for them, and
+    /// messages given but not sent yet.
+    std::size_t owed();
+    /// The stop ends: the channels close. Retires first if not yet retired.
+    void detach();
 
     std::shared_ptr<detail::IpcCore> core_;
 };

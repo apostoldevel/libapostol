@@ -24,7 +24,16 @@
 //   7. a request sent to the respawned worker while it is still starting —
 //      held back before it attaches its channels — waits for its handlers
 //      instead of being refused as "no_handler";
-//   8. a reload (SIGHUP): while the old generation is still stopping, a gather
+//   8. answers owed by a stopping process: two workers get SIGTERM while each
+//      holds a request of the probe. The one that answers 300 ms later — its
+//      stop already begun — still delivers the answer; the one that never
+//      answers stops once the probe has stopped waiting (its 700 ms), not
+//      sooner and not at the end of the stop's budget. Both are respawned.
+//      Then a worker asks another one (never answered, 5 s) and is stopped
+//      first, kept on the node by an answer it owes the probe: the other,
+//      stopped next, owes nothing to an asker that has stopped waiting and
+//      exits at once, not at the end of its budget;
+//   9. a reload (SIGHUP): while the old generation is still stopping, a gather
 //      answers once per worker number, and the new processes' first gathers
 //      are answered by everyone; each old worker, stopping with a request in
 //      flight since its start whose callback asks again, saw both callbacks
@@ -187,6 +196,22 @@ void install(Application& app, EventLoop& loop)
     ipc.on("hang", [](const IpcPeer&, std::string_view, IpcReply r) {
         g_hung.push_back(std::move(r));
     });
+    // "<slot> <ms>": asks that worker "hang" for that long; answered at once.
+    ipc.on("ask", [&ipc](const IpcPeer&, std::string_view b, IpcReply r) {
+        const std::string body(b);
+        const auto sp = body.find(' ');
+        ipc.request(std::stoi(body.substr(0, sp)), "hang", {}, [](IpcResult) {},
+                    std::chrono::milliseconds(std::stoi(body.substr(sp + 1))));
+        r.send("asked");
+    });
+    // "<ms>": answered that much later, from the loop — a stop begun meanwhile
+    // included.
+    ipc.on("later", [&loop](const IpcPeer&, std::string_view b, IpcReply r) {
+        auto reply = std::make_shared<IpcReply>(std::move(r));
+        loop.add_timer(std::chrono::milliseconds(std::stoi(std::string(b))), [reply] {
+            reply->send(fmt::format("later {}", ::getpid()));
+        }, /*repeat=*/false);
+    });
     // Busy elsewhere: the loop is held, nothing is read meanwhile.
     ipc.on("stall", [](const IpcPeer&, std::string_view b, IpcReply) {
         std::this_thread::sleep_for(std::chrono::milliseconds(std::stoi(std::string(b))));
@@ -235,12 +260,13 @@ void install(Application& app, EventLoop& loop)
     }, /*repeat=*/false);
 }
 
-// A worker that takes a while to stop: the old generation of a reload stays
-// on the node, retiring, while the new one answers. From its start it keeps a
+// A worker that takes a while to stop in a reload: the old generation stays
+// on the node, retiring, while the new one answers. (Only then: in step 8 the
+// stop must wait for nothing but the answers owed.) From its start it keeps a
 // request in flight (to itself, never answered) whose callback asks again:
-// when the worker stops, both callbacks must run as its channels are detached
-// — the verdict goes to detach.<pid>. (Not from on_stopping(): that runs after
-// the detach, when a request fails at once.)
+// when the worker stops, both callbacks must run as its stop begins — the
+// verdict goes to detach.<pid>. (Not from on_stopping(): that runs after the
+// stop has begun, when a request fails at once.)
 class SlowStop final : public Module
 {
 public:
@@ -263,7 +289,11 @@ public:
             }, 1s);
         }, 600s);
     }
-    void on_stopping() override { since_ = Clock::now(); }
+    void on_stopping() override
+    {
+        if (read_file(stage_file()).rfind("hup", 0) == 0)
+            since_ = Clock::now();
+    }
     bool busy() const override
     {
         return since_ != Clock::time_point{} && Clock::now() - since_ < 1500ms;
@@ -631,14 +661,127 @@ private:
                                                 ipc_error_name(r.error), r.body)))
                             return;
                         note(fmt::format("the helper kept {} message(s) until 'open'", r.body));
-                        step_sockets(15, [this] { step_reload(); });
+                        step_sockets(15, [this] { step_owed(); });
                     }, 3s);
                 });
             }, 3s);
         });
     }
 
-    // ── 8. reload ────────────────────────────────────────────────────────────
+    // ── 8. answers owed by a stopping process ───────────────────────────────
+
+    void step_owed()
+    {
+        const IpcPeer late = workers_[3];   // answers 300 ms after the request
+        const IpcPeer mute = workers_[1];   // never answers; the probe waits 700 ms
+        const auto t0 = Clock::now();
+        auto left = std::make_shared<int>(4);   // two answers, two exits
+        auto term = std::make_shared<Clock::time_point>();
+        auto next = [this, left, late, mute] {
+            if (--*left == 0)
+                step_owed_respawned(late, mute, [this] {
+                    step_sockets(15, [this] { step_owed_asker(); });
+                });
+        };
+        auto ms = [](Clock::duration d) {
+            return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
+        };
+
+        ipc().request(late.slot, "later", "300", [this, late, t0, next, ms](IpcResult r) {
+            if (!expect(r.ok() && r.body == fmt::format("later {}", late.pid),
+                        fmt::format("owed: the answer of {}, stopping, did not arrive: {} '{}'",
+                                    late.name, ipc_error_name(r.error), r.body)))
+                return;
+            note(fmt::format("owed: {} answered {} ms after the request, while stopping",
+                             late.name, ms(Clock::now() - t0)));
+            next();
+        }, 5s);
+        ipc().request(mute.slot, "hang", {}, [this, mute, t0, next, ms](IpcResult r) {
+            if (!expect(r.error == IpcError::timeout,
+                        fmt::format("owed: {} kept the answer: {}, not timeout", mute.name,
+                                    ipc_error_name(r.error))))
+                return;
+            note(fmt::format("owed: {} timed out after {} ms", mute.name, ms(Clock::now() - t0)));
+            next();
+        }, 700ms);
+
+        after(50ms, [this, late, mute, term, next, ms] {
+            *term = Clock::now();
+            ::kill(late.pid, SIGTERM);
+            ::kill(mute.pid, SIGTERM);
+            for (const IpcPeer& w : {late, mute})
+                wait_until([pid = w.pid] { return !alive(pid); }, Clock::now() + 10s,
+                           w.name + " to exit after SIGTERM", [this, w, mute, term, next, ms] {
+                    const auto took = ms(Clock::now() - *term);
+                    note(fmt::format("owed: {} exited {} ms after SIGTERM", w.name, took));
+                    // The mute one waits for the probe (700 ms from the
+                    // request, 650 from SIGTERM), not for the budget (1500).
+                    if (w.pid == mute.pid
+                        && !expect(took >= 550 && took < 1300,
+                                   fmt::format("owed: {} exited {} ms after SIGTERM — the stop did "
+                                               "not wait for its asker's 700 ms, or waited for "
+                                               "the budget instead", w.name, took)))
+                        return;
+                    next();
+                });
+        });
+    }
+
+    void step_owed_respawned(IpcPeer late, IpcPeer mute, std::function<void()> then)
+    {
+        wait_until([this, late, mute] {
+            if (!all_live())
+                return false;
+            for (const auto& p : ipc().peers(ipc_workers))
+                if (p.pid == late.pid || p.pid == mute.pid)
+                    return false;
+            return true;
+        }, Clock::now() + 10s, "the stopped workers to be respawned", [this, then] {
+            remember_workers();
+            note("owed: both respawned");
+            then();
+        });
+    }
+
+    void step_owed_asker()
+    {
+        const IpcPeer asker  = workers_[1];
+        const IpcPeer holder = workers_[2];
+        ipc().request(asker.slot, "ask", fmt::format("{} 5000", holder.slot),
+                      [this, asker, holder](IpcResult r) {
+            if (!expect(r.ok() && r.body == "asked",
+                        fmt::format("owed: {} did not ask: {} '{}'", asker.name, ipc_error_name(r.error), r.body)))
+                return;
+            // The asker owes the probe an answer 1.5 s from now: it stays on
+            // the node, stopping, while the holder stops — so it is its
+            // stopping, not its exit, that releases the holder.
+            ipc().request(asker.slot, "later", "1500", [](IpcResult) {}, 3s);
+            // The holder has the request by now; the asker stops first.
+            after(100ms, [this, asker, holder] {
+                ::kill(asker.pid, SIGTERM);
+                after(200ms, [this, asker, holder] {
+                    const auto term = Clock::now();
+                    ::kill(holder.pid, SIGTERM);
+                    wait_until([pid = holder.pid] { return !alive(pid); }, Clock::now() + 10s,
+                               holder.name + " to exit after SIGTERM", [this, asker, holder, term] {
+                        const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            Clock::now() - term).count();
+                        note(fmt::format("owed: {} exited {} ms after SIGTERM, its asker {} stopped",
+                                         holder.name, took, asker.name));
+                        if (!expect(took < 700,
+                                    fmt::format("owed: {} exited {} ms after SIGTERM — it waited for an "
+                                                "asker that had stopped waiting", holder.name, took)))
+                            return;
+                        step_owed_respawned(asker, holder, [this] {
+                            step_sockets(15, [this] { step_reload(); });
+                        });
+                    });
+                });
+            });
+        }, 3s);
+    }
+
+    // ── 9. reload ────────────────────────────────────────────────────────────
 
     void step_reload()
     {
@@ -712,7 +855,7 @@ private:
                                                     "stopping()", o, v)))
                                 return;
                         }
-                        note("old workers: both callbacks ran at detach");
+                        note("old workers: both callbacks ran as the stop began");
                         pass();
                     });
                 });
