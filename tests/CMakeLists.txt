@@ -85,3 +85,15 @@ target_compile_options(url_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-par
 add_test(NAME url COMMAND url_test)
 add_test(NAME url_ipv6 COMMAND url_test --ipv6)
 set_tests_properties(url url_ipv6 PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+# accept_balance_test — the slot set aside for a worker before its fork: the
+# table in this process, then (edge-triggered build) a master with three
+# workers and a custom process "probe"; a level-triggered build runs the table only.
+add_executable(accept_balance_test accept_balance_test.cpp)
+target_link_libraries(accept_balance_test PRIVATE apostol)
+target_compile_options(accept_balance_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+
+set(ACCEPT_BALANCE_TEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/accept_balance_test.d")
+add_test(NAME accept_balance
+         COMMAND accept_balance_test -p "${ACCEPT_BALANCE_TEST_DIR}/" -c "${ACCEPT_BALANCE_TEST_DIR}/accept_balance_test.json")
+set_tests_properties(accept_balance PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)

@@ -1781,11 +1781,20 @@ pid_t Application::fork_child(ProcessRole role, std::string child_name,
     // A slot and the channels, before fork: the child inherits them, the
     // master hands its inbox to the others. False — it runs without channels.
     ipc_.master_prepare(role, child_name, process_number(role, child_name));
+#ifdef APOSTOL_EPOLL_ET
+    // A worker's slot in the accept balance, set aside before fork on the
+    // terms start_http_server() joins it: connections queued on the socket
+    // while the workers start are left to the ones not running yet, not taken
+    // whole by the first that runs. A respawn and a reload start the same way.
+    if (role == ProcessRole::worker && listen_fd_ >= 0 && settings_.effective_workers() > 1)
+        accept_balance_.reserve();
+#endif
 
     pid_t pid = ::fork();
     if (pid < 0)
     {
         const int err = errno;
+        accept_balance_.reserved_for(pid);
         ipc_.master_fork_failed();
         throw std::system_error(err, std::system_category(), "fork");
     }
@@ -1835,6 +1844,7 @@ pid_t Application::fork_child(ProcessRole role, std::string child_name,
     }
 
     // ── Parent (master) ────────────────────────────────────────────────────
+    accept_balance_.reserved_for(pid);
     ipc_.master_forked_parent(pid);
     logger_->notice("spawned {} '{}' pid={}", role_name(role), child_name, pid);
     children_.push_back({pid, role, std::move(child_name), false});
@@ -2611,8 +2621,9 @@ void Application::start_http_server(EventLoop& loop, uint16_t port)
             // Every open and close is seen by the others at once: a count
             // read late lets two workers each leave a connection to the
             // other. The timers say only that this worker is alive — the
-            // first once its loop runs: until then the others must not
-            // leave it anything.
+            // first once its loop runs. Until then the others count it only
+            // inside the start grace of the slot the master set aside
+            // (fork_child), and a slot taken here not at all.
             TcpConnection::observe_live(
                 [](void* ctx, int live, long long lived_ms) noexcept {
                     auto* balance = static_cast<AcceptBalance*>(ctx);

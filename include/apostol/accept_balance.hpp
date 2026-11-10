@@ -12,6 +12,12 @@
 // a worker that has not said anything for kStaleMs is not counted, and a
 // worker that has waited kDeferMs takes one connection anyway and waits again
 // — nothing waits for long on a worker that does not accept.
+//
+// Connections may queue on the socket before the workers run: the master
+// listens before it forks. The master therefore sets a slot aside for each
+// worker before forking it, counted as holding nothing for kStartGraceMs —
+// the worker that runs first leaves the queue to the others while they start
+// instead of taking all of it.
 
 #include <sys/types.h>
 
@@ -28,6 +34,11 @@ public:
     static constexpr std::chrono::milliseconds kStaleMs{3000};
     static constexpr std::chrono::milliseconds kDeferMs{100};
     static constexpr std::chrono::milliseconds kRecheckMs{1};
+    // How long a slot set aside for a starting worker counts before the
+    // worker says anything itself.
+    static constexpr std::chrono::milliseconds kStartGraceMs{1000};
+    // reserve() dates the slot kStaleMs - kStartGraceMs back.
+    static_assert(kStartGraceMs > std::chrono::milliseconds{0} && kStartGraceMs < kStaleMs);
     // A wait not looked at again for this long has ended (the queue emptied):
     // the next one starts afresh.
     static constexpr std::chrono::milliseconds kEpisodeGapMs{50};
@@ -49,8 +60,19 @@ public:
     bool create();
     bool created() const noexcept { return slots_ != nullptr; }
 
-    /// Worker: take a free slot for @p pid. False — none: no balancing. The
-    /// slot is not counted by the others until the first publish().
+    /// Master, before it forks a worker: a free slot is set aside for it,
+    /// counted as holding nothing for kStartGraceMs. False — none free: the
+    /// worker takes one itself in join().
+    bool reserve();
+    /// Master, after fork: the slot set aside by reserve() is @p pid's — freed
+    /// by release(@p pid). @p pid <= 0 (fork failed): it is free again. Nothing
+    /// set aside — nothing done.
+    void reserved_for(pid_t pid);
+
+    /// Worker: take the slot the master set aside for it before the fork, or
+    /// else a free one, for @p pid. False — none: no balancing. A slot taken
+    /// here is not counted by the others until the first publish(); one set
+    /// aside is counted from reserve(), for kStartGraceMs at most.
     bool join(pid_t pid);
     /// Worker: the slot is given up — it accepts nothing any more.
     void leave();
@@ -72,6 +94,8 @@ private:
     struct Slot;
     Slot*     slots_{nullptr};
     int       mine_{-1};
+    int       reserved_{-1};        // master: set aside for the next fork;
+                                    // the forked worker: its own
     long long window_ms_{0};        // the current kChurnMs window began
     int       closes_{0};           // short closes in it
     int       closes_before_{0};    // short closes in the window before
