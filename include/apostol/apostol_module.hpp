@@ -184,19 +184,27 @@ protected:
 
     /// Serve static content with try-files fallback (like nginx try_files).
     ///
+    /// The request path is resolved by path_under_root(): a path that does not
+    /// stay under @p root (empty, not starting with '/', starting with "//",
+    /// a NUL, or ".." segments leading out of the root) is answered
+    /// 400 Bad Request and nothing is read.
+    ///
     /// Resolution order for request path:
     ///   1. Exact file match (root / path)
     ///   2. Directory with index: if path is a directory, try path/index.html
     ///      - If path has no trailing slash, send 301 redirect to path + "/"
-    ///   3. Each entry in @p fallbacks (e.g. "/index.html" for SPA)
+    ///   3. Each entry in @p fallbacks (e.g. "/index.html" for SPA); an entry
+    ///      that does not stay under @p root is skipped
     ///   4. 404 Not Found
     ///
     /// @param root      Document root directory
-    /// @param req       HTTP request (uses path and provides host for redirect)
+    /// @param req       HTTP request (uses its path)
     /// @param resp      HTTP response to fill
-    /// @param head_only If true, suppress body (HEAD request)
-    /// @param fallbacks List of absolute paths to try as fallback (e.g. {"/index.html"})
-    /// @return true if a response was sent (file, redirect, or 404)
+    /// @param head_only If true, suppress the body of every answer (HEAD request);
+    ///                  Content-Length still describes it
+    /// @param fallbacks List of paths under @p root, each starting with '/',
+    ///                  to try as fallback (e.g. {"/index.html"})
+    /// @return true: a response was always set (file, redirect, 400 or 404)
     bool try_files(const std::filesystem::path& root,
                    const HttpRequest& req,
                    HttpResponse& resp,

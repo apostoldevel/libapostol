@@ -97,3 +97,11 @@ set(ACCEPT_BALANCE_TEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/accept_balance_test.d")
 add_test(NAME accept_balance
          COMMAND accept_balance_test -p "${ACCEPT_BALANCE_TEST_DIR}/" -c "${ACCEPT_BALANCE_TEST_DIR}/accept_balance_test.json")
 set_tests_properties(accept_balance PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+# path_under_root_test — path_under_root() and ApostolModule::try_files() on a
+# temporary tree (mkdtemp): paths under the root are served as
+# before, paths that do not stay under it are refused.
+add_executable(path_under_root_test path_under_root_test.cpp)
+target_link_libraries(path_under_root_test PRIVATE apostol)
+target_compile_options(path_under_root_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME path_under_root COMMAND path_under_root_test)

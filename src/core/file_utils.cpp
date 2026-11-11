@@ -140,4 +140,33 @@ bool is_safe_path(std::string_view path)
     return true;
 }
 
+// ─── path_under_root ─────────────────────────────────────────────────────────
+
+std::filesystem::path path_under_root(const std::filesystem::path& root, std::string_view path)
+{
+    namespace fs = std::filesystem;
+
+    if (path.empty() || path.front() != '/' || path.find('\0') != std::string_view::npos)
+        return {};
+
+    // Appending an absolute path to the root would replace the root.
+    const fs::path tail{path.substr(1)};
+    if (tail.has_root_directory() || tail.has_root_name())
+        return {};
+
+    // A relative path normalized lexically leaves its base only through a
+    // leading "..": "a/../.." becomes "..", "a/../b" becomes "b".
+    const fs::path rel = tail.lexically_normal();
+    if (!rel.empty() && *rel.begin() == "..")
+        return {};
+
+    // The root is used as given (it is not normalized: a ".." in it may follow
+    // a symbolic link); an empty root is the working directory.
+    const fs::path base = root.empty() ? fs::path(".") : root;
+    if (rel.empty() || rel == ".")
+        return base;
+
+    return base / rel;
+}
+
 } // namespace apostol

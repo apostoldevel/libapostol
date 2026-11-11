@@ -1,5 +1,6 @@
 #include "apostol/apostol_module.hpp"
 #include "apostol/http_utils.hpp"
+#include "apostol/file_utils.hpp"
 #ifdef WITH_POSTGRESQL
 #include "apostol/pg_utils.hpp"
 #endif
@@ -336,21 +337,28 @@ bool ApostolModule::try_files(const std::filesystem::path& root,
 
     const auto& path = req.path;
 
-    // 1. Try exact file
-    if (path.size() > 1) {
-        auto file_path = root / path.substr(1);
-        if (serve_file(file_path, resp, head_only))
-            return true;
+    // Only a path that stays under the root is served; any other is refused
+    // before anything is read.
+    const auto file_path = path_under_root(root, path);
+    if (file_path.empty()) {
+        resp.set_status(HttpStatus::bad_request)
+            .set_body("400 Bad Request", "text/plain");
+        if (head_only)
+            resp.suppress_body();
+        return true;
     }
 
+    // 1. Try exact file ("/" resolves to the root, a directory: not served here)
+    if (serve_file(file_path, resp, head_only))
+        return true;
+
     // 2. Directory handling: try path/index.html
-    auto rel = (path.size() > 1) ? path.substr(1) : std::string{};
-    auto dir_index = root / rel / "index.html";
+    auto dir_index = file_path / "index.html";
 
     std::error_code ec;
     if (fs::is_regular_file(dir_index, ec) && !ec) {
         // Redirect to path + "/" if missing trailing slash (fixes relative URLs)
-        if (!path.empty() && path.back() != '/') {
+        if (path.back() != '/') {
             resp.set_status(HttpStatus::moved_permanently)
                 .set_header("Location", path + "/")
                 .set_body("", "text/plain");
@@ -361,16 +369,20 @@ bool ApostolModule::try_files(const std::filesystem::path& root,
             return true;
     }
 
-    // 3. Fallbacks (e.g. SPA → /index.html)
+    // 3. Fallbacks (e.g. SPA → /index.html); one not under the root is skipped
     for (const auto& fallback : fallbacks) {
-        auto file_path = root / fallback.substr(1);
-        if (serve_file(file_path, resp, head_only))
+        const auto fallback_path = path_under_root(root, fallback);
+        if (fallback_path.empty())
+            continue;
+        if (serve_file(fallback_path, resp, head_only))
             return true;
     }
 
     // 4. Nothing found
     resp.set_status(HttpStatus::not_found)
         .set_body("404 Not Found", "text/plain");
+    if (head_only)
+        resp.suppress_body();
     return true;
 }
 
