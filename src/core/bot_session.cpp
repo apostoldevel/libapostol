@@ -35,6 +35,11 @@ void BotSession::set_credentials(std::string client_id, std::string client_secre
     client_id_     = std::move(client_id);
     client_secret_ = std::move(client_secret);
     username_      = std::move(username);
+#ifdef WITH_DB_PLATFORM
+    // Failures under the old credentials say nothing about the new ones.
+    last_error_.clear();
+    report_.reset();
+#endif
 }
 
 } // namespace apostol

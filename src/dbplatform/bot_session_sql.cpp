@@ -10,13 +10,110 @@
 
 #include "apostol/bot_session.hpp"
 #include "apostol/db_platform.hpp"
+#include "apostol/event_loop.hpp"
+#include "apostol/logger.hpp"
 #include "apostol/pg_utils.hpp"
 
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+
 namespace apostol
 {
+
+// ─── detail::SignInReport ────────────────────────────────────────────────────
+
+namespace detail
+{
+
+SignInReport::Line SignInReport::failed(const std::string& why,
+                                        std::chrono::steady_clock::time_point now)
+{
+    ++failures_;
+
+    const bool written = std::find(written_.begin(), written_.end(), why) != written_.end();
+    if (!written && written_.size() < k_reasons) {
+        written_.push_back(why);
+        last_line_ = now;
+        return Line::reason;
+    }
+
+    // Written already, or too many distinct reasons to keep apart: a reminder
+    // once per interval, counted from the last line of either kind.
+    if (now - last_line_ >= k_interval) {
+        last_line_ = now;
+        return Line::reminder;
+    }
+
+    return Line::none;
+}
+
+bool SignInReport::obtained() noexcept
+{
+    const bool ended = failures_ > 0;
+    reset();
+    return ended;
+}
+
+void SignInReport::reset() noexcept
+{
+    written_.clear();
+    last_line_ = {};
+    failures_  = 0;
+}
+
+} // namespace detail
+
+// ─── failed / obtained ───────────────────────────────────────────────────────
+//
+// A background component calls refresh_if_needed() from its heartbeat and, while
+// valid() is false, simply takes no work. Nothing else in the process says why: the
+// pool writes the database's error to its own statement log, without naming who
+// asked. These two write it where an operator looks, under the component's agent.
+//
+// The wording says "failed", not "refused": the same path carries a credential
+// refusal, a connection lost under the batch and a batch never sent.
+
+void BotSession::failed(std::string why)
+{
+    last_error_ = std::move(why);
+
+    const auto line = report_.failed(last_error_, std::chrono::steady_clock::now());
+    if (line == detail::SignInReport::Line::none)
+        return;
+
+    Logger* log = EventLoop::diagnostics();
+    if (log == nullptr)
+        return;
+
+    try {
+        if (line == detail::SignInReport::Line::reason)
+            log->error("BotSession [{}]: no session — sign-in as client '{}' failed: {}; "
+                       "retried every {} s", agent_, client_id_, last_error_,
+                       k_retry_interval.count());
+        else
+            log->error("BotSession [{}]: still no session — {} failed sign-in attempts as "
+                       "client '{}', the last: {}", agent_, report_.failures(), client_id_,
+                       last_error_);
+    } catch (...) {}
+}
+
+void BotSession::obtained()
+{
+    const std::size_t failures = report_.failures();
+    last_error_.clear();
+
+    if (!report_.obtained())
+        return;
+
+    if (Logger* log = EventLoop::diagnostics()) {
+        try {
+            log->notice("BotSession [{}]: session obtained after {} failed sign-in attempt(s)",
+                        agent_, failures);
+        } catch (...) {}
+    }
+}
 
 // ─── refresh_if_needed ───────────────────────────────────────────────────────
 //
@@ -35,8 +132,11 @@ void BotSession::refresh_if_needed()
     if (now < retry_at_)
         return;
 
-    if (client_id_.empty() || client_secret_.empty())
+    if (client_id_.empty() || client_secret_.empty()) {
+        retry_at_ = now + k_retry_interval;
+        failed(client_id_.empty() ? "no client credentials set" : "no client secret set");
         return;
+    }
 
     refreshing_ = true;
 
@@ -67,6 +167,8 @@ void BotSession::refresh_if_needed()
             if (results.size() < 2) {
                 refreshing_ = false;
                 retry_at_ = std::chrono::steady_clock::now() + k_retry_interval;
+                failed(fmt::format("the sign-in batch answered with {} result(s), expected 2",
+                                   results.size()));
                 return;
             }
 
@@ -109,6 +211,7 @@ void BotSession::refresh_if_needed()
                 if (!found.empty()) {
                     sessions_ = std::move(found);
                     expiry_ = std::chrono::steady_clock::now() + k_refresh_interval;
+                    obtained();
                 }
             }
 
@@ -131,9 +234,12 @@ void BotSession::refresh_if_needed()
                 retry_at_ = std::chrono::steady_clock::now() + k_retry_interval;
             }
         },
-        [this](std::string_view /*error*/) {
+        [this](std::string_view error) {
             refreshing_ = false;
             retry_at_ = std::chrono::steady_clock::now() + k_retry_interval;
+            // The batch is quiet: the pool hands over text that does not quote the
+            // statement, which carries the secret.
+            failed(std::string(error));
         },
         /*quiet=*/true);
 }

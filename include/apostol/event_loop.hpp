@@ -78,11 +78,16 @@ public:
     [[nodiscard]] bool modify_io(int fd, uint32_t events);
 
     // Where EventLoop reports what it tolerated instead of throwing. One per
-    // process, for every loop in it; Application sets its log here.
-    // nullptr (the default) — not reported.
+    // process, for every loop in it; Application sets its log here when it is
+    // constructed and clears it when destroyed. nullptr (the default) — not
+    // reported.
     static void set_diagnostics(Logger* logger) noexcept;
     // Clears the setting only if @p logger is the one set.
     static void unset_diagnostics(Logger* logger) noexcept;
+    // The log set above, or nullptr. Also used by framework components that
+    // hold no logger of their own and must still report a failure nobody else
+    // sees (BotSession). Read on the loop's thread; valid until unset.
+    static Logger* diagnostics() noexcept;
 
     // Re-arm a fd registered with APOSTOL_EPOLL_ET (edge-triggered + one-shot)
     // so further events resume being delivered. With @p events==0 (default)

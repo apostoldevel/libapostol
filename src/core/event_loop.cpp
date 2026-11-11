@@ -192,8 +192,9 @@ void EventLoop::add_io(int fd, uint32_t events, IOCallback cb)
 
 namespace
 {
-// Process-wide: every loop of the process reports to the same log. Atomic only
-// for the reader's sake; it is set once, before any loop runs.
+// Process-wide: every loop of the process, and BotSession, report to the same
+// log. Atomic only for the reader's sake; Application sets it before any loop
+// runs, a test may set and clear it between cases.
 std::atomic<Logger*> g_diagnostics{nullptr};
 
 // EPOLL_CTL_MOD failed because the socket a handler was registered for is
@@ -305,6 +306,11 @@ void EventLoop::set_diagnostics(Logger* logger) noexcept
 void EventLoop::unset_diagnostics(Logger* logger) noexcept
 {
     g_diagnostics.compare_exchange_strong(logger, nullptr, std::memory_order_relaxed);
+}
+
+Logger* EventLoop::diagnostics() noexcept
+{
+    return g_diagnostics.load(std::memory_order_relaxed);
 }
 
 bool EventLoop::modify_io(int fd, uint32_t events)

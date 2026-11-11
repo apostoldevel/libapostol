@@ -5,12 +5,62 @@
 #include "apostol/pg.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace apostol
 {
+
+#ifdef WITH_DB_PLATFORM
+
+namespace detail
+{
+
+// ─── SignInReport ────────────────────────────────────────────────────────────
+//
+// When BotSession writes a failed sign-in to the process log. Pure: no log, no
+// clock — the caller passes the time and writes the line this asks for.
+//
+// A failed sign-in is retried every few seconds for as long as it keeps failing,
+// on processes nobody restarts. So each reason is written once per failure
+// streak, then one reminder at most per k_interval, whatever the reason; a
+// streak that alternates between reasons writes each of them once, not on
+// every attempt. The streak ends when a session is obtained.
+class SignInReport
+{
+public:
+    enum class Line
+    {
+        none,      // write nothing
+        reason,    // a reason not yet written in this streak
+        reminder,  // the streak goes on: the count and the last reason
+    };
+
+    Line failed(const std::string& why, std::chrono::steady_clock::time_point now);
+
+    /// A session was obtained. True when it ends a failure streak (write that).
+    bool obtained() noexcept;
+
+    /// Forget the streak without a line — new credentials, a new subject.
+    void reset() noexcept;
+
+    /// Failed attempts in the current streak.
+    std::size_t failures() const noexcept { return failures_; }
+
+    static constexpr auto        k_interval = std::chrono::hours(1);
+    static constexpr std::size_t k_reasons  = 8;
+
+private:
+    std::vector<std::string>              written_;
+    std::chrono::steady_clock::time_point last_line_{};
+    std::size_t                           failures_{0};
+};
+
+} // namespace detail
+
+#endif // WITH_DB_PLATFORM
 
 // ─── BotSession ──────────────────────────────────────────────────────────────
 //
@@ -64,7 +114,18 @@ public:
 
     /// Call from heartbeat(). Refreshes session if expired or not yet obtained.
     /// Mirrors v1: login → get_session → signout(login_session).
+    ///
+    /// An attempt that fails — no credentials set, the batch refused, or lost on
+    /// its way — is written to the process log (EventLoop::diagnostics()) at error
+    /// level under the agent, as detail::SignInReport decides; a session obtained
+    /// after failures, at notice level. Without that line a background component
+    /// that cannot sign in runs, takes no work and says nothing.
     void refresh_if_needed();
+
+    /// Why the last failed attempt obtained no session; empty until one fails and
+    /// again once a session is obtained. An attempt that signed in but found no
+    /// session in any scope does not set it.
+    const std::string& last_error() const noexcept { return last_error_; }
 
     /// Sign out the session obtained by the *login* step. The bot's own sessions are
     /// deliberately left alone: they belong to the donor user, which holds no logout
@@ -108,6 +169,14 @@ private:
     std::chrono::steady_clock::time_point expiry_{};
     std::chrono::steady_clock::time_point retry_at_{};
     bool refreshing_{false};
+
+#ifdef WITH_DB_PLATFORM
+    std::string          last_error_;
+    detail::SignInReport report_;
+
+    void failed(std::string why);
+    void obtained();
+#endif
 
     static constexpr auto k_refresh_interval = std::chrono::hours(24);
     static constexpr auto k_retry_interval   = std::chrono::seconds(10);
