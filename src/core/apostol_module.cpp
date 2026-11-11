@@ -211,12 +211,14 @@ void ApostolModule::cors(const HttpRequest& req, HttpResponse& resp)
     if (origin.empty() || !is_origin_allowed(origin))
         return;
 
-    // Echo the actual origin (never "*") so Credentials work (mirrors v1 CORS())
-    resp.set_header("Access-Control-Allow-Origin",      origin)
-        .set_header("Access-Control-Allow-Methods",     std::string(get_allowed()))
-        .set_header("Access-Control-Allow-Headers",     get_allowed_headers_str())
-        .set_header("Access-Control-Allow-Credentials", "true")
-        .set_header("Vary",                             "Origin");
+    // Echo the actual origin (never "*") so Credentials work (mirrors v1 CORS()).
+    // Carried: a handler that defers answers later with a response of its own,
+    // and the CORS headers belong on that answer as well.
+    resp.set_carried_header("Access-Control-Allow-Origin",      origin)
+        .set_carried_header("Access-Control-Allow-Methods",     std::string(get_allowed()))
+        .set_carried_header("Access-Control-Allow-Headers",     get_allowed_headers_str())
+        .set_carried_header("Access-Control-Allow-Credentials", "true")
+        .set_carried_header("Vary",                             "Origin");
 }
 
 // ─── HTTP utilities (delegate to free functions in http_utils.hpp) ────────────

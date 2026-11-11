@@ -131,6 +131,26 @@ public:
     /// Remove all headers whose name matches @p name (case-sensitive).
     HttpResponse& del_header(std::string_view name);
 
+    /// True if a header named @p name is set (case-insensitive).
+    bool has_header(std::string_view name) const noexcept;
+
+    /// Set a header that belongs to the request rather than to this answer:
+    /// it is set here as set_header() does, and when this response is deferred
+    /// the answer sent later for the same request
+    /// (HttpConnection::send_response() or send_file()) gets it too. The
+    /// carried headers go as one set: an answer that sets any of them itself
+    /// gets none, except `Vary`, whose tokens are merged into the answer's
+    /// own. ApostolModule::cors() uses it, so that a deferred answer carries
+    /// the CORS headers. The value carried is the one this response holds when
+    /// the handler returns: set_header() and del_header() on the name apply.
+    /// Framing headers (Content-Length, Content-Type, Transfer-Encoding,
+    /// Connection) are refused.
+    HttpResponse& set_carried_header(std::string name, std::string value);
+
+    /// The carried headers with the values this response holds now, in the
+    /// order their names were first carried.
+    std::vector<std::pair<std::string, std::string>> carried_headers() const;
+
     HttpResponse& set_body(std::string body, std::string content_type = "text/plain");
 
     /// For HEAD responses: body_ drives Content-Length but is not sent.
@@ -154,7 +174,7 @@ public:
     HttpResponse& set_deferred(bool d = true) noexcept { deferred_ = d; return *this; }
     bool is_deferred() const noexcept { return deferred_; }
 
-    /// Reset to default state (200 OK, no headers, no body).
+    /// Reset to default state (200 OK, no headers, carried ones included, no body).
     HttpResponse& clear();
 
     /// Serialize to a complete HTTP/1.1 response string, including
@@ -165,6 +185,7 @@ private:
     int         status_code_{200};
     std::string status_text_{"OK"};
     std::vector<std::pair<std::string, std::string>> headers_;
+    std::vector<std::string> carried_;   // names, set_carried_header()
     std::string body_;
     bool        suppress_body_{false};
     bool        deferred_{false};
@@ -447,8 +468,21 @@ private:
     std::string   pending_in_;               // read, not yet parsed
     uint32_t      mask_;                     // events last set on the loop
 
+    // The headers a deferred answer carries (HttpResponse::set_carried_header):
+    // read from the dispatcher's response while its handler runs — an answer
+    // may go out from inside it — and kept from it for an answer that comes
+    // later.
+    const HttpResponse* in_dispatch_{nullptr};
+    std::vector<std::pair<std::string, std::string>> carried_;
+
     /// An answer is owed: nothing further may be parsed.
     bool owed() const noexcept { return awaiting_ || file_fd_ >= 0; }
+
+    /// The carried headers due to @p resp when it is the deferred answer to
+    /// the request in work (nullptr: a file, which sets none of them); empty
+    /// otherwise, and empty when @p resp sets any of them itself but `Vary`.
+    /// Called before response_started(), which ends the wait.
+    std::vector<std::pair<std::string, std::string>> carried_for(const HttpResponse* resp) const;
 
     /// Bytes already read wait to be parsed and nothing stops them — except
     /// the write throttle, which waits for the tail to drain.

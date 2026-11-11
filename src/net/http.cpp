@@ -334,6 +334,42 @@ HttpResponse& HttpResponse::del_header(std::string_view name)
     return *this;
 }
 
+bool HttpResponse::has_header(std::string_view name) const noexcept
+{
+    for (const auto& [k, v] : headers_)
+        if (k.size() == name.size() && ::strncasecmp(k.data(), name.data(), name.size()) == 0)
+            return true;
+    return false;
+}
+
+HttpResponse& HttpResponse::set_carried_header(std::string name, std::string value)
+{
+    // A carried header is added to an answer built elsewhere — to the head of
+    // a file among them; one that frames the message would contradict it.
+    for (std::string_view framing : {"Content-Length", "Content-Type", "Transfer-Encoding", "Connection"})
+        if (name.size() == framing.size() && ::strncasecmp(name.data(), framing.data(), name.size()) == 0)
+            return *this;
+
+    if (!header_name_ok(name))
+        return *this;
+
+    set_header(name, std::move(value));
+
+    if (std::find(carried_.begin(), carried_.end(), name) == carried_.end())
+        carried_.push_back(std::move(name));
+    return *this;
+}
+
+std::vector<std::pair<std::string, std::string>> HttpResponse::carried_headers() const
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const auto& name : carried_)
+        for (const auto& kv : headers_)
+            if (kv.first == name)
+                out.push_back(kv);
+    return out;
+}
+
 HttpResponse& HttpResponse::set_body(std::string body, std::string content_type)
 {
     body_ = std::move(body);
@@ -380,6 +416,7 @@ HttpResponse& HttpResponse::clear()
     status_code_   = 200;
     status_text_   = "OK";
     headers_.clear();
+    carried_.clear();
     body_.clear();
     suppress_body_ = false;
     deferred_      = false;
@@ -853,7 +890,18 @@ bool HttpConnection::on_readable(RequestHandler handler)
         // FIN. Set before the handler: a file is sent from inside it.
         if (!req.keep_alive())
             close_after_send_ = true;
-        handler(req, resp);
+        // The headers a deferred answer carries are this request's: none from
+        // the one before, and read from resp while the handler runs, since a
+        // deferred answer (a file) may go out from inside it.
+        carried_.clear();
+        {
+            in_dispatch_ = &resp;
+            struct InDispatchGuard {
+                const HttpResponse*& ptr;
+                ~InDispatchGuard() { ptr = nullptr; }
+            } in_dispatch_guard{in_dispatch_};
+            handler(req, resp);
+        }
         // A WebSocket handshake the handler did not take (release_tcp() sets
         // closed_) was refused — 401, 403, 400, now or deferred. Its client
         // waits for 101 or for the close, never sends another request, and
@@ -870,8 +918,10 @@ bool HttpConnection::on_readable(RequestHandler handler)
         // or if the handler marked it as deferred (async PG response)
         if (!closed_ && !resp.is_deferred())
             send_response(resp);
-        if (resp.is_deferred() && !answered_in_dispatch_)
+        if (resp.is_deferred() && !answered_in_dispatch_) {
             awaiting_ = true;
+            carried_  = resp.carried_headers();
+        }
         if (!req.keep_alive() || ws_refused || draining_) {
             close_after_send_ = true;
             stop_reading_     = true;   // RFC 9112 §9.6: nothing after it is processed
@@ -1073,6 +1123,7 @@ void HttpConnection::response_started() noexcept
         return;
     }
     awaiting_ = false;
+    carried_.clear();   // the wait they were for is over
 }
 
 void HttpConnection::after_response()
@@ -1096,20 +1147,99 @@ void HttpConnection::after_response()
     update_interest();
 }
 
+std::vector<std::pair<std::string, std::string>>
+HttpConnection::carried_for(const HttpResponse* resp) const
+{
+    // In a dispatch, an answer other than the dispatcher's own response is
+    // the deferred one going out from inside the handler; outside it, the
+    // deferred one arriving. Anything else (the immediate answer, which has
+    // the headers itself, or a stray one) carries nothing.
+    std::vector<std::pair<std::string, std::string>> due;
+    if (dispatching_) {
+        if (in_dispatch_ && resp != in_dispatch_)
+            due = in_dispatch_->carried_headers();
+    } else if (awaiting_) {
+        due = carried_;
+    }
+
+    // One set: an answer that sets any of them itself (Vary aside) has a policy
+    // of its own — a relayed answer's CORS — and keeps it whole. Half of each
+    // would make a pair that says neither, `*` with credentials among them.
+    if (resp)
+        for (const auto& [name, value] : due)
+            if (::strcasecmp(name.c_str(), "Vary") != 0 && resp->has_header(name))
+                return {};
+    return due;
+}
+
+// Adds the tokens of @p tokens missing from the answer's own Vary (RFC 9110
+// §12.5.5): the answer varies by what it varied by, and by what the carried
+// headers vary by.
+static void merge_vary(HttpResponse& resp, const std::string& tokens)
+{
+    const auto has_token = [](std::string_view list, std::string_view token) {
+        while (!list.empty()) {
+            const auto comma = list.find(',');
+            auto item = list.substr(0, comma);
+            while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) item.remove_prefix(1);
+            while (!item.empty() && (item.back() == ' ' || item.back() == '\t')) item.remove_suffix(1);
+            if (item == "*" ||
+                (item.size() == token.size() && ::strncasecmp(item.data(), token.data(), token.size()) == 0))
+                return true;
+            if (comma == std::string_view::npos) break;
+            list.remove_prefix(comma + 1);
+        }
+        return false;
+    };
+
+    for (const auto& [name, value] : resp.headers()) {
+        if (::strcasecmp(name.c_str(), "Vary") != 0)
+            continue;
+        std::string merged = value;
+        std::string_view rest = tokens;
+        while (!rest.empty()) {
+            const auto comma = rest.find(',');
+            auto token = rest.substr(0, comma);
+            while (!token.empty() && token.front() == ' ') token.remove_prefix(1);
+            while (!token.empty() && token.back() == ' ') token.remove_suffix(1);
+            if (!token.empty() && !has_token(merged, token))
+                merged += fmt::format(", {}", token);
+            if (comma == std::string_view::npos) break;
+            rest.remove_prefix(comma + 1);
+        }
+        const std::string vary_name = name;   // set_header() replaces this entry
+        resp.set_header(vary_name, std::move(merged));
+        return;
+    }
+}
+
 void HttpConnection::send_response(const HttpResponse& resp)
 {
     // Closed first: a late answer on a dead connection is not a stray one.
     if (closed_) return;
 
+    // Before response_started(): it ends the wait the carried headers are for.
+    auto carried = carried_for(&resp);
+
     response_started();
 
     // The last answer on the connection says so, deferred ones included, not
     // only by closing: the request asked to close, or the process stops
-    // (stop_keep_alive). Copied only then: the copy carries the body.
+    // (stop_keep_alive). A deferred answer gets the headers its request
+    // carries (set_carried_header). Copied only then: the copy carries the body.
     std::string data;
-    if ((draining_ || close_after_send_) && !says_close(resp)) {
+    const bool add_close = (draining_ || close_after_send_) && !says_close(resp);
+    if (add_close || !carried.empty()) {
         HttpResponse last = resp;
-        data = last.set_close(true).serialize();
+        for (auto& [name, value] : carried) {
+            if (::strcasecmp(name.c_str(), "Vary") == 0 && last.has_header(name))
+                merge_vary(last, value);
+            else
+                last.add_header(std::move(name), std::move(value));
+        }
+        if (add_close)
+            last.set_close(true);
+        data = last.serialize();
     } else {
         data = resp.serialize();
     }
@@ -1180,6 +1310,13 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
 
     auto file_size = static_cast<std::size_t>(st.st_size);
 
+    // The headers the request carries (set_carried_header), read before
+    // response_started() ends the wait they are for. Their values went
+    // through header_safe() when they were set.
+    std::string carried;
+    for (const auto& [name, value] : carried_for(nullptr))
+        carried += fmt::format("{}: {}\r\n", name, value);
+
     // The answer is going out from here on. The refusals above went through
     // send_response(), which counts them itself.
     response_started();
@@ -1190,8 +1327,9 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
         "Content-Type: {}\r\n"
         "Content-Length: {}\r\n"
         "{}"
+        "{}"
         "\r\n",
-        mime_type, file_size, (draining_ || close_after_send_) ? "Connection: close\r\n" : "");
+        mime_type, file_size, carried, (draining_ || close_after_send_) ? "Connection: close\r\n" : "");
 
     // If there are already pending writes, append headers and queue file
     if (write_pos_ < write_buf_.size() || file_fd_ >= 0) {
