@@ -12,6 +12,16 @@ namespace apostol
 void exec_sql(PgPool& pool, const HttpRequest& req, HttpResponse& resp,
               std::string sql, PgResultHandler on_result, bool quiet)
 {
+    // A NUL byte cannot be sent: libpq takes the statement as a C string and
+    // would send only what comes before it, and no text value can hold one.
+    // The statement is built from the request, so the request is refused,
+    // before the database sees any of it.
+    if (sql.find('\0') != std::string::npos) {
+        reply_error(resp, HttpStatus::bad_request,
+                    "the request contains a NUL byte");
+        return;
+    }
+
     resp.set_deferred(true);
 
     auto conn = std::static_pointer_cast<HttpConnection>(req.connection_ctx);

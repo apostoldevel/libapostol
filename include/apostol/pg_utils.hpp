@@ -50,6 +50,10 @@ void reply_sql(HttpResponse&                resp,
 
 /// SQL-escape a string literal without PGconn* (manual E'...' escaping).
 /// Mirrors v1 PQQuoteLiteral().
+///
+/// A NUL byte is copied as it is: no text value can hold one, and a statement
+/// is sent as a C string, so it would end there. Whoever sends the statement
+/// does not send it with one: exec_sql() answers 400 instead.
 std::string pq_quote_literal(std::string_view val);
 
 /// SQL-quote an identifier without PGconn*: wrap in double quotes, double
