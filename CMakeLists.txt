@@ -97,6 +97,7 @@ add_library(apostol STATIC
     src/core/process.cpp
     src/core/module.cpp
     src/core/apostol_module.cpp
+    src/core/debug_mask.cpp
     src/core/application.cpp
     src/core/crash_handler.cpp
     src/core/settings.cpp

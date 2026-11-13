@@ -105,3 +105,10 @@ add_executable(path_under_root_test path_under_root_test.cpp)
 target_link_libraries(path_under_root_test PRIVATE apostol)
 target_compile_options(path_under_root_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME path_under_root COMMAND path_under_root_test)
+
+# debug_mask_test — masking of the _DEBUG request/response dump, in this
+# process: what is not recognised is not written; credentials masked by name.
+add_executable(debug_mask_test debug_mask_test.cpp)
+target_link_libraries(debug_mask_test PRIVATE apostol)
+target_compile_options(debug_mask_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME debug_mask COMMAND debug_mask_test)
