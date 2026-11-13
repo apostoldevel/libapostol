@@ -1,9 +1,9 @@
 // metrics_test — the metrics of a node, collected over the channels between its
 // processes.
 //
-// First the text itself, in this process: escaping, number formatting, and
-// merge_metrics() grouping the samples of one family from several texts under
-// one HELP and TYPE.
+// First the text itself, in this process: escaping, number formatting, a
+// histogram and the input it refuses, and merge_metrics() grouping the
+// samples of one family from several texts under one HELP and TYPE.
 //
 // Then an application: a master with two workers, the helper and a custom
 // process "probe" that drives the scenario and writes its verdict into
@@ -41,6 +41,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -50,6 +51,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -191,6 +193,144 @@ std::string check_text()
         const auto got = merge_metrics({a, b});
         if (got != want)
             return "merge_metrics:\n" + got + "--- want:\n" + want;
+    }
+    {
+        // A histogram: cumulative buckets, "+Inf" and _count the total of the
+        // buckets (one observation above the last bound), le the last label;
+        // a second series of the same family under the one TYPE.
+        const std::vector<double> bounds{0.1, 1, 2.5};
+        MetricsText m("x", {{"role", "w"}});
+        m.histogram("d_seconds", "D.", bounds, std::vector<std::uint64_t>{2, 0, 3, 1}, 7.25,
+                    {{"r", "a\"b"}});
+        m.histogram("d_seconds", "ignored", bounds, std::vector<std::uint64_t>{1, 1, 0, 0}, 0.6);
+        const std::string want =
+            "# HELP x_d_seconds D.\n"
+            "# TYPE x_d_seconds histogram\n"
+            "x_d_seconds_bucket{role=\"w\",r=\"a\\\"b\",le=\"0.1\"} 2\n"
+            "x_d_seconds_bucket{role=\"w\",r=\"a\\\"b\",le=\"1\"} 2\n"
+            "x_d_seconds_bucket{role=\"w\",r=\"a\\\"b\",le=\"2.5\"} 5\n"
+            "x_d_seconds_bucket{role=\"w\",r=\"a\\\"b\",le=\"+Inf\"} 6\n"
+            "x_d_seconds_sum{role=\"w\",r=\"a\\\"b\"} 7.25\n"
+            "x_d_seconds_count{role=\"w\",r=\"a\\\"b\"} 6\n"
+            "x_d_seconds_bucket{role=\"w\",le=\"0.1\"} 1\n"
+            "x_d_seconds_bucket{role=\"w\",le=\"1\"} 2\n"
+            "x_d_seconds_bucket{role=\"w\",le=\"2.5\"} 2\n"
+            "x_d_seconds_bucket{role=\"w\",le=\"+Inf\"} 2\n"
+            "x_d_seconds_sum{role=\"w\"} 0.6\n"
+            "x_d_seconds_count{role=\"w\"} 2\n";
+        if (m.str() != want)
+            return "histogram:\n" + m.str() + "--- want:\n" + want;
+
+        // No labels: no braces on _sum and _count. The bounds as the shortest
+        // form writes them — a negative one, zero, an exponent — and a sum
+        // that is not a number; no bounds at all is "+Inf" alone.
+        MetricsText bare("");
+        bare.histogram("h", "", std::vector<double>{-1, 0, 1e-05, 1e+16},
+                       std::vector<std::uint64_t>{1, 0, 2, 0, 0}, std::nan(""));
+        bare.histogram("e", "", {}, std::vector<std::uint64_t>{3}, 1.5);
+        const std::string want_bare = "# TYPE h histogram\n"
+                                      "h_bucket{le=\"-1\"} 1\nh_bucket{le=\"0\"} 1\n"
+                                      "h_bucket{le=\"1e-05\"} 3\nh_bucket{le=\"1e+16\"} 3\n"
+                                      "h_bucket{le=\"+Inf\"} 3\nh_sum NaN\nh_count 3\n"
+                                      "# TYPE e histogram\n"
+                                      "e_bucket{le=\"+Inf\"} 3\ne_sum 1.5\ne_count 3\n";
+        if (bare.str() != want_bare)
+            return "histogram, no labels:\n" + bare.str() + "--- want:\n" + want_bare;
+
+        // The texts of two processes merge under one HELP and TYPE.
+        MetricsText p1("x", {{"worker", "1"}});
+        MetricsText p2("x", {{"worker", "2"}});
+        // Fixed arrays, as a caller keeps its counters, pass as they are.
+        static constexpr std::array<double, 1>   one{1};
+        const std::array<std::uint64_t, 2>       first{1, 0};
+        const std::array<std::uint64_t, 2>       second{0, 1};
+        p1.histogram("d_seconds", "D.", one, first, 0.5);
+        p2.histogram("d_seconds", "D.", one, second, 3);
+        const auto merged = merge_metrics({p1.str(), p2.str()});
+        const std::string want_merged = "# HELP x_d_seconds D.\n"
+                                        "# TYPE x_d_seconds histogram\n"
+                                        "x_d_seconds_bucket{worker=\"1\",le=\"1\"} 1\n"
+                                        "x_d_seconds_bucket{worker=\"1\",le=\"+Inf\"} 1\n"
+                                        "x_d_seconds_sum{worker=\"1\"} 0.5\n"
+                                        "x_d_seconds_count{worker=\"1\"} 1\n"
+                                        "x_d_seconds_bucket{worker=\"2\",le=\"1\"} 0\n"
+                                        "x_d_seconds_bucket{worker=\"2\",le=\"+Inf\"} 1\n"
+                                        "x_d_seconds_sum{worker=\"2\"} 3\n"
+                                        "x_d_seconds_count{worker=\"2\"} 1\n";
+        if (merged != want_merged)
+            return "histogram merged:\n" + merged + "--- want:\n" + want_merged;
+    }
+    {
+        // A refused call throws for its own reason and leaves the text as it
+        // was: a valid call after it writes what it writes on a fresh text.
+        using Call = std::function<void(MetricsText&)>;
+        const std::vector<double>        b12{1, 2};
+        const std::vector<std::uint64_t> c3{0, 0, 0};
+        auto h = [&](std::string_view name, std::vector<double> b, std::vector<std::uint64_t> c,
+                     MetricLabels l = {}) -> Call {
+            return [=](MetricsText& m) { m.histogram(name, "", b, c, 0, l); };
+        };
+        struct Bad
+        {
+            std::string what;
+            std::string reason;   // a part of the message
+            Call        call;
+            MetricLabels common = {};
+        };
+        const std::vector<Bad> bad = {
+            {"buckets = bounds", "want 3 buckets", h("h", {1, 2}, {0, 0})},
+            {"bounds decrease", "do not increase at 1", h("h", {2, 1}, c3)},
+            {"bounds equal", "do not increase at 1", h("h", {1, 1}, c3)},
+            {"bound infinite", "bound 1 is not finite", h("h", {1, INFINITY}, c3)},
+            {"bound NaN", "bound 0 is not finite", h("h", {std::nan("")}, {0, 0})},
+            {"label le", "a label is named", h("h", {1}, {0, 0}, {{"le", "1"}})},
+            {"common label le", "a common label", h("h", {1}, {0, 0}), {{"le", "1"}}},
+            {"declared as a gauge", "declared as a gauge", h("g", {1}, {0, 0})},
+            {"name of a gauge's sample", "x_g_count is declared", h("g", {1}, {0, 0})},
+            {"a sample of a histogram", "a sample of the histogram x_k", h("k_sum", {1}, {0, 0})},
+            {"gauge on a histogram", "belongs to the histogram x_k",
+             [](MetricsText& m) { m.gauge("k", "", 1); }},
+            {"counter on its sample", "belongs to the histogram x_k",
+             [](MetricsText& m) { m.counter("k_count", "", 1); }},
+        };
+        auto fill = [&](MetricsText& m, const std::string& what) {
+            if (what == "name of a gauge's sample")
+                m.gauge("g_count", "", 1);
+            else
+                m.gauge("g", "", 1);
+            m.histogram("k", "", b12, c3, 0);
+        };
+        auto valid = [&](MetricsText& m) {
+            m.histogram("v", "", b12, std::vector<std::uint64_t>{1, 2, 3}, 4);
+        };
+        for (const auto& [what, reason, call, common] : bad) {
+            MetricsText m("x", common);
+            MetricsText clean("x", common);
+            if (common.empty()) {
+                fill(m, what);
+                fill(clean, what);
+            }
+            const auto before = m.str();
+            std::string message;
+            try {
+                call(m);
+            } catch (const std::invalid_argument& e) {
+                message = e.what();
+            }
+            if (message.empty())
+                return "refused " + what + ": accepted\n" + m.str();
+            if (message.find(reason) == std::string::npos)
+                return "refused " + what + ": another reason: " + message;
+            if (m.str() != before)
+                return "refused " + what + ": the text changed\n" + m.str();
+            if (common.empty()) {
+                valid(m);
+                valid(clean);
+                if (m.str() != clean.str())
+                    return "refused " + what + ": a later call differs\n" + m.str()
+                         + "--- want:\n" + clean.str();
+            }
+        }
     }
     return {};
 }

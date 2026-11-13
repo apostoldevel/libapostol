@@ -3,6 +3,8 @@
 #include <fmt/format.h>
 
 #include <cmath>
+#include <iterator>
+#include <stdexcept>
 
 namespace apostol
 {
@@ -47,6 +49,14 @@ void append_labels(std::string& out, const MetricLabels& labels)
     }
 }
 
+// "{a=\"1\"}" — nothing for an empty set.
+std::string braced(const std::string& set)
+{
+    return set.empty() ? std::string() : fmt::format("{{{}}}", set);
+}
+
+constexpr std::string_view k_histogram_suffixes[] = {"_bucket", "_sum", "_count"};
+
 std::string_view sample_name(std::string_view line)
 {
     const auto end = line.find_first_of("{ ");
@@ -76,6 +86,9 @@ MetricsText::MetricsText(std::string prefix, MetricLabels common)
     : prefix_(std::move(prefix))
 {
     append_labels(common_, common);
+    for (const auto& [k, v] : common)
+        if (k == "le")
+            common_le_ = true;
 }
 
 void MetricsText::gauge(std::string_view name, std::string_view help, double value,
@@ -90,10 +103,100 @@ void MetricsText::counter(std::string_view name, std::string_view help, double v
     add("counter", name, help, value, labels);
 }
 
+std::string MetricsText::full_name(std::string_view name) const
+{
+    return prefix_.empty() ? std::string(name) : fmt::format("{}_{}", prefix_, name);
+}
+
+std::string MetricsText::label_set(const MetricLabels& labels) const
+{
+    std::string set = common_;
+    append_labels(set, labels);
+    return set;
+}
+
+const std::string* MetricsText::histogram_of(const std::string& full) const
+{
+    if (auto it = families_.find(full); it != families_.end())
+        return it->second.type == "histogram" ? &it->first : nullptr;
+    for (std::string_view suffix : k_histogram_suffixes) {
+        if (full.size() > suffix.size() && full.ends_with(suffix)) {
+            auto it = families_.find(full.substr(0, full.size() - suffix.size()));
+            if (it != families_.end() && it->second.type == "histogram")
+                return &it->first;
+        }
+    }
+    return nullptr;
+}
+
+void MetricsText::histogram(std::string_view name, std::string_view help,
+                            std::span<const double> bounds,
+                            std::span<const std::uint64_t> buckets, double sum,
+                            const MetricLabels& labels)
+{
+    std::string full = full_name(name);
+
+    auto refuse = [&full](std::string_view why) {
+        throw std::invalid_argument(fmt::format("histogram {}: {}", full, why));
+    };
+
+    if (buckets.size() != bounds.size() + 1)
+        refuse(fmt::format("{} bounds want {} buckets, not {}", bounds.size(), bounds.size() + 1,
+                           buckets.size()));
+    for (std::size_t i = 0; i < bounds.size(); ++i) {
+        if (!std::isfinite(bounds[i]))
+            refuse(fmt::format("bound {} is not finite", i));
+        if (i > 0 && !(bounds[i - 1] < bounds[i]))
+            refuse(fmt::format("the bounds do not increase at {}", i));
+    }
+    if (common_le_)
+        refuse("a common label is named \"le\"");
+    for (const auto& [k, v] : labels)
+        if (k == "le")
+            refuse("a label is named \"le\"");
+    if (auto it = families_.find(full); it != families_.end() && it->second.type != "histogram")
+        refuse(fmt::format("the name is declared as a {}", it->second.type));
+    if (auto h = histogram_of(full); h != nullptr && *h != full)
+        refuse(fmt::format("the name is a sample of the histogram {}", *h));
+    for (std::string_view suffix : k_histogram_suffixes)
+        if (families_.contains(full + std::string(suffix)))
+            refuse(fmt::format("{}{} is declared", full, suffix));
+
+    // The lines are built aside and appended at once: a throw on the way
+    // leaves no half of a series in the text.
+    const std::string set = label_set(labels);
+    const std::string le  = set.empty() ? "le" : set + ",le";
+
+    std::vector<std::string> lines;
+    lines.reserve(buckets.size() + 2);
+    std::uint64_t cumulative = 0;
+    for (std::size_t i = 0; i < buckets.size(); ++i) {
+        cumulative += buckets[i];
+        const std::string bound = i < bounds.size() ? format_value(bounds[i]) : "+Inf";
+        lines.push_back(fmt::format("{}_bucket{{{}=\"{}\"}} {}", full, le, bound, cumulative));
+    }
+    lines.push_back(fmt::format("{}_sum{} {}", full, braced(set), format_value(sum)));
+    lines.push_back(fmt::format("{}_count{} {}", full, braced(set), cumulative));
+
+    auto [it, fresh] = families_.try_emplace(full);
+    if (fresh) {
+        it->second.type = "histogram";
+        it->second.help = std::string(help);
+        order_.push_back(full);
+    }
+    auto& samples = it->second.samples;
+    samples.reserve(samples.size() + lines.size());
+    std::move(lines.begin(), lines.end(), std::back_inserter(samples));
+}
+
 void MetricsText::add(std::string_view type, std::string_view name, std::string_view help,
                       double value, const MetricLabels& labels)
 {
-    std::string full = prefix_.empty() ? std::string(name) : fmt::format("{}_{}", prefix_, name);
+    std::string full = full_name(name);
+
+    if (auto h = histogram_of(full); h != nullptr)
+        throw std::invalid_argument(fmt::format(
+            "{} {}: the name belongs to the histogram {}", type, full, *h));
 
     auto [it, fresh] = families_.try_emplace(full);
     if (fresh) {
@@ -102,18 +205,8 @@ void MetricsText::add(std::string_view type, std::string_view name, std::string_
         order_.push_back(full);
     }
 
-    std::string set = common_;
-    append_labels(set, labels);
-
-    std::string line = full;
-    if (!set.empty()) {
-        line += '{';
-        line += set;
-        line += '}';
-    }
-    line += ' ';
-    line += format_value(value);
-    it->second.samples.push_back(std::move(line));
+    it->second.samples.push_back(
+        fmt::format("{}{} {}", full, braced(label_set(labels)), format_value(value)));
 }
 
 std::string MetricsText::str() const
