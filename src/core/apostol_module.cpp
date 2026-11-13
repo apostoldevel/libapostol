@@ -5,6 +5,8 @@
 #include "apostol/pg_utils.hpp"
 #endif
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <fmt/format.h>
 #include <fstream>
@@ -31,6 +33,157 @@ static void debug_write(std::string_view s)
     }
 }
 
+// The dump below goes to stderr, which a container runtime keeps in its log.
+// Credentials are masked in it: header values that carry them, and the values
+// of parameters whose names say they are secret, in the query string and in a
+// form or JSON body. The names are a heuristic; the rest is written as is.
+
+static constexpr std::string_view k_masked = "<masked>";
+
+static std::string lower(std::string_view s)
+{
+    std::string out(s);
+    std::transform(out.begin(), out.end(), out.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return out;
+}
+
+/// A parameter or header name whose value is a credential.
+static bool secret_name(std::string_view name)
+{
+    const auto n = lower(name);
+    if (n == "token_type" || n == "token_type_hint")
+        return false;
+    for (std::string_view part : {"password", "passwd", "secret", "token", "credential",
+                                  "api_key", "api-key", "apikey"})
+        if (n.find(part) != std::string::npos)
+            return true;
+    for (std::string_view whole : {"assertion", "code", "code_verifier", "ticket", "session",
+                                   "pwd", "otp", "pin", "authorization",
+                                   "proxy-authorization", "cookie", "set-cookie"})
+        if (n == whole)
+            return true;
+    return false;
+}
+
+/// Bodies nested deeper than this are not parsed for masking: both the
+/// masking and the dump recurse.
+static constexpr int k_mask_depth = 64;
+
+/// "a=1&password=x" → "a=1&password=<masked>".
+static std::string mask_form(std::string_view s)
+{
+    std::string out;
+    out.reserve(s.size());
+    while (true) {
+        auto amp = s.find('&');
+        auto part = s.substr(0, amp);
+        auto eq = part.find('=');
+        if (eq != std::string_view::npos && secret_name(url_decode(part.substr(0, eq)))) {
+            out.append(part.substr(0, eq + 1));
+            out.append(k_masked);
+        } else {
+            out.append(part);
+        }
+        if (amp == std::string_view::npos)
+            break;
+        out += '&';
+        s.remove_prefix(amp + 1);
+    }
+    return out;
+}
+
+static void mask_json(nlohmann::json& j)
+{
+    if (j.is_object()) {
+        for (auto& [k, v] : j.items()) {
+            // An error envelope's numeric "code" is a status, not a credential.
+            if (secret_name(k) && !v.is_null() && !(k == "code" && v.is_number()))
+                v = std::string(k_masked);
+            else
+                mask_json(v);
+        }
+    } else if (j.is_array()) {
+        for (auto& v : j)
+            mask_json(v);
+    }
+}
+
+/// A JSON body is masked by name at any depth; anything else is read as a form.
+static std::string mask_body(std::string_view body)
+{
+    bool too_deep = false;
+    nlohmann::json::parser_callback_t depth_cb =
+        [&too_deep](int depth, nlohmann::json::parse_event_t, nlohmann::json&) {
+            if (depth > k_mask_depth)
+                too_deep = true;
+            return !too_deep;
+        };
+    auto j = nlohmann::json::parse(body, depth_cb, /*allow_exceptions=*/false);
+    if (too_deep)
+        return fmt::format("{} ({} bytes, nested too deep to mask)", k_masked, body.size());
+    if (!j.is_discarded() && j.is_structured()) {
+        mask_json(j);
+        return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    }
+    return mask_form(body);
+}
+
+/// The value of a header that carries a credential: the scheme of an
+/// Authorization header stays, a cookie keeps its name.
+static std::string mask_header(std::string_view name, std::string_view value)
+{
+    const auto n = lower(name);
+    if (n == "authorization" || n == "proxy-authorization") {
+        auto sp = value.find(' ');
+        return sp == std::string_view::npos
+            ? std::string(k_masked)
+            : fmt::format("{} {}", value.substr(0, sp), k_masked);
+    }
+    // A URL may carry a code or a token in its query or fragment.
+    if (n == "referer" || n == "location" || n == "content-location"
+        || n == "x-original-uri" || n == "x-forwarded-uri") {
+        auto q = value.find_first_of("?#");
+        if (q == std::string_view::npos)
+            return std::string(value);
+        std::string out(value.substr(0, q + 1));
+        auto rest = value.substr(q + 1);
+        auto hash = rest.find('#');
+        out += mask_form(rest.substr(0, hash));
+        if (hash != std::string_view::npos)
+            out += '#' + mask_form(rest.substr(hash + 1));
+        return out;
+    }
+    if (n == "cookie") {
+        std::string out;
+        std::string_view rest = value;
+        while (!rest.empty()) {
+            auto semi = rest.find(';');
+            auto part = rest.substr(0, semi);
+            auto eq = part.find('=');
+            if (!out.empty())
+                out += ';';
+            if (eq != std::string_view::npos)
+                out.append(part.substr(0, eq + 1));
+            out.append(k_masked);
+            if (semi == std::string_view::npos)
+                break;
+            rest.remove_prefix(semi + 1);
+        }
+        return out;
+    }
+    if (n == "set-cookie") {
+        auto eq = value.find('=');
+        if (eq == std::string_view::npos)
+            return std::string(k_masked);
+        auto semi = value.find(';', eq);
+        return fmt::format("{}{}{}", value.substr(0, eq + 1), k_masked,
+                           semi == std::string_view::npos ? std::string_view{}
+                                                          : value.substr(semi));
+    }
+    return secret_name(name) ? std::string(k_masked) : std::string(value);
+}
+
 /// Mirrors v1 DebugRequest(): dump [ip:port] [fd] + request-line, headers, body.
 static void debug_request(const HttpRequest& req)
 {
@@ -43,15 +196,17 @@ static void debug_request(const HttpRequest& req)
         fprintf(stderr, "[%p] [%s:%d] [%d] Request:\n%s %s?%s %s\n",
                 static_cast<const void*>(&req),
                 req.peer_ip.c_str(), req.peer_port, req.socket_fd,
-                req.method.c_str(), req.path.c_str(), req.query.c_str(), req.version.c_str());
+                req.method.c_str(), req.path.c_str(), mask_form(req.query).c_str(),
+                req.version.c_str());
 
     for (const auto& [k, v] : req.headers)
-        fprintf(stderr, "%s: %s\n", k.c_str(), v.c_str());
+        fprintf(stderr, "%s: %s\n", k.c_str(), mask_header(k, v).c_str());
 
     if (!req.body.empty()) {
+        const auto body = mask_body(req.body);
         fputc('\n', stderr);
-        debug_write(req.body);
-        if (req.body.size() <= k_debug_max)
+        debug_write(body);
+        if (body.size() <= k_debug_max)
             fputc('\n', stderr);
     }
 
@@ -62,6 +217,42 @@ static void debug_request(const HttpRequest& req)
 static void debug_response(const HttpRequest& req, const HttpResponse& resp)
 {
     std::string s = resp.serialize();
+
+    // Mask header values and the body as debug_request() does: the head is
+    // rebuilt line by line, the body follows the first empty line.
+    {
+        const auto head_end = s.find("\r\n\r\n");
+        if (head_end != std::string::npos) {
+            std::string out;
+            std::string_view head(s.data(), head_end);
+            auto eol = head.find("\r\n");
+            out.append(head.substr(0, eol));            // status line
+            while (eol != std::string_view::npos) {
+                head.remove_prefix(eol + 2);
+                eol = head.find("\r\n");
+                auto line = head.substr(0, eol);
+                auto colon = line.find(':');
+                out += "\r\n";
+                if (colon == std::string_view::npos) {
+                    out.append(line);
+                } else {
+                    auto value = line.substr(colon + 1);
+                    while (!value.empty() && value.front() == ' ')
+                        value.remove_prefix(1);
+                    out.append(line.substr(0, colon + 1));
+                    out += ' ';
+                    out.append(mask_header(line.substr(0, colon), value));
+                }
+            }
+            out += "\r\n\r\n";
+            std::string_view body(s.data() + head_end + 4, s.size() - head_end - 4);
+            if (!body.empty())
+                out.append(mask_body(body));
+            s = std::move(out);
+        } else {
+            s = fmt::format("{} ({} bytes, not masked)\n", k_masked, s.size());
+        }
+    }
 
     // Replace CRLF → LF for clean terminal output
     for (std::size_t i = 0; i + 1 < s.size(); ) {
