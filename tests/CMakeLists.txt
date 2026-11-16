@@ -112,3 +112,12 @@ add_executable(debug_mask_test debug_mask_test.cpp)
 target_link_libraries(debug_mask_test PRIVATE apostol)
 target_compile_options(debug_mask_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME debug_mask COMMAND debug_mask_test)
+
+# pg_nul_test — a statement with a NUL byte is refused by PgPool::execute() and
+# listener_execute() from the loop, never sent; no database (a pool whose server
+# does not exist), the same calls without the byte as the control.
+add_executable(pg_nul_test pg_nul_test.cpp)
+target_link_libraries(pg_nul_test PRIVATE apostol)
+target_compile_options(pg_nul_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME pg_nul COMMAND pg_nul_test)
+set_tests_properties(pg_nul PROPERTIES TIMEOUT 30)

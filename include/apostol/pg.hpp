@@ -572,11 +572,20 @@ public:
 
     using QueryId = uint64_t;
 
+    /// The error text of a statement refused for a NUL byte (execute(),
+    /// listener_execute()). Constant, so that a caller can tell it from a
+    /// server error and answer accordingly.
+    static constexpr std::string_view nul_refusal = "the statement contains a NUL byte";
+
     /// Schedule a query. Calls on_result when done, on_error on failure.
     /// Set quiet=true to suppress Query/ResultStatus logging (e.g. heartbeat).
     /// Returns a QueryId that can be passed to cancel().
     /// `retry` — what happens if the connection is lost once the query has gone
     /// out: see PgRetry. The default is not to send it again.
+    /// A statement holding a NUL byte is never sent — libpq takes it as a C
+    /// string and the server would get only what precedes the byte: the call
+    /// fails with nul_refusal, from the loop (never from inside execute()),
+    /// as a query lost with its connection does. It opens no connection.
     QueryId execute(std::string              sql,
                     PgQuery::ResultHandler    on_result,
                     PgQuery::ExceptionHandler on_exception = {},
@@ -676,7 +685,9 @@ public:
     /// not repeated: the
     /// statement in flight when the listener is lost is failed as one lost with
     /// its connection, from the loop; the ones still waiting go out on the next
-    /// listener. After detach() its handlers are not called.
+    /// listener. After detach() its handlers are not called. A statement
+    /// holding a NUL byte is never sent and fails as with execute()
+    /// (nul_refusal); it starts no listener.
     ///
     /// @p answer_within > 0: with no answer by then the listener is given up as
     /// dead and replaced. The time runs from the send, and while the statement
@@ -812,8 +823,13 @@ private:
     /// to lost_ to be failed from the loop.
     void fail_inflight_query(PgConnection& conn, std::string_view reason);
 
-    /// Tell the callers in lost_ — from the loop, on a clean stack.
+    /// Tell the callers in lost_ — from the loop, on a clean stack. Only the
+    /// entries there when it starts: one a handler adds waits for the timer.
     void deliver_lost();
+
+    /// A statement holding a NUL byte: moved to lost_ to fail with
+    /// nul_refusal from the loop, and true. False — @p q is left as it was.
+    bool refuse_nul(std::unique_ptr<PgQuery>& q);
 
     /// Arm the timer that runs deliver_lost(), if lost_ holds anything and it
     /// is not armed. Refused by the loop, it is logged; heartbeat() asks again.

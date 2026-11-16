@@ -1598,14 +1598,17 @@ PgPool::QueryId PgPool::execute(std::string              sql,
                                 bool                      quiet,
                                 PgRetry                   retry)
 {
-    used_ = true;
-
     auto q = std::make_unique<PgQuery>(std::move(sql), quiet);
     q->on_result(std::move(on_result));
     q->on_exception(std::move(on_exception));
     q->set_retry(retry);
 
     auto qid = q->id();
+
+    if (refuse_nul(q))
+        return qid;
+
+    used_ = true;
 
     // Find a ready connection (mirrors v1 GetReadyConnection). One past its
     // lifetime comes after the others, and the one being retired after all:
@@ -2218,10 +2221,22 @@ void PgPool::arm_lost_delivery() noexcept
 void PgPool::deliver_lost()
 {
     // One at a time, taken out of lost_ just before its handler runs, so that a
-    // cancel() or detach() from a handler still reaches the entries after it. A
-    // loss is never appended synchronously from a handler (execute() re-queues a
-    // query it could not send), so the loop ends.
-    while (!lost_.empty()) {
+    // cancel() or detach() from a handler still reaches the entries after it.
+    // Only as many as are there now: a handler may add one (a statement
+    // execute() refuses for a NUL byte), and a handler that sends the same
+    // statement again on every failure would keep this loop going forever.
+    // What it adds is delivered by the timer it arms, on the next turn — so
+    // such a handler still runs once per turn until it stops resending, or
+    // until detach() silences it.
+    // A handler that throws leaves the rest here with no timer (the one that
+    // ran this is spent): re-armed on the way out, whichever way that is.
+    struct Rearm
+    {
+        PgPool& pool;
+        ~Rearm() { pool.arm_lost_delivery(); }
+    } rearm{*this};
+
+    for (std::size_t n = lost_.size(); n > 0 && !lost_.empty(); --n) {
         Lost l = std::move(lost_.front());
         lost_.erase(lost_.begin());
 
@@ -2240,6 +2255,34 @@ void PgPool::deliver_lost()
             l.query->deliver(std::move(results));
         }
     }
+}
+
+bool PgPool::refuse_nul(std::unique_ptr<PgQuery>& q)
+{
+    // PQsendQuery() takes a C string: the server would get the statement cut
+    // at the byte. Whatever it is, the cut one is not what the caller meant.
+    if (q->sql().find('\0') == std::string::npos)
+        return false;
+
+    // Everything that may throw comes before q is moved: a throw leaves the
+    // caller its query and no entry half made.
+    std::string error{nul_refusal};
+    PgResult result = PgResult::lost(error);
+    lost_.reserve(lost_.size() + 1);
+
+    // Not the statement: what precedes the byte is a caller's data. A log
+    // that throws does not turn the refusal into an exception from execute().
+    if (pg_logger_ && !q->quiet()) {
+        try {
+            pg_logger_->error("Query {} refused: {}", q->id(), error);
+        } catch (...) {}
+    }
+
+    // From the loop, as for a lost query: the caller is still inside the call,
+    // often inside a handler of its own with its state half set.
+    lost_.push_back(Lost{std::move(q), std::move(error), std::move(result)});
+    arm_lost_delivery();
+    return true;
 }
 
 void PgPool::ensure_min_connections()
@@ -2965,6 +3008,10 @@ void PgPool::listener_execute(std::string               sql,
     auto q = std::make_unique<PgQuery>(std::move(sql), quiet);
     q->on_result(std::move(on_result));
     q->on_exception(std::move(on_exception));
+
+    if (refuse_nul(q))
+        return;
+
     // Asked after detach(): somebody waits for it, as for execute() — and, as
     // enqueue() does, it goes ahead of the detached ones. on_stop()'s
     // deregistration would otherwise wait behind a statement nobody waits for
