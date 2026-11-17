@@ -113,6 +113,14 @@ target_link_libraries(debug_mask_test PRIVATE apostol)
 target_compile_options(debug_mask_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME debug_mask COMMAND debug_mask_test)
 
+# content_json_test — content_to_json() on JSON bodies nested at, over and far
+# over the depth limit, brackets in strings, broken JSON, form and query; in
+# this process, no files.
+add_executable(content_json_test content_json_test.cpp)
+target_link_libraries(content_json_test PRIVATE apostol)
+target_compile_options(content_json_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME content_json COMMAND content_json_test)
+
 # pg_nul_test — a statement with a NUL byte is refused by PgPool::execute() and
 # listener_execute() from the loop, never sent; no database (a pool whose server
 # does not exist), the same calls without the byte as the control.

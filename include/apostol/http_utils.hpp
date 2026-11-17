@@ -110,6 +110,8 @@ nlohmann::json parse_form_body(std::string_view body);
 // ─── Content parsing ────────────────────────────────────────────────────────
 
 /// Parse request body by Content-Type: JSON -> parse, form -> decode, else -> params.
+/// A JSON body that does not parse, or nests arrays and objects more than 128
+/// levels deep, yields an empty object.
 nlohmann::json content_to_json(const HttpRequest& req);
 
 } // namespace apostol

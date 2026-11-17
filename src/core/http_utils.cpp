@@ -420,6 +420,13 @@ nlohmann::json parse_form_body(std::string_view body)
 
 // ─── content_to_json ────────────────────────────────────────────────────────
 
+namespace {
+
+/// Deepest nesting of arrays and objects content_to_json() accepts.
+constexpr int k_content_json_depth = 128;
+
+} // namespace
+
 nlohmann::json content_to_json(const HttpRequest& req)
 {
     if (req.body.empty()) {
@@ -437,11 +444,24 @@ nlohmann::json content_to_json(const HttpRequest& req)
                    [](unsigned char c) { return std::tolower(c); });
 
     if (ct_lower.find("application/json") != std::string::npos) {
-        try {
-            return nlohmann::json::parse(req.body);
-        } catch (...) {
+        // A parsed document is copied, compared and written back (dump)
+        // recursively, one stack frame per level of arrays and objects: a body
+        // nesting more than k_content_json_depth of them is handled as a body
+        // that does not parse. The depth of a container's start event is the
+        // number of containers already open around it.
+        bool too_deep = false;
+        nlohmann::json::parser_callback_t depth_cb =
+            [&too_deep](int depth, nlohmann::json::parse_event_t event, nlohmann::json&) {
+                if ((event == nlohmann::json::parse_event_t::object_start ||
+                     event == nlohmann::json::parse_event_t::array_start) &&
+                    depth >= k_content_json_depth)
+                    too_deep = true;
+                return !too_deep;
+            };
+        auto j = nlohmann::json::parse(req.body, depth_cb, /*allow_exceptions=*/false);
+        if (too_deep || j.is_discarded())
             return nlohmann::json::object();
-        }
+        return j;
     }
 
     if (ct_lower.find("application/x-www-form-urlencoded") != std::string::npos) {
