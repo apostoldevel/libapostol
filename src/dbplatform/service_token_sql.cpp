@@ -187,6 +187,49 @@ void close_session(PgPool& pool, std::string_view token, Logger* log, std::strin
     });
 }
 
+// ─── reading daemon.token's answer ───────────────────────────────────────────
+
+namespace
+{
+
+// The member @p key of @p obj when both are what they should be — an object
+// and a string; @p fallback otherwise.
+std::string string_member(const nlohmann::json& obj, const char* key, std::string fallback = {})
+{
+    if (!obj.is_object())
+        return fallback;
+    const auto it = obj.find(key);
+    return it != obj.end() && it->is_string() ? it->get<std::string>() : fallback;
+}
+
+// An optional string member: absent or null leaves @p out empty; present it
+// must be a string — false otherwise.
+bool optional_string(const nlohmann::json& obj, const char* key, std::string& out)
+{
+    const auto it = obj.find(key);
+    if (it == obj.end() || it->is_null())
+        return true;
+    if (!it->is_string())
+        return false;
+    out = it->get<std::string>();
+    return true;
+}
+
+// expires_in in whole seconds. Bounded while still a double: past the range
+// of the integer the conversion is undefined. Not positive (or not a number)
+// → 0, which issued() takes for a refusal; past the longest life ServiceToken
+// accepts → that life.
+std::chrono::seconds lifetime(double s)
+{
+    if (!(s > 0))
+        return std::chrono::seconds(0);
+    if (s >= static_cast<double>(ServiceToken::k_max_life.count()))
+        return ServiceToken::k_max_life;
+    return std::chrono::seconds(static_cast<long long>(s));
+}
+
+} // namespace
+
 // ─── refresh_service_token ───────────────────────────────────────────────────
 
 void refresh_service_token(PgPool& pool, ServiceToken& token, Logger& log,
@@ -248,22 +291,40 @@ void refresh_service_token(PgPool& pool, ServiceToken& token, Logger& log,
                 return;
             }
 
+            // Every member is read by its type: nlohmann's value() and get() throw
+            // on a mismatch, and a throw here would leave the refresh pending until
+            // its deadline and cost the pool its connection.
+            if (!j.is_object()) {
+                log.error("{} service token for \"{}\": the result is not an object",
+                          label, client_id);
+                token.failed();
+                return;
+            }
+
             // daemon.token reports refusals in the body, not as a failed query.
             if (j.contains("error")) {
                 const auto& e = j["error"];
                 log.error("{} service token for \"{}\" refused: {} {}", label, client_id,
-                          e.is_object() ? e.value("error", "error") : std::string("error"),
-                          e.is_object() ? e.value("message", "") : std::string());
+                          string_member(e, "error", "error"), string_member(e, "message"));
+                token.failed();
+                return;
+            }
+
+            std::string access_token;
+            std::string session;
+            if (!optional_string(j, "access_token", access_token)
+                || !optional_string(j, "session", session)) {
+                log.error("{} service token for \"{}\": access_token or session is not a string",
+                          label, client_id);
                 token.failed();
                 return;
             }
 
             std::chrono::seconds life{3600};
-            if (j.contains("expires_in") && j["expires_in"].is_number())
-                life = std::chrono::seconds(
-                    static_cast<long long>(j["expires_in"].get<double>()));
+            if (const auto it = j.find("expires_in"); it != j.end() && it->is_number())
+                life = lifetime(it->get<double>());
 
-            token.issued(j.value("access_token", ""), j.value("session", ""), life);
+            token.issued(std::move(access_token), std::move(session), life);
 
             if (!token.valid()) {
                 log.error("{} service token for \"{}\": response carried no usable token",

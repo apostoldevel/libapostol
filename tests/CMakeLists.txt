@@ -147,3 +147,13 @@ set_target_properties(pg_resolve_test PROPERTIES ENABLE_EXPORTS ON)
 target_compile_options(pg_resolve_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME pg_resolve COMMAND pg_resolve_test)
 set_tests_properties(pg_resolve PROPERTIES TIMEOUT 60)
+
+# service_token_test — ServiceToken's retry schedule against a clock the test
+# moves (steady_clock::now() is defined in the test binary), and how
+# refresh_service_token() reads daemon.token's answer from a child process
+# that plays the server.
+add_executable(service_token_test service_token_test.cpp)
+target_link_libraries(service_token_test PRIVATE apostol)
+target_compile_options(service_token_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME service_token COMMAND service_token_test)
+set_tests_properties(service_token PROPERTIES TIMEOUT 60)

@@ -95,10 +95,20 @@ void ServiceToken::issued(std::string token, std::string session,
 void ServiceToken::failed() noexcept
 {
     refreshing_ = false;
+    const auto now  = std::chrono::steady_clock::now();
+    const bool held = !token_.empty() && now < hard_expiry_;
+
+    // While a token is held, a long delay costs nothing: the token serves. Once
+    // none is, every caller is refused until the next attempt, so the delay is
+    // kept short — and the attempt that would land past the token's expiry is
+    // brought forward to it, so the outage does not outlast the issuer's.
+    const auto cap = held ? k_retry_max : k_retry_max_unheld;
     backoff_ = (backoff_.count() == 0)
                    ? k_retry_initial
-                   : std::min(backoff_ * 2, k_retry_max);
-    retry_at_ = std::chrono::steady_clock::now() + backoff_;
+                   : std::min(backoff_ * 2, cap);
+    retry_at_ = now + backoff_;
+    if (held && retry_at_ > hard_expiry_)
+        retry_at_ = hard_expiry_;
 }
 
 // ─── take_previous_session ───────────────────────────────────────────────────

@@ -75,7 +75,9 @@ public:
     /// failure. @p session may be empty when the caller tracks none.
     void issued(std::string token, std::string session, std::chrono::seconds life);
 
-    /// Report failure. Backs off, doubling up to the maximum.
+    /// Report failure. Backs off, doubling from k_retry_initial: up to
+    /// k_retry_max while a valid token is held, never past the moment it
+    /// expires; up to k_retry_max_unheld while none is.
     void failed() noexcept;
 
     /// The session behind the token that issued() replaced, if any; empty
@@ -91,12 +93,13 @@ public:
     /// Whether a request is in flight right now.
     bool refreshing() const noexcept { return refreshing_; }
 
-    static constexpr auto k_renew_margin    = std::chrono::seconds(300);
-    static constexpr auto k_min_life        = std::chrono::seconds(30);
-    static constexpr auto k_max_life        = std::chrono::seconds(30 * 24 * 3600);
-    static constexpr auto k_retry_initial   = std::chrono::seconds(10);
-    static constexpr auto k_retry_max       = std::chrono::seconds(1800);
-    static constexpr auto k_refresh_timeout = std::chrono::seconds(30);
+    static constexpr auto k_renew_margin     = std::chrono::seconds(300);
+    static constexpr auto k_min_life         = std::chrono::seconds(30);
+    static constexpr auto k_max_life         = std::chrono::seconds(30 * 24 * 3600);
+    static constexpr auto k_retry_initial    = std::chrono::seconds(10);
+    static constexpr auto k_retry_max        = std::chrono::seconds(1800);
+    static constexpr auto k_retry_max_unheld = std::chrono::seconds(60);
+    static constexpr auto k_refresh_timeout  = std::chrono::seconds(30);
 
 private:
     std::string token_;
