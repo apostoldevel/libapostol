@@ -16,6 +16,7 @@ namespace apostol
 {
 
 class Logger;
+class PgResolver;
 class PgConnection;
 class PgResult;
 
@@ -122,10 +123,12 @@ private:
     void drop(std::string_view why);
     void close();
     void lose(std::string_view why);
+    void on_resolved(bool ok, bool kept, std::string_view error);
     std::string tag() const;
 
     EventLoop&           loop_;
     std::string          conninfo_;
+    std::unique_ptr<PgResolver> resolver_;   // host names looked up off the loop
     std::string          key_;
     std::string          holder_;
     std::chrono::seconds interval_;

@@ -138,3 +138,12 @@ target_link_libraries(pg_queue_test PRIVATE apostol)
 target_compile_options(pg_queue_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME pg_queue COMMAND pg_queue_test)
 set_tests_properties(pg_queue PROPERTIES TIMEOUT 60)
+
+# pg_resolve_test — PgPool and PgLeaderLock look host names up off the loop:
+# getaddrinfo() is replaced in the test binary (exported, so libpq reaches it).
+add_executable(pg_resolve_test pg_resolve_test.cpp)
+target_link_libraries(pg_resolve_test PRIVATE apostol dl)
+set_target_properties(pg_resolve_test PROPERTIES ENABLE_EXPORTS ON)
+target_compile_options(pg_resolve_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME pg_resolve COMMAND pg_resolve_test)
+set_tests_properties(pg_resolve PROPERTIES TIMEOUT 60)

@@ -1,5 +1,6 @@
 #include "apostol/pg.hpp"
 #include "apostol/pg_utils.hpp"
+#include "pg_resolver.hpp"
 
 #include <fmt/format.h>
 #include <poll.h>
@@ -651,6 +652,8 @@ PgPool::PgPool(EventLoop& loop, std::string conninfo,
                Logger* pg_logger)
     : loop_(loop)
     , conninfo_(std::move(conninfo))
+    , resolver_(std::make_unique<PgResolver>(loop, conninfo_,
+          [this](const PgResolver::Outcome& o) { on_resolved(o.ok, o.kept, o.error); }))
     , min_conns_(min_conns)
     , max_conns_(max_conns)
     , pg_logger_(pg_logger)
@@ -883,7 +886,12 @@ void PgPool::new_connection(Opening why)
         return;
     }
 
-    auto conn = std::make_unique<PgConnection>(conninfo_);
+    // The names not looked up yet: on_resolved() opens what is due then.
+    auto conninfo = resolver_->conninfo();
+    if (!conninfo)
+        return;
+
+    auto conn = std::make_unique<PgConnection>(std::move(*conninfo));
     conn->set_round(why == Opening::growth    ? kGrowthRound
                   : why == Opening::successor ? kSuccessorRound
                   :                             connect_round_);
@@ -2502,6 +2510,8 @@ void PgPool::record_connect_success()
 void PgPool::record_connect_failure(std::uint64_t round)
 {
     using namespace std::chrono;
+    // The server may have moved: the next connection looks its name up again.
+    resolver_->stale();
     // A connection above min_conns failed — most likely refused for the
     // server's (or the pooler's) connection limit. The pool's own connections
     // are not concerned: the backoff stays as it is, so a min connection lost
@@ -2553,6 +2563,40 @@ void PgPool::reconnect_now()
         restart_listener("down while queries wait for it");
     else if (!listener_ && wants_listener())
         start_listener();
+}
+
+void PgPool::on_resolved(bool ok, bool kept, std::string_view error) noexcept
+{
+    if (!ok) {
+        if (kept) {
+            if (pg_logger_)
+                upkeep(pg_logger_, "name lookup", [&] {
+                    pg_logger_->warn("PgPool: {} — connecting to the addresses found before", error);
+                });
+            return;
+        }
+        if (pg_logger_)
+            upkeep(pg_logger_, "name lookup", [&] {
+                pg_logger_->error("[0] [-1] [] ConnectException: {}", error);
+            });
+        // A failed connect: the backoff, and the reconnect timer asks again.
+        record_connect_failure(connect_round_);
+        upkeep(pg_logger_, "reconnect", [this] { schedule_reconnect_timer(); });
+        return;
+    }
+
+    if (!error.empty() && pg_logger_)
+        upkeep(pg_logger_, "name lookup", [&] { pg_logger_->warn("PgPool: {}", error); });
+
+    // What the reconnect timer does — the connections and the listener that
+    // waited for the addresses.
+    upkeep(pg_logger_, "reconnect", [this] {
+        ensure_min_connections();
+        if (!queue_.empty())
+            grow_for_queue(queue_.size());
+    });
+    if (!listener_ && wants_listener())
+        upkeep(pg_logger_, "listener reconnect", [this] { start_listener(); });
 }
 
 void PgPool::schedule_reconnect_timer()
@@ -3407,7 +3451,12 @@ void PgPool::start_listener()
         return;
     }
 
-    listener_ = std::make_unique<PgConnection>(conninfo_);
+    // The names not looked up yet: on_resolved() starts the listener then.
+    auto conninfo = resolver_->conninfo();
+    if (!conninfo)
+        return;
+
+    listener_ = std::make_unique<PgConnection>(std::move(*conninfo));
     listener_->set_round(connect_round_);
     ++listener_gen_;
     setup_notice_handler(*listener_);

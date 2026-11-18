@@ -136,6 +136,7 @@ if(WITH_POSTGRESQL)
         src/pg/pg_utils.cpp
         src/pg/pg_exec.cpp
         src/pg/pg_leader.cpp
+        src/pg/pg_resolver.cpp
         src/core/bot_session.cpp
     )
 

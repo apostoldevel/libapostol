@@ -3,6 +3,7 @@
 #include "apostol/logger.hpp"
 #include "apostol/pg.hpp"
 #include "apostol/pg_utils.hpp"
+#include "pg_resolver.hpp"
 
 #include <poll.h>
 #include <sys/epoll.h>
@@ -57,6 +58,8 @@ PgLeaderLock::PgLeaderLock(EventLoop& loop, std::string conninfo, std::string ke
                            Logger* logger)
     : loop_(loop)
     , conninfo_(std::move(conninfo))
+    , resolver_(std::make_unique<PgResolver>(loop, conninfo_,
+          [this](const PgResolver::Outcome& o) { on_resolved(o.ok, o.kept, o.error); }))
     , key_(std::move(key))
     , holder_(std::move(holder))
     , interval_(std::max(interval, std::chrono::seconds(1)))
@@ -186,7 +189,12 @@ void PgLeaderLock::tick()
 
 void PgLeaderLock::connect()
 {
-    conn_   = std::make_unique<PgConnection>(conninfo_);
+    // The names not looked up yet: on_resolved() connects then.
+    auto conninfo = resolver_->conninfo();
+    if (!conninfo)
+        return;
+
+    conn_   = std::make_unique<PgConnection>(std::move(*conninfo));
     since_  = std::chrono::steady_clock::now();
     set_up_ = false;
     asked_  = Ask::none;
@@ -442,6 +450,7 @@ void PgLeaderLock::drop(std::string_view why)
 {
     // `why` often points into the PGconn that close() is about to free.
     std::string reason = one_line(why);
+    resolver_->stale();   // the server may have moved: look its name up again
 
     if (held_) {
         lose(reason);
@@ -485,6 +494,25 @@ void PgLeaderLock::lose(std::string_view why)
 
     if (on_lost_)
         on_lost_(reason);
+}
+
+// From the loop, when a lookup of the host names ends; must not throw.
+void PgLeaderLock::on_resolved(bool ok, bool kept, std::string_view error)
+{
+    try {
+        if (inert_ || conn_)
+            return;
+        if (ok)
+            connect();
+        else if (!kept)
+            drop(fmt::format("connect failed: {}", error));
+        else if (logger_)
+            logger_->warn("{} {} — connecting to the addresses found before", tag(), error);
+    } catch (const std::exception& e) {
+        if (logger_)
+            logger_->error("{} connect failed: {}", tag(), e.what());
+    } catch (...) {
+    }
 }
 
 void PgLeaderLock::close()

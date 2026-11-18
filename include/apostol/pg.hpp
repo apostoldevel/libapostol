@@ -453,6 +453,11 @@ private:
 /// - On dispatch: verify PQstatus() before sending queries
 /// - Periodic heartbeat: check health, restore min_conns, grow for a queue
 ///   left waiting, close connections idle above min_conns
+///
+/// Host names are looked up off the loop (see PgResolver): a connection is
+/// opened once the addresses are known, and libpq is given them.
+class PgResolver;
+
 class PgPool
 {
 public:
@@ -965,6 +970,7 @@ private:
 
     EventLoop&  loop_;
     std::string conninfo_;
+    std::unique_ptr<PgResolver> resolver_;   // conninfo_ with its names looked up
     std::size_t min_conns_;
     std::size_t max_conns_;
     Logger*     pg_logger_{nullptr};
@@ -1072,6 +1078,10 @@ private:
     /// failing during startup isn't abandoned forever (was: listener_.reset()
     /// with no retry — see start_listener()/on_listener_io()).
     void schedule_reconnect_timer();
+
+    /// A lookup of the host names ended (PgResolver's ReadyHandler): open what
+    /// waited for it, or count a failure when there is nothing to connect to.
+    void on_resolved(bool ok, bool kept, std::string_view error) noexcept;
 
     // ── Handshake watch ───────────────────────────────────────────────────────
     // PQconnectPoll keeps no time: a server that takes the TCP connection and
