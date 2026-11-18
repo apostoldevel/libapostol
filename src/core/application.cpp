@@ -442,7 +442,6 @@ void Application::parse_args(int argc, char* argv[])
             settings_.error_log    = settings_.resolve(APP_ERROR_LOG_FILE);
             settings_.access_log   = settings_.resolve(APP_ACCESS_LOG_FILE);
             settings_.stream_log   = settings_.resolve(APP_STREAM_LOG_FILE);
-            settings_.postgres_log = settings_.resolve(APP_POSTGRES_LOG_FILE);
             settings_.doc_root     = settings_.resolve(APP_DOC_ROOT);
             settings_.cache_prefix = settings_.resolve(APP_CACHE_PREFIX);
             // Sync config_file_ if not yet overridden by -c
@@ -2392,7 +2391,8 @@ PgPool& Application::setup_db(EventLoop& loop, std::string conninfo,
                                std::size_t min_conns, std::size_t max_conns,
                                bool lazy)
 {
-    // Create dedicated postgres logger (writes to stderr + separate postgres.log)
+    // Create dedicated postgres logger: a file when log.postgres names one,
+    // otherwise stderr at log.level
     {
         pg_logger_ = std::make_unique<Logger>();
 

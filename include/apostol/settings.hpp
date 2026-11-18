@@ -49,7 +49,7 @@ struct AppSettings
     std::filesystem::path error_log;    // resolved: prefix + APP_ERROR_LOG_FILE
     std::filesystem::path access_log;   // resolved: prefix + APP_ACCESS_LOG_FILE
     std::filesystem::path stream_log;   // resolved: prefix + APP_STREAM_LOG_FILE
-    std::filesystem::path postgres_log; // resolved: prefix + APP_POSTGRES_LOG_FILE
+    std::filesystem::path postgres_log; // resolved: prefix + log.postgres; empty (no file) unless the key names one
 
     // ── Logging ───────────────────────────────────────────────────────────
     std::string   log_level       {APP_DEFAULT_LOG_LEVEL};

@@ -432,7 +432,8 @@ both off by default:
   dead address blocks the loop); its query is failed as lost —
   `Query in flight: no answer from the server in Ns (postgres.stall_timeout),
   dropping the connection without cancel` in the application's PostgreSQL log
-  (`log.postgres`) — or re-queued if it was not sent whole or may be repeated,
+  (`log.postgres`; without the key no file is written and the pool logs to
+  stderr at `log.level`) — or re-queued if it was not sent whole or may be repeated,
   and the connection reconnects in its own slot. The LISTEN connection is not
   watched. A statement that runs longer than the limit without sending
   anything is dropped too: it is a safety net above the longest statement the

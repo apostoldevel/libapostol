@@ -22,7 +22,6 @@ if(PROJECT_IS_TOP_LEVEL)
         APP_LOCK_FILE="logs/apostol-test.lock"
         APP_ERROR_LOG_FILE="logs/error.log"
         APP_ACCESS_LOG_FILE="logs/access.log"
-        APP_POSTGRES_LOG_FILE="logs/postgres.log"
         APP_STREAM_LOG_FILE="logs/stream.log"
         APP_DOC_ROOT="www"
         APP_DEFAULT_LOG_LEVEL="notice"
@@ -120,6 +119,14 @@ add_executable(content_json_test content_json_test.cpp)
 target_link_libraries(content_json_test PRIVATE apostol)
 target_compile_options(content_json_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME content_json COMMAND content_json_test)
+
+# settings_test — AppSettings defaults and populate(): the PostgreSQL log is
+# opened only when log.postgres names it; the other paths keep their defaults.
+# In this process, no files.
+add_executable(settings_test settings_test.cpp)
+target_link_libraries(settings_test PRIVATE apostol)
+target_compile_options(settings_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME settings COMMAND settings_test)
 
 # pg_nul_test — a statement with a NUL byte is refused by PgPool::execute() and
 # listener_execute() from the loop, never sent; no database (a pool whose server
