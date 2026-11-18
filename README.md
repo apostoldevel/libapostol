@@ -372,6 +372,33 @@ that has lived this long is replaced by a new one:
   `Past postgres.pool.lifetime (…s): opening its successor`, then
   `Retired: past postgres.pool.lifetime (…s), its successor is up`.
 
+### A bound on the pool's queue
+
+A query that finds no free connection waits in the pool's queue. With the
+database gone, the queue grows with every request, each entry holding its
+caller (an HTTP request, a deferred response), and once the server is back the
+pool runs everything in it — statements whose callers gave up long ago. Two
+keys bound it, both off by default:
+
+```json
+{ "postgres": { "pool": { "queue_limit": 10000, "queue_timeout": 60 } } }
+```
+
+- **`postgres.pool.queue_limit`** queries (default `0` — no limit): a query
+  that would wait past it is refused at once — its error handler gets
+  `the pool's queue is full` (`PgPool::queue_full_refusal`), from the loop —
+  and opens no connection. A query the pool takes back after a connection
+  loss is not refused. Logged once per run of refusals at error, and the
+  count at notice when the queue is below the limit again.
+- **`postgres.pool.queue_timeout`** seconds (default `0` — no limit): a query
+  that has waited longer is failed, never sent — `not sent: waited longer than
+  Ns in the queue for a connection`. Checked once a second while anything
+  waits, and again as a connection takes the query. Count from the longest
+  wait the application expects on a live server: a burst behind a few busy
+  connections fails as well. A sweep is logged in one line at error.
+- Every pool — worker, helper, custom process, `db_pool(role)`; not the LISTEN
+  connection (`listener_execute()`).
+
 ### A time limit on connecting to PostgreSQL
 
 The pool connects asynchronously, and libpq's asynchronous handshake keeps no

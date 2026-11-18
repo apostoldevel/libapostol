@@ -129,3 +129,12 @@ target_link_libraries(pg_nul_test PRIVATE apostol)
 target_compile_options(pg_nul_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME pg_nul COMMAND pg_nul_test)
 set_tests_properties(pg_nul PROPERTIES TIMEOUT 30)
+
+# pg_queue_test — the bound and the age of PgPool's queue: refused past the
+# limit, failed unsent past the timeout; a child process plays a server that
+# finishes the handshake late, to show nothing stale reaches it.
+add_executable(pg_queue_test pg_queue_test.cpp)
+target_link_libraries(pg_queue_test PRIVATE apostol)
+target_compile_options(pg_queue_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME pg_queue COMMAND pg_queue_test)
+set_tests_properties(pg_queue PROPERTIES TIMEOUT 60)

@@ -814,6 +814,10 @@ PgPool::~PgPool()
         loop_.cancel_timer(stall_timer_);
         stall_timer_ = EventLoop::kInvalidTimer;
     }
+    if (queue_timer_ != EventLoop::kInvalidTimer) {
+        loop_.cancel_timer(queue_timer_);
+        queue_timer_ = EventLoop::kInvalidTimer;
+    }
     cancel_listener_answer();
 
 #ifdef LIBPQ_HAS_ASYNC_CANCEL
@@ -1500,7 +1504,11 @@ void PgPool::drop_cancel(CancelRequest* cr) noexcept
 
 void PgPool::dispatch_queue(PgConnection& conn)
 {
-    // Skip canceled queued queries
+    // Skip canceled queued queries, and fail the ones that have waited too
+    // long (set_queue_timeout()): a server back after an outage must not run
+    // what callers gave up on long ago.
+    const auto now = std::chrono::steady_clock::now();
+    bool expired_any = false;
     while (!queue_.empty()) {
         auto& front = queue_.front();
         if (canceled_ids_.count(front->id())) {
@@ -1510,8 +1518,24 @@ void PgPool::dispatch_queue(PgConnection& conn)
             queue_.pop_front();
             continue;
         }
+        if (expired(*front, now)) {
+            std::string error = expired_error();
+            PgResult result = PgResult::lost(error);
+            if (pg_logger_ && !front->quiet())
+                pg_logger_->error("Query {} failed: {}", front->id(), error);
+            lost_.push_back(Lost{nullptr, std::move(error), std::move(result)});
+            lost_.back().query = std::move(front);
+            queue_.pop_front();
+            expired_any = true;
+            continue;
+        }
         break;
     }
+    if (expired_any)
+        arm_lost_delivery();
+
+    if (refused_full_ && queue_.size() < queue_limit_)
+        note_queue_below_limit();
 
     if (queue_.empty())
         return;
@@ -1545,6 +1569,8 @@ void PgPool::dispatch_queue(PgConnection& conn)
     inflight_.push_back(std::move(queue_.front()));
     queue_.pop_front();
     conn.set_current_query(raw_q);
+    if (refused_full_ && queue_.size() < queue_limit_)
+        note_queue_below_limit();
 
     // If flush was incomplete, need EPOLLOUT to continue flushing. A socket
     // the loop no longer watches would leave the rest unsent for good;
@@ -1702,7 +1728,12 @@ PgPool::QueryId PgPool::execute(std::string              sql,
         }
     }
 
-    // No ready connection — queue. Connections first: opening one may throw
+    // No ready connection — queue, unless it is full: refused before a
+    // connection is opened for it, as a query that will not wait needs none.
+    if (refuse_full(q))
+        return qid;
+
+    // Connections first: opening one may throw
     // (epoll, timerfd), and a query already queued would then go out
     // with the next connection while its caller, told it failed, sends it
     // again. Nothing in here dispatches the queue, so the order is free.
@@ -1728,6 +1759,14 @@ PgPool::QueryId PgPool::execute(std::string              sql,
 
 void PgPool::enqueue(std::unique_ptr<PgQuery> q)
 {
+    q->mark_queued(std::chrono::steady_clock::now());
+    // Armed after the query is in, below; noexcept, so the order is free.
+    struct Watch
+    {
+        PgPool& pool;
+        ~Watch() { pool.arm_queue_watch(); }
+    } watch{*this};
+
     // Before detach() nothing in the queue is detached, and the order is the
     // order of the calls. After it, the queue holds work nobody waits for any
     // more, and a connection that frees up would take that first — on_stop()'s
@@ -2305,6 +2344,142 @@ bool PgPool::refuse_nul(std::unique_ptr<PgQuery>& q)
     return true;
 }
 
+bool PgPool::refuse_full(std::unique_ptr<PgQuery>& q)
+{
+    if (queue_limit_ == 0 || detached_ || queue_.size() < queue_limit_)
+        return false;
+
+    std::string error{queue_full_refusal};
+    PgResult result = PgResult::lost(error);
+
+    // One line for a run of them, not one per query: a queue fills when the
+    // database is gone and requests keep coming, and a line each would be
+    // the log's whole content. The count comes when the queue is below the
+    // limit again (note_queue_below_limit()).
+    if (refused_full_ == 0 && pg_logger_) {
+        try {
+            pg_logger_->error("PgPool: the queue holds {} queries (its limit): refusing new ones "
+                              "until it is below the limit, first refused: query {}",
+                              queue_.size(), q->id());
+        } catch (...) {}
+    }
+
+    lost_.push_back(Lost{nullptr, std::move(error), std::move(result)});
+    lost_.back().query = std::move(q);
+    ++refused_full_;
+    arm_lost_delivery();
+    return true;
+}
+
+void PgPool::note_queue_below_limit()
+{
+    const auto n = refused_full_;
+    refused_full_ = 0;
+    if (pg_logger_)
+        pg_logger_->notice("PgPool: the queue is below its limit ({}) again: {} query(ies) refused meanwhile",
+                           queue_limit_, n);
+}
+
+void PgPool::set_queue_timeout(std::chrono::seconds limit)
+{
+    queue_timeout_ = limit;
+    arm_queue_watch();
+}
+
+bool PgPool::expired(const PgQuery& q, std::chrono::steady_clock::time_point now) const
+{
+    return queue_timeout_.count() > 0 && now - q.queued_at() > queue_timeout_;
+}
+
+std::string PgPool::expired_error() const
+{
+    return fmt::format("not sent: waited longer than {}s in the queue for a connection",
+                       queue_timeout_.count());
+}
+
+std::size_t PgPool::expire_queued(std::chrono::steady_clock::time_point now)
+{
+    if (queue_timeout_.count() <= 0)
+        return 0;
+
+    // Not in order of age: a query taken back after a connection loss goes
+    // in again with a new stamp, and after detach() new ones go ahead of the
+    // detached. The whole queue, then — once a second, and bounded by what
+    // arrives within the limit.
+    std::size_t n = 0;
+    std::uint64_t first = 0, last = 0;
+    for (auto it = queue_.begin(); it != queue_.end();) {
+        if (canceled_ids_.count((*it)->id())) {
+            canceled_ids_.erase((*it)->id());
+            it = queue_.erase(it);
+            continue;
+        }
+        if (!expired(**it, now)) {
+            ++it;
+            continue;
+        }
+        std::string error = expired_error();
+        PgResult result = PgResult::lost(error);
+        lost_.push_back(Lost{nullptr, std::move(error), std::move(result)});
+        lost_.back().query = std::move(*it);
+        it = queue_.erase(it);
+        last = lost_.back().query->id();
+        if (n++ == 0)
+            first = last;
+    }
+
+    if (n > 0) {
+        // One line for the sweep: during an outage it may fail thousands.
+        if (pg_logger_)
+            pg_logger_->error("PgPool: {} queued query(ies) failed (queries {}…{}): {}",
+                              n, first, last, expired_error());
+        arm_lost_delivery();
+    }
+    if (refused_full_ && queue_.size() < queue_limit_)
+        note_queue_below_limit();
+    return n;
+}
+
+void PgPool::arm_queue_watch() noexcept
+{
+    if (queue_timeout_.count() <= 0 || queue_.empty() || queue_timer_ != EventLoop::kInvalidTimer)
+        return;
+
+    // As arm_stall_watch(): a timer the loop refuses fails no query;
+    // heartbeat() runs the same check, and the next query queued arms it again.
+    try {
+        queue_timer_ = loop_.add_timer(std::chrono::seconds(1),
+            [this] { on_queue_watch(); },
+            /*repeat=*/false);
+    } catch (const std::exception& e) {
+        if (pg_logger_) {
+            try {
+                pg_logger_->error("PgPool: queue watch not armed: {}", e.what());
+            } catch (...) {}
+        }
+    } catch (...) {
+        if (pg_logger_) {
+            try {
+                pg_logger_->error("PgPool: queue watch not armed: unknown exception");
+            } catch (...) {}
+        }
+    }
+}
+
+void PgPool::on_queue_watch()
+{
+    queue_timer_ = EventLoop::kInvalidTimer;
+    // Re-armed on the way out, whichever way that is: a throw out of the
+    // sweep (the log, memory) leaves the loop, and the watch must outlive it.
+    struct Rearm
+    {
+        PgPool& pool;
+        ~Rearm() { pool.arm_queue_watch(); }
+    } rearm{*this};
+
+    upkeep(pg_logger_, "queue age check", [this] { expire_queued(std::chrono::steady_clock::now()); });
+}
+
 void PgPool::ensure_min_connections()
 {
     if (lazy_ && !used_)
@@ -2875,6 +3050,13 @@ void PgPool::heartbeat()
     // check, here as well for a watch the loop refused to arm.
     upkeep(pg_logger_, "heartbeat: stall check",
            [this] { drop_stalled(std::chrono::steady_clock::now()); });
+
+    // Queries past the queue's age — the queue watch's check, here as well
+    // for a watch the loop refused to arm.
+    upkeep(pg_logger_, "heartbeat: queue age check", [this] {
+        expire_queued(std::chrono::steady_clock::now());
+        arm_queue_watch();
+    });
 
     // Ensure min_conns
     upkeep(pg_logger_, "heartbeat: minimum connections", [this] { ensure_min_connections(); });

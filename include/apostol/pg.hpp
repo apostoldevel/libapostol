@@ -150,6 +150,11 @@ public:
     bool detached() const      { return detached_; }
     void mark_detached()       { detached_ = true; }
 
+    /// When it was last put in the pool's queue to wait for a connection
+    /// (PgPool::set_queue_timeout()).
+    std::chrono::steady_clock::time_point queued_at() const { return queued_at_; }
+    void mark_queued(std::chrono::steady_clock::time_point t) { queued_at_ = t; }
+
     void deliver(std::vector<PgResult> results);
     void fail   (std::string_view error);
 
@@ -173,6 +178,7 @@ private:
     bool             canceled_{false};
     bool             detached_{false};
     PgRetry          retry_{PgRetry::never};
+    std::chrono::steady_clock::time_point queued_at_{};
     ResultHandler    result_handler_;
     ExceptionHandler exception_handler_;
 };
@@ -570,7 +576,41 @@ public:
     void set_stall_timeout(std::chrono::seconds limit) { stall_timeout_ = limit; }
     std::chrono::seconds stall_timeout() const { return stall_timeout_; }
 
+    /// How many queries may wait in the queue for a connection; 0 — no limit
+    /// (the default). A query execute() would queue past it is refused: it
+    /// fails with queue_full_refusal from the loop, as one refused for a NUL
+    /// byte, and opens no connection. Only execute() is refused: a query the
+    /// pool takes back to send again (not sent whole, PgRetry::if_lost) goes
+    /// in whatever the length. After detach() nothing is refused for it: what
+    /// on_stop() sends does not lose its place to work nobody waits for.
+    /// Taken into account from the next call.
+    void set_queue_limit(std::size_t limit) { queue_limit_ = limit; }
+    std::size_t queue_limit() const { return queue_limit_; }
+
+    /// How long a query may wait in the queue for a connection; 0 — no limit
+    /// (the default). Past it the query is not sent: it fails, from the loop,
+    /// with "not sent: waited longer than Ns in the queue …" — on_exception(),
+    /// or a result that is not ok(), as for a query lost with its connection.
+    /// The wait counts from each time the query is put in the queue (a query
+    /// taken back after a connection loss starts again). Checked once a second
+    /// while the queue holds anything, and again as a connection takes the
+    /// query: one that has waited too long never reaches the server, whenever
+    /// the server is back. With the database down, the queue holds what
+    /// arrives within the limit, no more.
+    ///
+    /// A query that waits longer on a live server — a burst behind a few
+    /// busy connections — fails too: the limit is a bound above the longest
+    /// wait the application expects, not a statement timeout. A detached query
+    /// past it is dropped without a call, as it would be delivered.
+    void set_queue_timeout(std::chrono::seconds limit);
+    std::chrono::seconds queue_timeout() const { return queue_timeout_; }
+
     using QueryId = uint64_t;
+
+    /// The error text of a query execute() refuses because the queue holds
+    /// queue_limit() queries already. Constant, so that a caller can tell it
+    /// from a server error.
+    static constexpr std::string_view queue_full_refusal = "the pool's queue is full";
 
     /// The error text of a statement refused for a NUL byte (execute(),
     /// listener_execute()). Constant, so that a caller can tell it from a
@@ -839,6 +879,32 @@ private:
     /// is not armed. Refused by the loop, it is logged; heartbeat() asks again.
     void arm_lost_delivery() noexcept;
 
+    /// The queue holds queue_limit_ queries (none detached since detach()):
+    /// @p q is moved to lost_ to fail with queue_full_refusal from the loop,
+    /// and true. False — @p q is left as it was.
+    bool refuse_full(std::unique_ptr<PgQuery>& q);
+
+    /// Queued longer than queue_timeout_ by @p now.
+    bool expired(const PgQuery& q, std::chrono::steady_clock::time_point now) const;
+
+    /// Move every queued query past queue_timeout_ to lost_, to fail from the
+    /// loop; a cancelled one is dropped. Returns how many were moved.
+    std::size_t expire_queued(std::chrono::steady_clock::time_point now);
+
+    /// The error text of a query past queue_timeout_.
+    std::string expired_error() const;
+
+    /// Arm the once-a-second check of the queue's age, if a timeout is set,
+    /// the queue holds anything and it is not armed. Refused by the loop, it
+    /// is logged: heartbeat() checks as well, and the next query queued arms
+    /// it again.
+    void arm_queue_watch() noexcept;
+    void on_queue_watch();
+
+    /// A run of queue_full_refusal is logged at its first refusal and at its
+    /// end (the queue below the limit again): count of the refused ones.
+    void note_queue_below_limit();
+
     /// Ensure at least min_conns_ healthy connections exist. Does nothing in a
     /// lazy pool not used yet.
     void ensure_min_connections();
@@ -910,6 +976,12 @@ private:
     std::vector<std::unique_ptr<PgConnection>> conns_;
     std::deque<std::unique_ptr<PgQuery>>       queue_;
     std::vector<std::unique_ptr<PgQuery>>      inflight_;     // queries currently executing
+
+    // The queue's bound and age (set_queue_limit(), set_queue_timeout()).
+    std::size_t                                queue_limit_{0};
+    std::chrono::seconds                       queue_timeout_{0};
+    EventLoop::TimerId                         queue_timer_{EventLoop::kInvalidTimer};
+    std::uint64_t                              refused_full_{0};  // in the current run, 0 — none
     std::unordered_set<uint64_t>               canceled_ids_; // queued queries pending cancel
 
     // Exponential backoff for connect failures: prevents auth-fail / unreachable-host

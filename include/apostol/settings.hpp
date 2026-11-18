@@ -112,6 +112,12 @@ struct AppSettings
     // postgres.pool.lifetime — seconds a pool connection lives before a new one
     // replaces it (PgPool::set_lifetime); 0 = never.
     int         pg_pool_lifetime{0};
+    // postgres.pool.queue_limit — queries that may wait for a connection;
+    // past it a query is refused (PgPool::set_queue_limit); 0 = no limit.
+    int         pg_pool_queue_limit{0};
+    // postgres.pool.queue_timeout — seconds a query may wait for a connection;
+    // past it, it is failed unsent (PgPool::set_queue_timeout); 0 = no limit.
+    int         pg_pool_queue_timeout{0};
     // postgres.stall_timeout — seconds a query in flight may go without a byte
     // from the server before its connection is dropped (PgPool::set_stall_timeout);
     // 0 = never.
