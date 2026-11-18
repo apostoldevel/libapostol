@@ -59,7 +59,7 @@ PgLeaderLock::PgLeaderLock(EventLoop& loop, std::string conninfo, std::string ke
     : loop_(loop)
     , conninfo_(std::move(conninfo))
     , resolver_(std::make_unique<PgResolver>(loop, conninfo_,
-          [this](const PgResolver::Outcome& o) { on_resolved(o.ok, o.kept, o.error); }))
+          [this](const PgResolver::Outcome& o) { on_resolved(o.ok, o.kept, o.awaited, o.error); }))
     , key_(std::move(key))
     , holder_(std::move(holder))
     , interval_(std::max(interval, std::chrono::seconds(1)))
@@ -496,18 +496,21 @@ void PgLeaderLock::lose(std::string_view why)
         on_lost_(reason);
 }
 
-// From the loop, when a lookup of the host names ends; must not throw.
-void PgLeaderLock::on_resolved(bool ok, bool kept, std::string_view error)
+// From the loop, when a lookup of the host names ends; must not throw. Only
+// the lookup connect() waited for connects: a refresh that ends between two
+// ticks leaves the next attempt to tick().
+void PgLeaderLock::on_resolved(bool ok, bool kept, bool awaited, std::string_view error)
 {
     try {
-        if (inert_ || conn_)
+        if (inert_ || conn_ || !awaited)
             return;
-        if (ok)
-            connect();
-        else if (!kept)
+        if (!ok && !kept) {
             drop(fmt::format("connect failed: {}", error));
-        else if (logger_)
+            return;
+        }
+        if (!ok && logger_)
             logger_->warn("{} {} — connecting to the addresses found before", tag(), error);
+        connect();
     } catch (const std::exception& e) {
         if (logger_)
             logger_->error("{} connect failed: {}", tag(), e.what());

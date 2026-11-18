@@ -24,8 +24,9 @@ class EventLoop;
 ///
 /// A name with several addresses becomes as many host entries, in the order
 /// getaddrinfo() returned them — libpq tries them in that order, as it does
-/// with a name. A name that does not resolve is left out; the others are
-/// still tried. None left: the lookup failed.
+/// with a name. A name that does not resolve keeps the addresses of its last
+/// answer; one that never resolved is left out, and the others are still
+/// tried. None left: the lookup failed.
 ///
 /// A string with nothing to look up is handed out unchanged and no thread is
 /// started: a numeric address or a socket directory only, `hostaddr` or a
@@ -35,7 +36,11 @@ class EventLoop;
 /// The answer is kept for kMaxAge. An older one is still handed out while a
 /// fresh one is looked up; so is the last good one when a fresh lookup
 /// fails — a resolver outage does not stop connections to a server that is
-/// up. stale() — called after a connect failed — asks for a fresh lookup.
+/// up. A lookup in which a name failed is repeated after kRetry.
+///
+/// stale() — called after a connect failed — asks for a fresh lookup, and
+/// conninfo() waits for it (nullopt, then on_ready) instead of handing out
+/// the addresses that have just failed.
 class PgResolver
 {
 public:
@@ -43,11 +48,13 @@ public:
     {
         bool        ok   = true;   ///< addresses for at least one host
         bool        kept = false;  ///< failed, the previous answer still in use
+        bool        awaited = false; ///< a conninfo() call returned nullopt for it
         std::string error;         ///< the names that did not resolve, and why
     };
     using ReadyHandler = std::function<void(const Outcome&)>;
 
     static constexpr std::chrono::seconds kMaxAge{60};
+    static constexpr std::chrono::seconds kRetry{5};
 
     /// @param on_ready  called from the loop when a lookup ends — the first
     ///                  one, which conninfo() made the owner wait for, and
@@ -58,12 +65,18 @@ public:
     PgResolver(const PgResolver&)            = delete;
     PgResolver& operator=(const PgResolver&) = delete;
 
-    /// The string to connect with now; nullopt while the first answer is
-    /// awaited (on_ready comes with it). Starts a lookup when one is due.
+    /// The string to connect with now; nullopt while the first answer, or
+    /// the one after stale(), is awaited (on_ready comes with it). Starts a
+    /// lookup when one is due.
     std::optional<std::string> conninfo();
 
-    /// A connect failed: the next conninfo() looks the names up again.
+    /// A connect failed: the next conninfo() looks the names up again and
+    /// waits for the answer.
     void stale() noexcept { stale_ = true; }
+
+    /// @p s is what conninfo() hands out now — false once the names resolve
+    /// to other addresses than @p s carries. Starts nothing.
+    bool current(const std::string& s) const noexcept { return !plan_ || !resolved_ || *resolved_ == s; }
 
     /// A lookup is under way.
     bool pending() const noexcept { return job_ != nullptr; }
@@ -84,12 +97,13 @@ private:
     std::string  conninfo_;
     ReadyHandler on_ready_;
 
-    std::unique_ptr<Plan> plan_;      // what the string asks for; null — nothing to look up
+    std::unique_ptr<Plan> plan_;      // what the string asks for, the last answer per name; null — nothing to look up
     bool                  resolves_ = false;
 
     std::optional<std::string>            resolved_;
-    std::chrono::steady_clock::time_point resolved_at_{};
-    bool                                  stale_ = false;
+    std::chrono::steady_clock::time_point refresh_at_{};  // the next lookup is due
+    bool                                  stale_   = false;
+    bool                                  awaited_ = false;  // conninfo() returned nullopt for job_
 
     std::shared_ptr<Job> job_;        // the lookup under way; its thread holds it too
 };

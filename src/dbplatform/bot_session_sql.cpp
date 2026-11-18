@@ -227,12 +227,22 @@ void BotSession::refresh_if_needed()
                 expiry_ = std::chrono::steady_clock::now() + k_refresh_interval;
                 obtained();
             } else {
+                // Say which step came back empty. "Signed in" is true only when
+                // api.login answered a session: a login that answered none (a
+                // configuration may replace api.login with one that returns
+                // NULL instead of raising) is a refused sign-in, not a missing
+                // session of the donor.
                 retry_at_ = std::chrono::steady_clock::now() + k_retry_interval;
-                failed(results[1].ok()
-                           ? fmt::format("signed in, but api.get_sessions found no session "
-                                         "for user '{}' in any scope", username_)
-                           : fmt::format("signed in, but api.get_sessions failed ({})",
-                                         results[1].status_string()));
+                if (!results[0].ok())
+                    failed(fmt::format("sign-in failed ({})", results[0].status_string()));
+                else if (token_session.empty())
+                    failed("api.login returned no session");
+                else if (!results[1].ok())
+                    failed(fmt::format("signed in, but api.get_sessions failed ({})",
+                                       results[1].status_string()));
+                else
+                    failed(fmt::format("signed in, but api.get_sessions found no session "
+                                       "for user '{}' in any scope", username_));
             }
 
             // Step 3: signout the login token_session (cleanup)

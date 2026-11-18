@@ -33,6 +33,7 @@ struct PgResolver::Plan
     std::vector<Kind>        kinds;
     std::vector<std::string> ports;                        // one per host, one for all, or none
     std::vector<std::string> names;                        // the distinct names to look up
+    std::vector<std::vector<std::string>> last;            // per name: its last addresses found
 };
 
 namespace
@@ -162,6 +163,7 @@ std::unique_ptr<PgResolver::Plan> make_plan(const std::string& conninfo)
     }
     if (plan->names.empty())
         return nullptr;
+    plan->last.resize(plan->names.size());
     return plan;
 }
 
@@ -291,13 +293,19 @@ std::optional<std::string> PgResolver::conninfo()
     if (!plan_)
         return conninfo_;
 
-    const bool due = !resolved_ || stale_
-                  || std::chrono::steady_clock::now() - resolved_at_ >= kMaxAge;
-    if (due && !job_) {
+    // No answer yet, or the one held has just failed a connect: wait for a
+    // fresh one rather than hand out what is known not to work.
+    const bool wait = !resolved_ || stale_;
+    const bool due  = wait || std::chrono::steady_clock::now() >= refresh_at_;
+    if (due && !job_)
         start();
-        // No thread to look up on: libpq looks up itself, as it always did.
-        if (!job_ && !resolved_)
-            return conninfo_;
+    if (!job_)
+        // No thread to look up on: the answer held, or libpq looks up
+        // itself, as it always did.
+        return resolved_ ? resolved_ : std::optional<std::string>(conninfo_);
+    if (wait) {
+        awaited_ = true;
+        return std::nullopt;
     }
     return resolved_;
 }
@@ -320,11 +328,22 @@ void PgResolver::start()
         // The thread co-owns the job: the resolver may be gone by the time
         // getaddrinfo() returns.
         std::thread([job] {
-            std::vector<Answer> answers;
-            look_up(job->names, answers);
-            {
+            // Nothing may escape a thread's function (std::terminate): a
+            // lookup that throws ends as one that found nothing, and the
+            // loop hears of it either way.
+            try {
+                std::vector<Answer> answers;
+                try {
+                    look_up(job->names, answers);
+                } catch (const std::exception& e) {
+                    answers.clear();
+                    answers.resize(job->names.size());
+                    for (auto& a : answers)
+                        a.error = e.what();
+                }
                 std::lock_guard lock(job->mutex);
                 job->answers = std::move(answers);
+            } catch (...) {
             }
             const std::uint64_t one = 1;
             (void)!::write(job->efd, &one, sizeof one);
@@ -360,19 +379,42 @@ void PgResolver::on_done() noexcept
     }
     job_.reset();
 
+    using namespace std::chrono;
     Outcome out;
+    out.awaited = std::exchange(awaited_, false);
+    const auto now = steady_clock::now();
     try {
-        if (auto s = build(*plan_, answers, out.error)) {
-            resolved_    = std::move(s);
-            resolved_at_ = std::chrono::steady_clock::now();
-        } else {
+        // A name that failed this time keeps its last addresses: one refused
+        // answer of several does not take a host out of the list. The others
+        // are remembered as found.
+        answers.resize(plan_->names.size());
+        bool failed = false;
+        for (std::size_t i = 0; i < answers.size(); ++i) {
+            if (!answers[i].addrs.empty()) {
+                plan_->last[i] = answers[i].addrs;
+                continue;
+            }
+            failed = true;
+            if (plan_->last[i].empty())
+                continue;   // build() names it
+            if (!out.error.empty())
+                out.error += "; ";
+            out.error += "could not translate host name \"" + plan_->names[i] + "\" to address: "
+                       + answers[i].error + " — the addresses found before are used";
+            answers[i].addrs = plan_->last[i];
+        }
+        if (auto s = build(*plan_, answers, out.error))
+            resolved_ = std::move(s);
+        else {
             out.ok   = false;
             out.kept = resolved_.has_value();
         }
+        refresh_at_ = now + (failed ? kRetry : kMaxAge);
     } catch (const std::exception& e) {
-        out.ok    = false;
-        out.kept  = resolved_.has_value();
-        out.error = e.what();
+        out.ok      = false;
+        out.kept    = resolved_.has_value();
+        out.error   = e.what();
+        refresh_at_ = now + kRetry;
     }
 
     if (on_ready_) {

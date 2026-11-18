@@ -4,6 +4,8 @@
 //   1. control: the sign-in batch answers a session — valid(), no error;
 //   2. signed in, no session in any scope: a failure — last_error() set, a line
 //      in the log, and no new sign-in before the retry pause has passed;
+//   2a. api.login answers a NULL session: a failure named after the login, never
+//      "signed in";
 //   3. a BotSession destroyed with its sign-in in flight: the late answer
 //      leaves the memory it occupied untouched;
 //   4. a ServiceToken destroyed with its request in flight: the same.
@@ -129,6 +131,16 @@ std::string result(const std::vector<std::string>& rows)
     return out + message('C', "SELECT " + std::to_string(rows.size()) + std::string(1, '\0'));
 }
 
+// One text column, one row holding NULL — what a function answering a NULL
+// field sends.
+std::string null_row()
+{
+    return message('T', be16(1) + std::string("v\0", 2) + be32(0) + be16(0) + be32(25)
+                            + be16(0xFFFF) + be32(0xFFFFFFFF) + be16(0))
+        + message('D', be16(1) + be32(0xFFFFFFFF))
+        + message('C', std::string("SELECT 1\0", 9));
+}
+
 const std::string k_ready = message('Z', "I");
 
 // The sessions api.get_sessions answers, by case.
@@ -136,7 +148,10 @@ const std::vector<std::vector<std::string>> k_sessions{
     {R"({"session":"bot-s1"})", R"({"session":"bot-s2"})"},   // case0: control
     {},                                                         // case1: none in any scope
     {R"({"session":"bot-s"})"},                                 // case2: slow
+    {},                                                         // case3: login answers NULL
 };
+
+constexpr std::size_t k_login_null = 3;
 
 [[noreturn]] void serve(int listen_fd, int count_fd)
 {
@@ -173,7 +188,7 @@ const std::vector<std::vector<std::string>> k_sessions{
             if (m.find("api.login(") != std::string::npos && at != std::string::npos) {
                 const std::size_t n = std::stoul(m.substr(at + 5));
                 write_all(count_fd, "L");
-                write_all(fd, result({R"({"session":"login-s"})"})
+                write_all(fd, (n == k_login_null ? null_row() : result({R"({"session":"login-s"})"}))
                                   + result(n < k_sessions.size() ? k_sessions[n]
                                                                  : std::vector<std::string>{})
                                   + k_ready);
@@ -314,6 +329,24 @@ void sign_in(Server& srv)
         g_offset += 11s;   // past the 10 s pause
         round(loop, bot);
         check(srv.logins() == 1, "no session in any scope: signed in again after the pause");
+    }
+
+    {
+        EventLoop loop;
+        PgPool    pool{loop, srv.conninfo, 1, 1};
+        pool.set_reset({});
+        pool.start();
+
+        said.clear();
+        BotSession bot(pool, "BotSessionTest/1.0", "127.0.0.1");
+        bot.set_credentials("case3", "secret");
+        round(loop, bot);
+        check(!bot.valid(), "login answered no session: not valid");
+        check(bot.last_error() == "api.login returned no session",
+              "login answered no session: last_error() names the login (" + bot.last_error() + ")");
+        check(said.find("signed in") == std::string::npos,
+              "login answered no session: the log does not say signed in");
+        check(srv.logins() == 1, "login answered no session: one sign-in batch");
     }
 
     EventLoop::unset_diagnostics(&diag);

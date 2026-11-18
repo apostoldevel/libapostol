@@ -1812,6 +1812,20 @@ bool PgPool::try_reconnect(PgConnection& conn)
 
     int old_fd = conn.fd();
 
+    // A reset reuses the addresses the connection was opened with. Once its
+    // host names resolve to others, it is replaced by a new connection
+    // instead: left in Error with its socket unwatched, as when a reset does
+    // not start — the caller replaces it, or heartbeat() does.
+    if (!resolver_->current(conn.connect_string())) {
+        if (old_fd >= 0)
+            loop_.remove_io(old_fd);
+        conn.set_state(PgConnState::Error);
+        if (pg_logger_)
+            pg_logger_->notice("{} The server's host names resolve to other addresses: "
+                               "a new connection instead of a reset", conn_tag(conn));
+        return false;
+    }
+
     // Attempt async reset (reuses existing PGconn handle — cheapest reconnect).
     // PQresetStart() closes the old socket whatever it returns: its
     // registration goes too, or the loop keeps a handler under a number the
@@ -2576,14 +2590,14 @@ void PgPool::reconnect_now()
 
 void PgPool::on_resolved(bool ok, bool kept, std::string_view error) noexcept
 {
-    if (!ok) {
-        if (kept) {
-            if (pg_logger_)
-                upkeep(pg_logger_, "name lookup", [&] {
-                    pg_logger_->warn("PgPool: {} — connecting to the addresses found before", error);
-                });
-            return;
-        }
+    if (!ok && kept) {
+        // The connections that waited for this lookup go to the addresses
+        // found before, as below.
+        if (pg_logger_)
+            upkeep(pg_logger_, "name lookup", [&] {
+                pg_logger_->warn("PgPool: {} — connecting to the addresses found before", error);
+            });
+    } else if (!ok) {
         if (pg_logger_)
             upkeep(pg_logger_, "name lookup", [&] {
                 pg_logger_->error("[0] [-1] [] ConnectException: {}", error);
@@ -2594,7 +2608,7 @@ void PgPool::on_resolved(bool ok, bool kept, std::string_view error) noexcept
         return;
     }
 
-    if (!error.empty() && pg_logger_)
+    if (ok && !error.empty() && pg_logger_)
         upkeep(pg_logger_, "name lookup", [&] { pg_logger_->warn("PgPool: {}", error); });
 
     // What the reconnect timer does — the connections and the listener that

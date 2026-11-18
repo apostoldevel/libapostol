@@ -388,6 +388,9 @@ public:
     std::size_t reset_results() const          { return reset_results_; }
     void        set_reset_results(std::size_t n){ reset_results_ = n; }
 
+    /// The connection string the connection was created with.
+    const std::string& connect_string() const noexcept { return conninfo_; }
+
     // ── libpq conninfo accessors (valid after connect) ───────────────────────
     const char* pg_host()     const { return conn_ ? PQhost(conn_.get())       : ""; }
     const char* pg_port()     const { return conn_ ? PQport(conn_.get())       : ""; }

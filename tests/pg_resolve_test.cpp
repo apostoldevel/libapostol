@@ -10,7 +10,15 @@
 //      and the loop's thread looks nothing up;
 //   2. a name that does not resolve: the queries wait (as for a server that is
 //      down), the loop is not held, the lookup is asked again by the backoff;
-//   3. leader lock: connecting on a slow name does not hold the loop.
+//   3. leader lock: connecting on a slow name does not hold the loop;
+//   4. resolver: of two names, one that fails keeps its last addresses;
+//   5. resolver: after stale() the next string waits for a fresh answer;
+//   6. resolver: a lookup that failed is not repeated by every call before
+//      the retry pause;
+//   7. pool: a connection lost after its name moved reconnects to the new
+//      address, never resets to the old one;
+//   8. leader lock: a lookup that ends on its own does not connect between
+//      two ticks.
 //
 // Usage: pg_resolve_test
 
@@ -18,7 +26,12 @@
 #include "apostol/pg.hpp"
 #include "apostol/pg_leader.hpp"
 
+#include "../src/pg/pg_resolver.hpp"
+
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <time.h>
 #include <dlfcn.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -44,7 +57,23 @@ namespace
 std::thread::id   g_loop_thread;
 std::atomic<int>  g_on_loop{0};    // lookups of a test name on the loop's thread
 std::atomic<int>  g_lookups{0};    // lookups of a test name, any thread
+std::atomic<int>  g_b_mode{0};     // b.pg.test: 0 — 127.0.0.2, 1 — fails, 2 — 127.0.0.3
+std::atomic<int>  g_flips{0};      // lookups of flip.pg.test: the first 127.0.0.1, then 127.0.0.2
+std::chrono::nanoseconds g_offset{0};
 }
+
+// steady_clock::now() is defined in this binary: the monotonic clock plus an
+// offset a test moves.
+namespace std::chrono
+{
+steady_clock::time_point steady_clock::now() noexcept
+{
+    timespec ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return time_point(duration(std::chrono::seconds(ts.tv_sec) + std::chrono::nanoseconds(ts.tv_nsec)))
+        + g_offset;
+}
+} // namespace std::chrono
 
 extern "C" int getaddrinfo(const char* node, const char* service, const addrinfo* hints, addrinfo** res)
 {
@@ -60,6 +89,20 @@ extern "C" int getaddrinfo(const char* node, const char* service, const addrinfo
         ++g_on_loop;
     if (n.starts_with("gone."))
         return EAI_NONAME;
+    if (n == "a.pg.test")
+        return real("127.0.0.1", service, hints, res);
+    if (n == "b.pg.test") {
+        const int m = g_b_mode;
+        if (m == 1)
+            return EAI_AGAIN;
+        return real(m == 2 ? "127.0.0.3" : "127.0.0.2", service, hints, res);
+    }
+    if (n == "flip.pg.test")
+        return real(g_flips++ == 0 ? "127.0.0.1" : "127.0.0.2", service, hints, res);
+    if (n.starts_with("quick.")) {
+        std::this_thread::sleep_for(300ms);
+        return real("127.0.0.1", service, hints, res);
+    }
     std::this_thread::sleep_for(1500ms);
     return real("127.0.0.1", service, hints, res);
 }
@@ -285,6 +328,269 @@ void leader_on_slow_name()
     check(g_on_loop == 0, "leader: nothing looked up on the loop's thread");
 }
 
+// ── 4–6. the resolver itself ────────────────────────────────────────────────
+
+struct Lookups
+{
+    int                  done = 0;
+    PgResolver::Outcome  last;
+};
+
+// Runs the loop until one more lookup has ended, or 3 s.
+void await(EventLoop& loop, Lookups& seen)
+{
+    const int before = seen.done;
+    for (int i = 0; i < 300 && seen.done == before; ++i)
+        loop.run_for(10ms);
+}
+
+void resolver_partial_failure()
+{
+    g_b_mode = 0;
+    EventLoop loop;
+    Lookups seen;
+    PgResolver r{loop, "host=a.pg.test,b.pg.test port=1 user=t",
+                 [&](const PgResolver::Outcome& o) { ++seen.done; seen.last = o; }};
+    (void)r.conninfo();
+    await(loop, seen);
+    const auto first = r.conninfo().value_or("");
+    check(first.find("127.0.0.2") != std::string::npos, "partial: both names found (" + first + ")");
+
+    g_b_mode = 1;
+    r.stale();
+    (void)r.conninfo();
+    await(loop, seen);
+    const auto after = r.conninfo().value_or("");
+    check(after.find("127.0.0.1") != std::string::npos && after.find("127.0.0.2") != std::string::npos,
+          "partial: the name that failed keeps its last address (" + after + ")");
+    g_b_mode = 0;
+}
+
+void resolver_waits_after_stale()
+{
+    g_b_mode = 0;
+    EventLoop loop;
+    Lookups seen;
+    PgResolver r{loop, "host=b.pg.test port=1 user=t",
+                 [&](const PgResolver::Outcome& o) { ++seen.done; seen.last = o; }};
+    (void)r.conninfo();
+    await(loop, seen);
+
+    g_b_mode = 2;   // the server moved
+    r.stale();
+    const auto now = r.conninfo();
+    check(!now, "stale: the next string waits (" + now.value_or("nullopt") + ")");
+    await(loop, seen);
+    const auto fresh = r.conninfo().value_or("");
+    check(fresh.find("127.0.0.3") != std::string::npos && fresh.find("127.0.0.2") == std::string::npos,
+          "stale: then the fresh address (" + fresh + ")");
+    g_b_mode = 0;
+}
+
+void resolver_failure_not_repeated()
+{
+    g_b_mode = 0;
+    EventLoop loop;
+    Lookups seen;
+    PgResolver r{loop, "host=b.pg.test port=1 user=t",
+                 [&](const PgResolver::Outcome& o) { ++seen.done; seen.last = o; }};
+    (void)r.conninfo();
+    await(loop, seen);
+
+    g_b_mode = 1;
+    g_offset += PgResolver::kMaxAge + 1s;   // the answer is old: a refresh is due
+    (void)r.conninfo();
+    await(loop, seen);
+    check(!seen.last.error.empty(), "failed refresh: the lookup says the name failed (" + seen.last.error + ")");
+
+    g_lookups = 0;
+    for (int i = 0; i < 5; ++i) {
+        const auto s = r.conninfo();
+        check(s && s->find("127.0.0.2") != std::string::npos, "failed refresh: the old address is handed out");
+        loop.run_for(50ms);
+    }
+    check(g_lookups == 0, "failed refresh: not looked up again before the pause ("
+                              + std::to_string(g_lookups.load()) + " lookups)");
+
+    g_offset += 6s;   // past the 5 s pause
+    (void)r.conninfo();
+    await(loop, seen);
+    check(g_lookups == 1, "failed refresh: looked up again after the pause");
+    g_b_mode = 0;
+}
+
+// ── 7. a lost connection after the name moved ───────────────────────────────
+//
+// One port on 127.0.0.1 and 127.0.0.2. On .1 the first connection is served
+// for 2 s and every other one is closed at once — so the pool's second
+// connection fails, looks the name up again and lands on .2; then the first
+// one is lost. Every connection to .1 after that is reported.
+
+long long ms_now()
+{
+    timespec ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
+}
+
+int listen_on(const char* ip, int port)
+{
+    const int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    const int one = 1;
+    ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port   = htons(static_cast<uint16_t>(port));
+    ::inet_pton(AF_INET, ip, &a.sin_addr);
+    if (::bind(lfd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0 || ::listen(lfd, 8) != 0) {
+        ::close(lfd);
+        return -1;
+    }
+    return lfd;
+}
+
+int free_port()
+{
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t alen    = sizeof a;
+    ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
+    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &alen);
+    ::close(fd);
+    return ntohs(a.sin_port);
+}
+
+std::string drain(int fd)
+{
+    std::string got;
+    char buf[512];
+    ssize_t r;
+    while ((r = ::read(fd, buf, sizeof buf)) > 0)
+        got.append(buf, static_cast<std::size_t>(r));
+    return got;
+}
+
+void pool_lost_after_move()
+{
+    g_flips = 0;
+    const int port = free_port();
+    const int l1 = listen_on("127.0.0.1", port);
+    const int l2 = listen_on("127.0.0.2", port);
+    int p[2];
+    if (l1 < 0 || l2 < 0 || ::pipe(p) != 0) {
+        check(false, "moved: two listeners");
+        return;
+    }
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        ::close(p[0]);
+        long long first = 0;
+        pollfd fds[2] = {{l1, POLLIN, 0}, {l2, POLLIN, 0}};
+        for (;;) {
+            if (::poll(fds, 2, -1) <= 0)
+                continue;
+            for (int i = 0; i < 2; ++i) {
+                if (!(fds[i].revents & POLLIN))
+                    continue;
+                const int fd = ::accept(fds[i].fd, nullptr, nullptr);
+                if (fd < 0)
+                    continue;
+                if (i == 1 || first == 0) {
+                    if (i == 0)
+                        first = ms_now();
+                    if (::fork() == 0) {
+                        if (i == 0)
+                            ::alarm(2);   // the first connection to .1 is lost after 2 s
+                        session(fd, p[1]);
+                    }
+                } else if (ms_now() - first > 1900) {
+                    write_all(p[1], "late\n");
+                }
+                ::close(fd);
+            }
+        }
+    }
+    ::close(l1);
+    ::close(l2);
+    ::close(p[1]);
+    ::fcntl(p[0], F_SETFL, ::fcntl(p[0], F_GETFL) | O_NONBLOCK);
+
+    {
+        EventLoop loop;
+        PgPool pool{loop, conninfo("flip.pg.test", port), 2, 2};
+        pool.set_reset({});
+        pool.start();
+        loop.run_for(4500ms);
+        bool answered = false;
+        pool.execute("SELECT 'after'", [&](std::vector<PgResult> r) { answered = r.size() == 1 && r[0].ok(); },
+                     [](std::string_view) {});
+        loop.run_for(1000ms);
+        check(answered, "moved: the pool still answers");
+    }
+    ::kill(pid, SIGTERM);
+    ::waitpid(pid, nullptr, 0);
+    const auto got = drain(p[0]);
+    ::close(p[0]);
+    const auto late = static_cast<int>(std::count(got.begin(), got.end(), 'l'));
+    check(late == 0, "moved: nothing reconnects to the old address once the connection is lost ("
+                         + std::to_string(late) + " times)");
+}
+
+// ── 8. the leader's attempts follow its ticks ───────────────────────────────
+
+void leader_connects_on_tick()
+{
+    const int port = free_port();
+    const int lfd  = listen_on("127.0.0.1", port);
+    int p[2];
+    if (lfd < 0 || ::pipe(p) != 0) {
+        check(false, "leader ticks: a listener");
+        return;
+    }
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        ::close(p[0]);
+        for (;;) {
+            const int fd = ::accept(lfd, nullptr, nullptr);
+            if (fd < 0)
+                _exit(2);
+            write_all(p[1], std::to_string(ms_now()) + "\n");
+            ::close(fd);   // every attempt fails
+        }
+    }
+    ::close(lfd);
+    ::close(p[1]);
+    ::fcntl(p[0], F_SETFL, ::fcntl(p[0], F_GETFL) | O_NONBLOCK);
+    {
+        EventLoop loop;
+        PgLeaderLock lock{loop, conninfo("quick.pg.test", port), "test/leader", "test", 1s, nullptr};
+        lock.start([] {}, [](std::string_view) {});
+        loop.run_for(5000ms);
+    }
+    ::kill(pid, SIGTERM);
+    ::waitpid(pid, nullptr, 0);
+    const auto got = drain(p[0]);
+    ::close(p[0]);
+
+    std::vector<long long> at;
+    std::size_t pos = 0;
+    while (pos < got.size()) {
+        const auto nl = got.find('\n', pos);
+        if (nl == std::string::npos)
+            break;
+        at.push_back(std::stoll(got.substr(pos, nl - pos)));
+        pos = nl + 1;
+    }
+    long long closest = 1000000;
+    for (std::size_t i = 1; i < at.size(); ++i)
+        closest = std::min(closest, at[i] - at[i - 1]);
+    check(at.size() >= 2, "leader ticks: it keeps trying (" + std::to_string(at.size()) + " attempts)");
+    check(closest >= 700, "leader ticks: no attempt between two ticks (closest "
+                              + std::to_string(closest) + " ms apart)");
+}
+
 } // namespace
 
 int main()
@@ -293,6 +599,11 @@ int main()
     pool_on_slow_name();
     pool_on_gone_name();
     leader_on_slow_name();
+    resolver_partial_failure();
+    resolver_waits_after_stale();
+    resolver_failure_not_repeated();
+    pool_lost_after_move();
+    leader_connects_on_tick();
 
     if (g_failed) {
         std::printf("pg_resolve_test: %d check(s) failed\n", g_failed);

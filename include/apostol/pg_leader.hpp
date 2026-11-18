@@ -123,7 +123,7 @@ private:
     void drop(std::string_view why);
     void close();
     void lose(std::string_view why);
-    void on_resolved(bool ok, bool kept, std::string_view error);
+    void on_resolved(bool ok, bool kept, bool awaited, std::string_view error);
     std::string tag() const;
 
     EventLoop&           loop_;
