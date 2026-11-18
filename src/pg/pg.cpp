@@ -2228,8 +2228,12 @@ void PgPool::deliver_lost()
     // What it adds is delivered by the timer it arms, on the next turn — so
     // such a handler still runs once per turn until it stops resending, or
     // until detach() silences it.
-    // A handler that throws leaves the rest here with no timer (the one that
-    // ran this is spent): re-armed on the way out, whichever way that is.
+    // This runs from a timer, and the loop lets an exception out of a timer
+    // end the process. A handler's exception therefore stays here: it is
+    // logged, and the entries after it are still delivered, on this turn.
+    // Anything else that unwinds (a move, the log itself) leaves the rest with
+    // no timer — the one that ran this is spent — so it is re-armed on the way
+    // out, whichever way that is.
     struct Rearm
     {
         PgPool& pool;
@@ -2245,16 +2249,31 @@ void PgPool::deliver_lost()
         if (l.query->canceled())
             continue;
 
-        if (l.query->has_exception_handler()) {
-            l.query->fail(l.error);
-        } else {
-            // As with a failed statement (see on_io): a caller without an error
-            // handler still gets its call, with a result that is not ok().
-            std::vector<PgResult> results;
-            results.push_back(std::move(l.result));
-            l.query->deliver(std::move(results));
+        try {
+            if (l.query->has_exception_handler()) {
+                l.query->fail(l.error);
+            } else {
+                // As with a failed statement (see on_io): a caller without an error
+                // handler still gets its call, with a result that is not ok().
+                std::vector<PgResult> results;
+                results.push_back(std::move(l.result));
+                l.query->deliver(std::move(results));
+            }
+        } catch (const std::exception& e) {
+            log_lost_handler_exception(l.query->id(), e.what());
+        } catch (...) {
+            log_lost_handler_exception(l.query->id(), "unknown exception");
         }
     }
+}
+
+void PgPool::log_lost_handler_exception(QueryId id, const char* what) noexcept
+{
+    if (!pg_logger_)
+        return;
+    try {
+        pg_logger_->error("PgPool: the handler of lost query {} threw: {}", id, what);
+    } catch (...) {}
 }
 
 bool PgPool::refuse_nul(std::unique_ptr<PgQuery>& q)

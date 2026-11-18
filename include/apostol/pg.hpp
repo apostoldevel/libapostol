@@ -825,7 +825,11 @@ private:
 
     /// Tell the callers in lost_ — from the loop, on a clean stack. Only the
     /// entries there when it starts: one a handler adds waits for the timer.
+    /// A handler that throws is logged and the next entry still runs.
     void deliver_lost();
+
+    /// Log, at error, that the handler of lost query @p id threw @p what.
+    void log_lost_handler_exception(QueryId id, const char* what) noexcept;
 
     /// A statement holding a NUL byte: moved to lost_ to fail with
     /// nul_refusal from the loop, and true. False — @p q is left as it was.

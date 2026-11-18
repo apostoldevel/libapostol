@@ -13,7 +13,8 @@
 //      refusal comes on a turn of its own, and the loop keeps running
 //      (a timer set alongside still fires);
 //   6. detach() after a refusal: no handler is called;
-//   7. a handler that throws: the refusal after it is still delivered;
+//   7. a handler that throws (error or result): the exception stays in the
+//      pool, and the refusal after it is delivered on the same turn;
 //   8. control — the same calls without the NUL byte are not refused: the
 //      pool and the listener open a socket for them, inside the call.
 //
@@ -168,11 +169,21 @@ void handler_throws()
     int second = 0;
     f.pool.execute(with_nul(), {}, [&](std::string_view) { throw std::runtime_error("handler"); });
     f.pool.execute(with_nul(), {}, [&](std::string_view) { ++second; });
-    for (int i = 0; i < 3 && second == 0; ++i) {
-        try { f.turn(); } catch (...) {}
-    }
-    check(second == 1, "handler throws: the next refusal is still delivered");
+    bool escaped = false;
+    try { f.turn(); } catch (...) { escaped = true; }
+    check(!escaped, "handler throws: the exception does not leave the loop");
+    check(second == 1, "handler throws: the next refusal is delivered on the same turn");
     check(f.pool.outstanding() == 0, "handler throws: nothing outstanding");
+
+    // The same for a caller with a result handler only.
+    int third = 0;
+    f.pool.execute(with_nul(), [&](std::vector<PgResult>) { throw std::runtime_error("result handler"); });
+    f.pool.execute(with_nul(), [&](std::vector<PgResult>) { ++third; });
+    escaped = false;
+    try { f.turn(); } catch (...) { escaped = true; }
+    check(!escaped, "result handler throws: the exception does not leave the loop");
+    check(third == 1, "result handler throws: the next refusal is delivered on the same turn");
+    check(f.pool.outstanding() == 0, "result handler throws: nothing outstanding");
 }
 
 void resent_from_handler()
