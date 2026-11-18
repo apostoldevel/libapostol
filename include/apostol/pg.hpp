@@ -942,7 +942,9 @@ private:
         std::string              error;
         PgResult                 result;   // for a caller without an error handler
     };
-    std::vector<Lost>                      lost_;
+    // A deque: taken from the front one at a time (deliver_lost()), added at
+    // the back — both constant, however many a flood of refusals leaves here.
+    std::deque<Lost>                       lost_;
     EventLoop::TimerId                     lost_timer_{EventLoop::kInvalidTimer};
 
 #ifdef LIBPQ_HAS_ASYNC_CANCEL

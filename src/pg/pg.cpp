@@ -2242,7 +2242,7 @@ void PgPool::deliver_lost()
 
     for (std::size_t n = lost_.size(); n > 0 && !lost_.empty(); --n) {
         Lost l = std::move(lost_.front());
-        lost_.erase(lost_.begin());
+        lost_.pop_front();
 
         // cancel() and detach() reach a query here as well; deliver() and fail()
         // check detached() themselves, canceled() is checked here as on_io does.
@@ -2284,10 +2284,10 @@ bool PgPool::refuse_nul(std::unique_ptr<PgQuery>& q)
         return false;
 
     // Everything that may throw comes before q is moved: a throw leaves the
-    // caller its query and no entry half made.
+    // caller its query and no entry half made (the entry goes in first, without
+    // it — see below).
     std::string error{nul_refusal};
     PgResult result = PgResult::lost(error);
-    lost_.reserve(lost_.size() + 1);
 
     // Not the statement: what precedes the byte is a caller's data. A log
     // that throws does not turn the refusal into an exception from execute().
@@ -2299,7 +2299,8 @@ bool PgPool::refuse_nul(std::unique_ptr<PgQuery>& q)
 
     // From the loop, as for a lost query: the caller is still inside the call,
     // often inside a handler of its own with its state half set.
-    lost_.push_back(Lost{std::move(q), std::move(error), std::move(result)});
+    lost_.push_back(Lost{nullptr, std::move(error), std::move(result)});
+    lost_.back().query = std::move(q);
     arm_lost_delivery();
     return true;
 }

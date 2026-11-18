@@ -16,7 +16,9 @@
 //   7. a handler that throws (error or result): the exception stays in the
 //      pool, and the refusal after it is delivered on the same turn;
 //   8. control — the same calls without the NUL byte are not refused: the
-//      pool and the listener open a socket for them, inside the call.
+//      pool and the listener open a socket for them, inside the call;
+//   9. a flood of refusals costs time in proportion to their number: twice as
+//      many take about twice as long to refuse and deliver, not four times.
 //
 // Usage: pg_nul_test
 
@@ -25,6 +27,7 @@
 
 #include <dirent.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -230,6 +233,44 @@ void control()
     }
 }
 
+// N refusals, then the turns that deliver them: seconds for both.
+double flood_seconds(int n)
+{
+    Fixture f;
+    int got = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < n; ++i)
+        f.pool.execute(with_nul(), {}, [&](std::string_view) { ++got; });
+    for (int i = 0; i < 1000 && got < n; ++i)
+        f.turn(10ms);
+    const auto t1 = std::chrono::steady_clock::now();
+    if (got != n)
+        return -1;
+    return std::chrono::duration<double>(t1 - t0).count();
+}
+
+void flood()
+{
+    // The best of three for each size: the ratio is what is judged, and one
+    // slow run on a busy machine must not decide it.
+    double one = 1e9, two = 1e9;
+    for (int i = 0; i < 3; ++i) {
+        const double a = flood_seconds(20000);
+        const double b = flood_seconds(40000);
+        if (a < 0 || b < 0) {
+            check(false, "flood: every refusal delivered");
+            return;
+        }
+        one = std::min(one, a);
+        two = std::min(two, b);
+    }
+    const double ratio = two / one;
+    char line[160];
+    std::snprintf(line, sizeof line, "flood: 20000 refusals %.3f s, 40000 %.3f s, ratio %.2f (below 3)",
+                  one, two, ratio);
+    check(ratio < 3.0, line);
+}
+
 } // namespace
 
 int main()
@@ -242,6 +283,7 @@ int main()
     handler_throws();
     resent_from_handler();
     control();
+    flood();
 
     if (g_failed) {
         std::printf("pg_nul_test: %d check(s) failed\n", g_failed);
