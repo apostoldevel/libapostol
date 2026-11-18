@@ -32,6 +32,9 @@ namespace apostol::db_platform
 ///
 /// On success the session behind the *previous* token is signed out, once its
 /// replacement is in hand.
+///
+/// @p token may be destroyed with the request in flight: the outcome is then
+/// dropped (ServiceToken::lifetime()). @p log must outlive the request.
 void refresh_service_token(PgPool& pool, ServiceToken& token, Logger& log,
                            std::string_view tag,
                            std::string client_id, std::string client_secret,

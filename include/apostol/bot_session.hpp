@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -92,6 +93,11 @@ class BotSession
 public:
     BotSession(PgPool& pool, std::string agent, std::string host);
 
+    // Not copyable: the pool's handlers of a request in flight check the life
+    // token of the object that sent it, and a copy would share it.
+    BotSession(const BotSession&)            = delete;
+    BotSession& operator=(const BotSession&) = delete;
+
     /// First session, or empty. Convenience for callers that act on one object and
     /// do not enumerate — the scope is decided by the object, not by the caller.
     ///
@@ -115,16 +121,21 @@ public:
     /// Call from heartbeat(). Refreshes session if expired or not yet obtained.
     /// Mirrors v1: login → get_session → signout(login_session).
     ///
-    /// An attempt that fails — no credentials set, the batch refused, or lost on
-    /// its way — is written to the process log (EventLoop::diagnostics()) at error
-    /// level under the agent, as detail::SignInReport decides; a session obtained
+    /// An attempt that fails — no credentials set, the batch refused or lost on
+    /// its way, a sign-in that found no session in any scope — is written to the
+    /// process log (EventLoop::diagnostics()) at error level under the agent, as
+    /// detail::SignInReport decides; a session obtained
     /// after failures, at notice level. Without that line a background component
     /// that cannot sign in runs, takes no work and says nothing.
     void refresh_if_needed();
 
     /// Why the last failed attempt obtained no session; empty until one fails and
     /// again once a session is obtained. An attempt that signed in but found no
-    /// session in any scope does not set it.
+    /// session in any scope is a failed one: it sets this, is written to the log
+    /// and is retried no sooner than k_retry_interval later.
+    ///
+    /// The object may be destroyed with a request in flight: the pool's handlers
+    /// hold a weak reference to it and do nothing once it is gone.
     const std::string& last_error() const noexcept { return last_error_; }
 
     /// Sign out the session obtained by the *login* step. The bot's own sessions are
@@ -169,6 +180,9 @@ private:
     std::chrono::steady_clock::time_point expiry_{};
     std::chrono::steady_clock::time_point retry_at_{};
     bool refreshing_{false};
+
+    // Life token: the pool's handlers hold a weak_ptr to it, not a bare this.
+    std::shared_ptr<int> alive_{std::make_shared<int>(0)};
 
 #ifdef WITH_DB_PLATFORM
     std::string          last_error_;

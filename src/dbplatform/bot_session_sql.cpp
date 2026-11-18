@@ -161,9 +161,18 @@ void BotSession::refresh_if_needed()
         pq_quote_literal(host_));
 
     // quiet: the statement carries client_secret, and PgPool logs statement text.
+    //
+    // The handlers hold a weak reference to this object, not a bare this: the
+    // owner may destroy it with the batch in flight (a process that stops, a
+    // module that is replaced), and the pool still delivers the outcome.
+    const std::weak_ptr<int> alive = alive_;
+
     pool_.execute(sql,
-        [this](std::vector<PgResult> results) {
-            // results[0] = login, results[1] = get_session
+        [this, alive](std::vector<PgResult> results) {
+            if (alive.expired())
+                return;
+
+            // results[0] = login, results[1] = get_sessions
             if (results.size() < 2) {
                 refreshing_ = false;
                 retry_at_ = std::chrono::steady_clock::now() + k_retry_interval;
@@ -190,9 +199,8 @@ void BotSession::refresh_if_needed()
             }
 
             // Extract the bot sessions — one row per scope.
+            std::vector<std::string> found;
             if (results[1].ok() && results[1].columns() > 0) {
-                std::vector<std::string> found;
-
                 for (int row = 0; row < results[1].rows(); ++row) {
                     const char* v = results[1].value(row, 0);
                     if (!v || v[0] == '\0')
@@ -207,12 +215,24 @@ void BotSession::refresh_if_needed()
                         found.emplace_back(v);
                     }
                 }
+            }
 
-                if (!found.empty()) {
-                    sessions_ = std::move(found);
-                    expiry_ = std::chrono::steady_clock::now() + k_refresh_interval;
-                    obtained();
-                }
+            // Signed in, but no session to work under: as failed as a refused
+            // sign-in, and treated the same way — a line in the log and the
+            // retry pause. Without it the next heartbeat signs in again, and
+            // every heartbeat after that, silently.
+            const bool got = !found.empty();
+            if (got) {
+                sessions_ = std::move(found);
+                expiry_ = std::chrono::steady_clock::now() + k_refresh_interval;
+                obtained();
+            } else {
+                retry_at_ = std::chrono::steady_clock::now() + k_retry_interval;
+                failed(results[1].ok()
+                           ? fmt::format("signed in, but api.get_sessions found no session "
+                                         "for user '{}' in any scope", username_)
+                           : fmt::format("signed in, but api.get_sessions failed ({})",
+                                         results[1].status_string()));
             }
 
             // Step 3: signout the login token_session (cleanup)
@@ -222,11 +242,13 @@ void BotSession::refresh_if_needed()
                     pq_quote_literal(token_session));
 
                 pool_.execute(sql3,
-                    [this](std::vector<PgResult> /*r*/) {
-                        refreshing_ = false;
+                    [this, alive](std::vector<PgResult> /*r*/) {
+                        if (!alive.expired())
+                            refreshing_ = false;
                     },
-                    [this](std::string_view /*error*/) {
-                        refreshing_ = false;
+                    [this, alive](std::string_view /*error*/) {
+                        if (!alive.expired())
+                            refreshing_ = false;
                     },
                     /*quiet=*/true);
             } else {
@@ -234,7 +256,9 @@ void BotSession::refresh_if_needed()
                 retry_at_ = std::chrono::steady_clock::now() + k_retry_interval;
             }
         },
-        [this](std::string_view error) {
+        [this, alive](std::string_view error) {
+            if (alive.expired())
+                return;
             refreshing_ = false;
             retry_at_ = std::chrono::steady_clock::now() + k_retry_interval;
             // The batch is quiet: the pool hands over text that does not quote the

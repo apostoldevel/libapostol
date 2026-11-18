@@ -263,9 +263,16 @@ void refresh_service_token(PgPool& pool, ServiceToken& token, Logger& log,
 
     std::string label(tag);
 
+    // The handlers check the token's life before they touch it: its owner may be
+    // destroyed with the request in flight, and the pool still delivers the outcome.
+    auto alive = token.lifetime();
+
     // quiet: the statement carries client_secret, and PgPool logs statement text.
     pool.execute(sql,
-        [&pool, &token, &log, label, client_id](std::vector<PgResult> results) {
+        [&pool, &token, &log, alive, label, client_id](std::vector<PgResult> results) {
+            if (alive.expired())
+                return;
+
             if (results.empty() || !results[0].ok()
                 || results[0].rows() == 0 || results[0].columns() == 0) {
                 log.error("{} service token for \"{}\": no result from daemon.token",
@@ -339,7 +346,9 @@ void refresh_service_token(PgPool& pool, ServiceToken& token, Logger& log,
             close_session(pool, token.take_previous_token(), &log, label);
             token.take_previous_session();   // discard; closed above
         },
-        [&token, &log, label, client_id](std::string_view error) {
+        [&token, &log, alive, label, client_id](std::string_view error) {
+            if (alive.expired())
+                return;
             log.error("{} service token for \"{}\": {}", label, client_id, error);
             token.failed();
         },

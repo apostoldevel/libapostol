@@ -157,3 +157,12 @@ target_link_libraries(service_token_test PRIVATE apostol)
 target_compile_options(service_token_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME service_token COMMAND service_token_test)
 set_tests_properties(service_token PROPERTIES TIMEOUT 60)
+
+# bot_session_test — BotSession's outcome of a sign-in that finds no session,
+# and the pool's handlers of BotSession and refresh_service_token() once their
+# owner is destroyed with a request in flight; a child process plays the server.
+add_executable(bot_session_test bot_session_test.cpp)
+target_link_libraries(bot_session_test PRIVATE apostol)
+target_compile_options(bot_session_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME bot_session COMMAND bot_session_test)
+set_tests_properties(bot_session PROPERTIES TIMEOUT 60)

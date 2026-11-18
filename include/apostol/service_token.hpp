@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <memory>
 #include <string>
 
 namespace apostol
@@ -44,6 +45,14 @@ class ServiceToken
 {
 public:
     ServiceToken() = default;
+
+    // Not copyable: lifetime() is this object's, and a copy would share it.
+    ServiceToken(const ServiceToken&)            = delete;
+    ServiceToken& operator=(const ServiceToken&) = delete;
+
+    /// Expires with this object. A request in flight on its behalf holds this,
+    /// not a reference, and reports nothing once the object is gone.
+    std::weak_ptr<const int> lifetime() const noexcept { return alive_; }
 
     /// True while a token is held and the issuer would still accept it. Distinct
     /// from being due for renewal: a token stays usable through the renewal margin,
@@ -119,6 +128,8 @@ private:
     std::chrono::seconds backoff_{0};
     bool refreshing_{false};
     bool timed_out_{false};
+
+    std::shared_ptr<int> alive_{std::make_shared<int>(0)};
 };
 
 } // namespace apostol
