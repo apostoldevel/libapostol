@@ -582,14 +582,16 @@ int PgConnection::consume_notify(
     bool alive = (PQconsumeInput(conn_.get()) != 0);
 
     int count = 0;
-    PGnotify* notify;
+    struct FreeNotify
+    {
+        void operator()(PGnotify* n) const noexcept { PQfreemem(n); }
+    };
     // Drain what libpq already parsed even when the read failed: those
     // notifications did arrive, and dropping them would turn one dead socket
-    // into lost work.
-    while ((notify = PQnotifies(conn_.get())) != nullptr) {
+    // into lost work. Each is freed however the callback leaves.
+    while (auto notify = std::unique_ptr<PGnotify, FreeNotify>(PQnotifies(conn_.get()))) {
         if (cb)
             cb(notify->relname, notify->extra);
-        PQfreemem(notify);
         ++count;
         if (alive)
             alive = (PQconsumeInput(conn_.get()) != 0);
@@ -1299,9 +1301,18 @@ bool PgPool::cancel(QueryId id)
         }
     }
 
-    // Not in-flight — mark for removal from queue
-    canceled_ids_.insert(id);
-    return true;
+    // Queued: marked, and dropped where the queue is read (dispatch_queue(),
+    // the age watch, fail_stranded()). The mark travels with the query, so
+    // nothing is kept for an id that is no longer anywhere.
+    for (auto& q : queue_) {
+        if (q->id() == id) {
+            q->mark_canceled();
+            return true;
+        }
+    }
+
+    // Finished, failed, refused, or never issued: nothing to cancel.
+    return false;
 }
 
 #ifdef LIBPQ_HAS_ASYNC_CANCEL
@@ -1519,10 +1530,9 @@ void PgPool::dispatch_queue(PgConnection& conn)
     bool expired_any = false;
     while (!queue_.empty()) {
         auto& front = queue_.front();
-        if (canceled_ids_.count(front->id())) {
+        if (front->canceled()) {
             if (pg_logger_)
                 pg_logger_->debug("Dropping canceled queued query {}", front->id());
-            canceled_ids_.erase(front->id());
             queue_.pop_front();
             continue;
         }
@@ -2160,9 +2170,9 @@ void PgPool::fail_inflight_query(PgConnection& conn, std::string_view reason)
         // Canceled: its caller has already been told the result will be thrown
         // away (cancel(), pg.hpp: "result is silently discarded" — so even when
         // PQcancel did not get through). Re-queued, it ran a second time on the
-        // new connection only for the answer to be discarded: dispatch_queue()
-        // drops a canceled query by canceled_ids_, and an in-flight cancel()
-        // never puts its id there — it marks the query instead.
+        // new connection only for the answer to be discarded. Queued, it would
+        // count in queue_size() and outstanding() until dispatch_queue() met
+        // it — dropped here instead.
         if (owned->canceled()) {
             if (pg_logger_)
                 pg_logger_->debug("Dropping canceled query {} after connection error: {}",
@@ -2417,8 +2427,7 @@ std::size_t PgPool::expire_queued(std::chrono::steady_clock::time_point now)
     std::size_t n = 0;
     std::uint64_t first = 0, last = 0;
     for (auto it = queue_.begin(); it != queue_.end();) {
-        if (canceled_ids_.count((*it)->id())) {
-            canceled_ids_.erase((*it)->id());
+        if ((*it)->canceled()) {
             it = queue_.erase(it);
             continue;
         }
@@ -2777,8 +2786,7 @@ std::size_t PgPool::fail_stranded(std::string_view reason, std::chrono::millisec
     // discarded (cancel()), and dispatch_queue() would only drop it. Dropped
     // now, so that it holds the finish no longer — outstanding() counts it.
     for (auto it = queue_.begin(); it != queue_.end();) {
-        if (canceled_ids_.count((*it)->id())) {
-            canceled_ids_.erase((*it)->id());
+        if ((*it)->canceled()) {
             it = queue_.erase(it);
         } else {
             ++it;
@@ -3238,8 +3246,12 @@ void PgPool::unlisten(std::string_view channel)
     single_listens_.erase(ch);
     rejected_listens_.erase(ch);
 
-    if (listener_ && listener_->state() == PgConnState::Ready)
-        listener_->send_query("UNLISTEN " + pq_quote_ident(ch));
+    // From a notification handler the listener is not replaced here (see
+    // listen()): consume_notify() is iterating it.
+    if (listener_ && listener_->state() == PgConnState::Ready
+        && listener_->send_query("UNLISTEN " + pq_quote_ident(ch))
+        && !watch_listener_out() && notify_depth_ == 0)
+        restart_listener("the listener could not be watched for the rest of UNLISTEN");
     // If listener is busy/connecting, callbacks are already removed from
     // notify_handlers_ so notifications won't be dispatched even if UNLISTEN
     // hasn't been sent yet.
@@ -3318,6 +3330,12 @@ void PgPool::listener_send_next()
         // The server has not got it: it goes first on the next listener.
         listener_queue_.push_front(ListenerQuery{std::move(listener_query_), lq.answer_within});
         restart_listener("send_query failed while shipping a listener statement");
+        return;
+    }
+    if (!watch_listener_out()) {
+        // Its tail is still here: the server has not run it either.
+        listener_queue_.push_front(ListenerQuery{std::move(listener_query_), lq.answer_within});
+        restart_listener("the listener could not be watched for the rest of a statement");
         return;
     }
 
@@ -3670,6 +3688,40 @@ void PgPool::send_pending_listens()
 
     sent_batch_size_ = sent.size();
     sent_listens_.insert(sent.begin(), sent.end());
+
+    if (!watch_listener_out())
+        restart_listener("the listener could not be watched for the rest of LISTEN");
+}
+
+bool PgPool::watch_listener_out()
+{
+    // A statement larger than the socket takes at once leaves its tail in
+    // libpq's buffer (PQflush returned 1). The server answers nothing before
+    // it has the whole statement, so no read comes to push the tail out: the
+    // listener is watched for writing until it is gone (on_listener_io()).
+    if (!listener_->needs_flush())
+        return true;
+    return rewatch_listener(EPOLLIN | EPOLLOUT);
+}
+
+bool PgPool::rewatch_listener(uint32_t events)
+{
+    try {
+        if (loop_.modify_io(listener_->fd(), events))
+            return true;
+        if (pg_logger_)
+            pg_logger_->error("{} Listener socket fd={} is no longer watched",
+                             conn_tag(*listener_), listener_->fd());
+    } catch (const std::exception& e) {
+        if (pg_logger_)
+            pg_logger_->error("{} Listener socket fd={} could not be re-watched: {}",
+                             conn_tag(*listener_), listener_->fd(), e.what());
+    } catch (...) {
+        if (pg_logger_)
+            pg_logger_->error("{} Listener socket fd={} could not be re-watched: unknown exception",
+                             conn_tag(*listener_), listener_->fd());
+    }
+    return false;
 }
 
 void PgPool::on_listener_io(uint32_t events)
@@ -3688,6 +3740,19 @@ void PgPool::on_listener_io(uint32_t events)
     // subscribed (the same as PgLeaderLock::on_io).
     if ((events & (EPOLLERR | EPOLLHUP)) && listener_->state() != PgConnState::Connecting)
         listener_->set_state(PgConnState::Error);
+
+    // The tail of a statement left in libpq's buffer (watch_listener_out()):
+    // written first; once it is out, the listener is watched for reading only.
+    // Not in a handshake — there EPOLLOUT is connect_poll()'s. A read below
+    // (PQconsumeInput) may push the tail out as well: the next EPOLLOUT then
+    // finds nothing to write and only drops the watch.
+    if ((events & EPOLLOUT) && (listener_->state() == PgConnState::Busy ||
+                                listener_->state() == PgConnState::Ready)) {
+        if ((!listener_->needs_flush() || listener_->flush()) && !rewatch_listener(EPOLLIN)) {
+            restart_listener("the listener could not be watched for reading");
+            return;
+        }
+    }
 
     switch (listener_->state()) {
 
@@ -3974,8 +4039,30 @@ void PgPool::dispatch_notify(const char* channel, const char* payload)
     // Copy the handler list — callbacks may mutate notify_handlers_ via unlisten()
     auto handlers = it->second;
     struct Depth { int& d; explicit Depth(int& x) : d(x) { ++d; } ~Depth() { --d; } } depth(notify_depth_);
-    for (const auto& cb : handlers)
-        cb(channel, payload ? payload : "");
+    // This runs inside the listener's I/O handler, and the loop answers an
+    // exception from there by shutting the socket: the listener would be
+    // replaced, and what the batch held after this notification lost with
+    // it. A handler's exception stays here — logged, and the other handlers
+    // and the rest of the batch still run.
+    for (const auto& cb : handlers) {
+        try {
+            cb(channel, payload ? payload : "");
+        } catch (const std::exception& e) {
+            log_listener_handler_exception("notification", channel, e.what());
+        } catch (...) {
+            log_listener_handler_exception("notification", channel, "unknown exception");
+        }
+    }
+}
+
+void PgPool::log_listener_handler_exception(const char* kind, std::string_view channel,
+                                            const char* what) noexcept
+{
+    if (!pg_logger_)
+        return;
+    try {
+        pg_logger_->error("PgPool: a {} handler of channel '{}' threw: {}", kind, channel, what);
+    } catch (...) {}
 }
 
 void PgPool::dispatch_listen_ready()
@@ -3997,10 +4084,19 @@ void PgPool::dispatch_listen_ready()
         if (it == ready_handlers_.end())
             continue;
 
-        // Copy the handler list — callbacks may mutate ready_handlers_
+        // Copy the handler list — callbacks may mutate ready_handlers_.
+        // Caught as in dispatch_notify(): thrown out, it took the listener down,
+        // and the next one confirmed the channel again — to the same handler.
         auto handlers = it->second;
-        for (const auto& cb : handlers)
-            cb(ch);
+        for (const auto& cb : handlers) {
+            try {
+                cb(ch);
+            } catch (const std::exception& e) {
+                log_listener_handler_exception("LISTEN ready", ch, e.what());
+            } catch (...) {
+                log_listener_handler_exception("LISTEN ready", ch, "unknown exception");
+            }
+        }
     }
 }
 

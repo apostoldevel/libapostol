@@ -166,3 +166,12 @@ target_link_libraries(bot_session_test PRIVATE apostol)
 target_compile_options(bot_session_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME bot_session COMMAND bot_session_test)
 set_tests_properties(bot_session PROPERTIES TIMEOUT 60)
+
+# pg_server_test — PgPool against a scripted server in a child process:
+# cancel() of a finished query, a listener handler that throws, a listener
+# statement larger than the socket takes at once.
+add_executable(pg_server_test pg_server_test.cpp)
+target_link_libraries(pg_server_test PRIVATE apostol)
+target_compile_options(pg_server_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME pg_server COMMAND pg_server_test)
+set_tests_properties(pg_server PROPERTIES TIMEOUT 60)

@@ -659,7 +659,8 @@ public:
     /// A canceled query is never sent again after a connection loss.
     /// Returns true if the query was found and the cancel started (sent, with
     /// an older libpq); a repeated call while a request is on its way starts
-    /// no second one.
+    /// no second one. False for an id that is not in flight, queued or lost:
+    /// finished, failed, refused, or never issued — nothing is kept for it.
     bool cancel(QueryId id);
 
     /// Call periodically (e.g. every 60s from module heartbeat).
@@ -707,6 +708,9 @@ public:
     /// answer came — that channel is confirmed by the next listener instead.
     /// A server that rejects every LISTEN (a hot standby: "cannot execute
     /// LISTEN during recovery") therefore never fires it at all.
+    ///
+    /// A handler of either kind that throws is logged at error; the other
+    /// handlers, and the notifications after it, still run on the same listener.
     void listen(const std::string& channel, NotifyHandler cb,
                 ListenReadyHandler on_ready = {});
 
@@ -988,7 +992,6 @@ private:
     std::chrono::seconds                       queue_timeout_{0};
     EventLoop::TimerId                         queue_timer_{EventLoop::kInvalidTimer};
     std::uint64_t                              refused_full_{0};  // in the current run, 0 — none
-    std::unordered_set<uint64_t>               canceled_ids_; // queued queries pending cancel
 
     // Exponential backoff for connect failures: prevents auth-fail / unreachable-host
     // tight loop from hammering PG with retries at full event-loop speed (and
@@ -1171,8 +1174,22 @@ private:
 
     void on_listener_io(uint32_t events);
     void send_pending_listens();
+
+    /// After a statement is shipped on the listener: if libpq kept part of it
+    /// (PQflush returned 1), watch the listener for writing as well. False —
+    /// the loop refused; the caller replaces the listener.
+    bool watch_listener_out();
+
+    /// Change what the loop watches the listener for. False — refused, logged.
+    bool rewatch_listener(uint32_t events);
+    /// Hand a notification to the channel's handlers; one that throws is
+    /// logged and the rest still run.
     void dispatch_notify(const char* channel, const char* payload);
+    /// Hand the confirmed channels to their on_ready handlers, the same way.
     void dispatch_listen_ready();
+    /// Log, at error, that a handler of @p kind on @p channel threw @p what.
+    void log_listener_handler_exception(const char* kind, std::string_view channel,
+                                        const char* what) noexcept;
 
     /// A channel to listen on, or a listener_execute() statement waiting: the
     /// listener has to exist.
