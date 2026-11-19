@@ -196,3 +196,11 @@ target_link_libraries(pg_server_test PRIVATE apostol)
 target_compile_options(pg_server_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME pg_server COMMAND pg_server_test)
 set_tests_properties(pg_server PROPERTIES TIMEOUT 60)
+
+# http_framing_test — one Content-Length per response; content_length() of a
+# value that does not fit; ".." segments in is_safe_path(); query decoding;
+# "Expect: 100-continue" answered before the body, after the answers due.
+add_executable(http_framing_test http_framing_test.cpp)
+target_link_libraries(http_framing_test PRIVATE apostol)
+target_compile_options(http_framing_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME http_framing COMMAND http_framing_test)

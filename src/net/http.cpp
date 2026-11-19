@@ -1,4 +1,5 @@
 #include "apostol/http.hpp"
+#include "apostol/http_utils.hpp"
 #include "apostol/event_loop.hpp"
 #include "apostol/logger.hpp"
 
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cerrno>
 #include <fcntl.h>
 #include <fmt/format.h>
@@ -24,35 +26,14 @@ namespace apostol
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
-static int hex_val(char c) noexcept
+/// A Content-Length value: digits only, within std::size_t; 0 otherwise.
+static std::size_t parse_content_length(std::string_view v) noexcept
 {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    return -1;
-}
-
-static std::string url_decode(std::string_view s)
-{
-    std::string out;
-    out.reserve(s.size());
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '+') {
-            out += ' ';
-        } else if (s[i] == '%' && i + 2 < s.size()) {
-            int hi = hex_val(s[i + 1]);
-            int lo = hex_val(s[i + 2]);
-            if (hi >= 0 && lo >= 0) {
-                out += static_cast<char>((hi << 4) | lo);
-                i += 2;
-            } else {
-                out += s[i];
-            }
-        } else {
-            out += s[i];
-        }
-    }
-    return out;
+    std::size_t val = 0;
+    const auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), val);
+    if (v.empty() || v.front() < '0' || v.front() > '9' || ec != std::errc{} || end != v.data() + v.size())
+        return 0;
+    return val;
 }
 
 static std::vector<std::pair<std::string,std::string>> parse_query(std::string_view q)
@@ -225,14 +206,7 @@ std::string HttpRequest::cookie(std::string_view name, std::string_view def) con
 
 std::size_t HttpRequest::content_length() const
 {
-    auto h = header("Content-Length");
-    if (h.empty()) return 0;
-    std::size_t val = 0;
-    for (char c : h) {
-        if (c < '0' || c > '9') return 0;
-        val = val * 10 + static_cast<std::size_t>(c - '0');
-    }
-    return val;
+    return parse_content_length(header("Content-Length"));
 }
 
 // ─── HttpResponse ────────────────────────────────────────────────────────────
@@ -482,22 +456,24 @@ std::string HttpResponse::serialize_head() const
 
     out += fmt::format("HTTP/1.1 {} {}\r\n", status_code_, status_text_);
 
-    // Write explicit headers first
-    for (const auto& [k, v] : headers_)
+    // One Content-Length — from the body, which is what goes out; a header of
+    // the caller's is not written beside it. The one exception is a suppressed
+    // body carrying its own header: a HEAD answer relayed from an upstream
+    // names the size of the resource, and the body here is empty by
+    // definition, so the caller's header is the truth.
+    const auto is_content_length = [](const std::string& k) {
+        return k.size() == 14 && strncasecmp(k.c_str(), "Content-Length", 14) == 0;
+    };
+    bool own_content_length = false;
+    for (const auto& [k, v] : headers_) {
+        if (is_content_length(k)) {
+            if (!suppress_body_ || own_content_length)
+                continue;
+            own_content_length = true;
+        }
         out += fmt::format("{}: {}\r\n", k, v);
-
-    // Always include Content-Length — from the body, which is what goes out.
-    // The one exception is a suppressed body carrying its own header: a HEAD
-    // answer relayed from an upstream names the size of the resource, and the
-    // body here is empty by definition, so the caller's header is the truth.
-    bool has_content_length = false;
-    if (suppress_body_)
-        for (const auto& [k, v] : headers_)
-            if (k.size() == 14 && strncasecmp(k.c_str(), "Content-Length", 14) == 0) {
-                has_content_length = true;
-                break;
-            }
-    if (!has_content_length)
+    }
+    if (!own_content_length)
         out += fmt::format("Content-Length: {}\r\n", body_size);
 
     out += "\r\n";
@@ -523,14 +499,7 @@ std::string HttpClientResponse::header(std::string_view name) const
 
 std::size_t HttpClientResponse::content_length() const
 {
-    auto h = header("Content-Length");
-    if (h.empty()) return 0;
-    std::size_t val = 0;
-    for (char c : h) {
-        if (c < '0' || c > '9') return 0;
-        val = val * 10 + static_cast<std::size_t>(c - '0');
-    }
-    return val;
+    return parse_content_length(header("Content-Length"));
 }
 
 // ─── HttpResponseParser — llhttp callbacks ───────────────────────────────────
@@ -732,6 +701,15 @@ int HttpParser::cb_on_headers_complete(llhttp_t* p)
     if (!cookie_hdr.empty())
         hp->current_.cookies = parse_cookies(cookie_hdr);
 
+    // "Expect: 100-continue" (RFC 9110 §10.1.1): the client waits for an
+    // interim answer before it sends the body. Not to HTTP/1.0 (§15.2), and
+    // only when a body is to come.
+    if (hp->continue_handler_
+        && (llhttp_get_http_major(p) > 1 || llhttp_get_http_minor(p) >= 1)
+        && ((p->flags & F_CHUNKED) != 0 || ((p->flags & F_CONTENT_LENGTH) != 0 && p->content_length > 0))
+        && ::strcasecmp(hp->current_.header("Expect").c_str(), "100-continue") == 0)
+        hp->continue_handler_();
+
     return 0;
 }
 
@@ -806,6 +784,7 @@ HttpParser::HttpParser(HttpParser&& o) noexcept
     , current_value_(std::move(o.current_value_))
     , in_message_(o.in_message_)
     , handler_(std::move(o.handler_))
+    , continue_handler_(std::move(o.continue_handler_))
 {
     // Fix userdata pointer — the parser stores a raw pointer to this
     if (parser_)
@@ -821,6 +800,7 @@ HttpParser& HttpParser::operator=(HttpParser&& o) noexcept
         current_field_ = std::move(o.current_field_);
         current_value_ = std::move(o.current_value_);
         in_message_    = o.in_message_;
+        continue_handler_ = std::move(o.continue_handler_);
         handler_       = std::move(o.handler_);
         if (parser_)
             parser_->data = this;
@@ -925,6 +905,8 @@ bool HttpConnection::on_readable(RequestHandler handler)
         bool& flag;
         ~DispatchGuard() { flag = false; }
     } dispatch_guard{dispatching_};
+
+    parser_.set_continue_handler([this] { send_continue(); });
 
     // Set the handler so the parser calls it per-request
     parser_.set_handler([&](HttpRequest req) {
@@ -1516,6 +1498,19 @@ bool HttpConnection::on_writable()
     after_response();
 
     return false;
+}
+
+void HttpConnection::send_continue()
+{
+    // The parser reads a request only when nothing is owed on the connection,
+    // so the answers before this one are whole in the buffer, if not yet out:
+    // the interim answer goes after them.
+    if (closed_)
+        return;
+    const bool idle = !has_pending_writes();
+    write_buf_.append("HTTP/1.1 100 Continue\r\n\r\n");
+    if (idle)
+        drain_buffer();   // a tail left by EAGAIN goes out on EPOLLOUT
 }
 
 bool HttpConnection::has_pending_writes() const noexcept

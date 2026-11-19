@@ -100,7 +100,8 @@ struct HttpRequest
     /// Value of the Content-Type header (empty if absent).
     std::string content_type() const { return header("Content-Type"); }
 
-    /// Numeric value of Content-Length (0 if absent or non-numeric).
+    /// Numeric value of Content-Length: 0 if absent, not digits only, or
+    /// larger than std::size_t holds.
     std::size_t content_length() const;
 };
 
@@ -238,6 +239,11 @@ public:
 
     void set_handler(Handler h) { handler_ = std::move(h); }
 
+    /// Called from feed() when the headers of a request that expects
+    /// "100-continue" are complete — HTTP/1.1 or later, with a body to come.
+    using ContinueHandler = std::function<void()>;
+    void set_continue_handler(ContinueHandler h) { continue_handler_ = std::move(h); }
+
     /// Feed @p len bytes. Returns false if the parser encountered an error.
     /// consumed() tells how many of them were parsed: fewer than @p len when
     /// the handler called hold(), or when llhttp paused after an Upgrade
@@ -287,6 +293,7 @@ private:
     std::string   error_msg_;
 
     Handler handler_;
+    ContinueHandler continue_handler_;
 
     void flush_header();  // move current_field_/value_ into current_.headers
 
@@ -315,7 +322,8 @@ struct HttpClientResponse
     /// Case-insensitive header lookup. Returns empty string when not found.
     std::string header(std::string_view name) const;
 
-    /// Numeric value of Content-Length (0 if absent or non-numeric).
+    /// Numeric value of Content-Length: 0 if absent, not digits only, or
+    /// larger than std::size_t holds.
     std::size_t content_length() const;
 };
 
@@ -541,6 +549,7 @@ private:
     std::size_t   file_remaining_{0};
 
     bool drain_buffer();
+    void send_continue();   // "100 Continue" after the answers already due
     bool drain_file();
     // The body file after its header block: queued for sendfile, or — behind
     // a file already in flight — read into the write buffer. Takes `fd`.
