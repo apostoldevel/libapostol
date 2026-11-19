@@ -135,6 +135,9 @@ struct AppSettings
 
     // ── Populate from loaded Config (JSON). ───────────────────────────────
     void populate(const Config& cfg);
+    // Numbers populate() found outside what their fields hold; validate()
+    // reports them. The fields keep their previous values.
+    std::vector<ValidationError> range_errors;
 
     // ── Strict validation (nginx-style). ──────────────────────────────────
     std::vector<ValidationError> validate() const;

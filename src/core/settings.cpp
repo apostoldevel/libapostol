@@ -6,6 +6,7 @@
 #include <fmt/format.h>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string_view>
 #include <utility>
@@ -49,6 +50,23 @@ std::filesystem::path AppSettings::resolve(std::string_view relative) const
 
 void AppSettings::populate(const Config& cfg)
 {
+    // A number its field cannot hold is an error validate() reports, and the
+    // field keeps what it had: the casts below used to wrap it — "workers"
+    // 4294967297 ran one worker, "log.max_size" -1 turned rotation off.
+    range_errors.clear();
+    const auto ranged = [&](std::string_view key, std::int64_t current,
+                            std::int64_t lo, std::int64_t hi) -> std::int64_t {
+        const std::int64_t v = cfg.get_int(key, current);
+        if (v < lo || v > hi) {
+            range_errors.push_back({std::string(key),
+                fmt::format("{} must be in range {}..{}, got {}", key, lo, hi, v)});
+            return current;
+        }
+        return v;
+    };
+    constexpr std::int64_t kIntMin = std::numeric_limits<int>::min();
+    constexpr std::int64_t kIntMax = std::numeric_limits<int>::max();
+
     locale = cfg.get_string("locale", locale);
 
     auto new_prefix = cfg.get_string("prefix", prefix);
@@ -81,29 +99,29 @@ void AppSettings::populate(const Config& cfg)
     if (auto v = cfg.get_string_opt("log.postgres"))
         postgres_log = resolve(*v);
     log_max_size = static_cast<std::uint64_t>(
-        cfg.get_int("log.max_size", static_cast<std::int64_t>(log_max_size)));
-    log_keep_rotated = static_cast<int>(
-        cfg.get_int("log.keep_rotated", log_keep_rotated));
+        ranged("log.max_size", static_cast<std::int64_t>(log_max_size), 0,
+               std::numeric_limits<std::int64_t>::max()));
+    log_keep_rotated = static_cast<int>(ranged("log.keep_rotated", log_keep_rotated, kIntMin, kIntMax));
     log_compress = cfg.get_bool("log.compress", log_compress);
 
     server_listen   = cfg.get_string("server.listen",   server_listen);
-    server_port     = static_cast<std::uint16_t>(cfg.get_int("server.port",    server_port));
-    server_backlog  = static_cast<int>(cfg.get_int("server.backlog",  server_backlog));
-    server_timeout  = static_cast<int>(cfg.get_int("server.timeout",  server_timeout));
+    server_port     = static_cast<std::uint16_t>(ranged("server.port", server_port, 0, 65535));
+    server_backlog  = static_cast<int>(ranged("server.backlog", server_backlog, kIntMin, kIntMax));
+    server_timeout  = static_cast<int>(ranged("server.timeout", server_timeout, kIntMin, kIntMax));
 
     if (auto v = cfg.get_string_opt("server.root"))
         doc_root = resolve(*v);
     if (auto v = cfg.get_string_opt("cache.prefix"))
         cache_prefix = resolve(*v);
 
-    workers    = static_cast<int>(cfg.get_int("workers", workers));
+    workers    = static_cast<int>(ranged("workers", workers, kIntMin, kIntMax));
     master     = cfg.get_bool("process.master",  master);
     helper     = cfg.get_bool("process.helper",  helper);
     daemon     = cfg.get_bool("daemon.enabled",  daemon);
 
     leader          = cfg.get_bool("process.leader", leader);
-    leader_interval = static_cast<int>(cfg.get_int("process.leader_interval", leader_interval));
-    stop_timeout    = static_cast<int>(cfg.get_int("process.stop_timeout", stop_timeout));
+    leader_interval = static_cast<int>(ranged("process.leader_interval", leader_interval, kIntMin, kIntMax));
+    stop_timeout    = static_cast<int>(ranged("process.stop_timeout", stop_timeout, kIntMin, kIntMax));
     // A string only. "node" is an object in applications that had the key
     // first (cs: {"code", "url"}), and it is theirs: reading it as a string
     // threw ConfigError and stopped them at start.
@@ -113,11 +131,11 @@ void AppSettings::populate(const Config& cfg)
     user         = cfg.get_string("process.user",         user);
     group        = cfg.get_string("process.group",        group);
     limit_nofile = static_cast<std::uint32_t>(
-        cfg.get_int("process.limit_nofile", limit_nofile));
+        ranged("process.limit_nofile", limit_nofile, 0, std::numeric_limits<std::uint32_t>::max()));
 
     pg_connect         = cfg.get_bool("postgres.connect",          pg_connect);
     pg_notice          = cfg.get_bool("postgres.notice",           pg_notice);
-    pg_connect_timeout = static_cast<int>(cfg.get_int("postgres.timeout", pg_connect_timeout));
+    pg_connect_timeout = static_cast<int>(ranged("postgres.timeout", pg_connect_timeout, kIntMin, kIntMax));
 
     pg_conninfo_worker = build_pg_conninfo(cfg, "worker", pg_connect_timeout);
     pg_conninfo_helper = build_pg_conninfo(cfg, "helper", pg_connect_timeout);
@@ -131,14 +149,14 @@ void AppSettings::populate(const Config& cfg)
     if (pg_conninfo_kernel.empty())
         pg_conninfo_kernel = pg_conninfo_worker;
 
-    pg_pool_min = static_cast<int>(cfg.get_int("postgres.pool.min", pg_pool_min));
+    pg_pool_min = static_cast<int>(ranged("postgres.pool.min", pg_pool_min, kIntMin, kIntMax));
     // Left out — pool.min: growth above it is asked for, never a default.
-    pg_pool_max = static_cast<int>(cfg.get_int("postgres.pool.max", pg_pool_min));
-    pg_pool_idle_timeout = static_cast<int>(cfg.get_int("postgres.pool.idle_timeout", pg_pool_idle_timeout));
-    pg_pool_lifetime = static_cast<int>(cfg.get_int("postgres.pool.lifetime", pg_pool_lifetime));
-    pg_pool_queue_limit = static_cast<int>(cfg.get_int("postgres.pool.queue_limit", pg_pool_queue_limit));
-    pg_pool_queue_timeout = static_cast<int>(cfg.get_int("postgres.pool.queue_timeout", pg_pool_queue_timeout));
-    pg_stall_timeout = static_cast<int>(cfg.get_int("postgres.stall_timeout", pg_stall_timeout));
+    pg_pool_max = static_cast<int>(ranged("postgres.pool.max", pg_pool_min, kIntMin, kIntMax));
+    pg_pool_idle_timeout = static_cast<int>(ranged("postgres.pool.idle_timeout", pg_pool_idle_timeout, kIntMin, kIntMax));
+    pg_pool_lifetime = static_cast<int>(ranged("postgres.pool.lifetime", pg_pool_lifetime, kIntMin, kIntMax));
+    pg_pool_queue_limit = static_cast<int>(ranged("postgres.pool.queue_limit", pg_pool_queue_limit, kIntMin, kIntMax));
+    pg_pool_queue_timeout = static_cast<int>(ranged("postgres.pool.queue_timeout", pg_pool_queue_timeout, kIntMin, kIntMax));
+    pg_stall_timeout = static_cast<int>(ranged("postgres.stall_timeout", pg_stall_timeout, kIntMin, kIntMax));
 
     // Session settings reset before every pool query (PgPool::set_reset).
     // Left out — the default; [] — none. A name that is not one refuses the
@@ -379,6 +397,8 @@ std::vector<ValidationError> AppSettings::validate() const
     auto err = [&errors](std::string_view key, std::string msg) {
         errors.push_back({std::string(key), std::move(msg)});
     };
+
+    errors.insert(errors.end(), range_errors.begin(), range_errors.end());
 
     // Log level
     // The logger's own list (level_from_string), "warning" included: a value

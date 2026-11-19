@@ -279,3 +279,9 @@ target_link_libraries(logger_test PRIVATE apostol ${CMAKE_DL_LIBS})
 target_compile_options(logger_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME logger COMMAND logger_test "${CMAKE_CURRENT_BINARY_DIR}/logger_test.d")
 set_tests_properties(logger PROPERTIES SKIP_RETURN_CODE 77)
+
+# settings_test — numbers out of their setting's range; no node, no files.
+add_executable(settings_test settings_test.cpp)
+target_link_libraries(settings_test PRIVATE apostol)
+target_compile_options(settings_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME settings COMMAND settings_test)
