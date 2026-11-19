@@ -10,7 +10,10 @@ namespace apostol
 // Install fatal-signal handlers (SIGSEGV, SIGFPE, SIGILL, SIGBUS, SIGABRT).
 //
 // On crash the handler logs a structured report to stderr and, if a log path
-// has been set, appends the same report to the error log file:
+// has been set, appends the same report to the error log file. The file is
+// opened by its path at the crash; a descriptor opened when the path was set
+// takes the report when that open is refused (a child that has switched to
+// another user since):
 //
 //   -----BEGIN CRASH REPORT-----
 //   2026/02/23 14:05:11 | crit | apostol: worker process (pid=12345)
@@ -60,8 +63,9 @@ void install_crash_handler(std::string_view log_file = "") noexcept;
 /// to be re-registered.
 void setup_crash_altstack() noexcept;
 
-/// Update the error log path without re-installing signal handlers.
-/// Call after config reload (SIGHUP) if the log path changed.
+/// Update the error log path without re-installing signal handlers, and open
+/// the descriptor the report falls back on (kept as it was when the new file
+/// cannot be opened). Application calls it on every configuration it applies.
 void set_crash_log_path(std::string_view log_file) noexcept;
 
 } // namespace apostol

@@ -260,3 +260,14 @@ target_link_libraries(fetch_limit_test PRIVATE apostol)
 target_compile_options(fetch_limit_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME fetch_limit COMMAND fetch_limit_test)
 set_tests_properties(fetch_limit PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+
+# process_model_test — the master and a failed fork, the pid file, a daemon's
+# umask, a failed privilege switch, the crash report; one case per test.
+add_executable(process_model_test process_model_test.cpp)
+target_link_libraries(process_model_test PRIVATE apostol)
+target_compile_options(process_model_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+foreach(case fork_retry own_pid pid_mode privilege crash_fd crash_reload)
+    add_test(NAME process_model_${case}
+             COMMAND process_model_test ${case} "${CMAKE_CURRENT_BINARY_DIR}/process_model_${case}.d")
+    set_tests_properties(process_model_${case} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+endforeach()

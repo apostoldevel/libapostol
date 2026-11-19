@@ -470,6 +470,10 @@ protected:
 
     pid_t fork_child(ProcessRole role, std::string name,
                      std::function<void()> custom_fn = {});
+    /// The master starts a child again — a respawn, a reload. A fork that
+    /// fails is logged and tried again kForkRetry later, on the master's loop;
+    /// it never leaves the master. False when the fork failed.
+    bool respawn_child(ProcessRole role, std::string name);
     virtual void spawn_workers();
     virtual void spawn_helper();
     void reap_children();
@@ -594,6 +598,8 @@ private:
     };
     std::map<std::string, RespawnState> respawn_state_;
     static constexpr auto kStormLogInterval = std::chrono::minutes(5);
+    // The pause before a failed fork is tried again (respawn_child).
+    static constexpr auto kForkRetry = std::chrono::seconds(5);
 
     // The master's own EventLoop while master_run() is running, else nullptr. Lets
     // reap_children() schedule a throttled respawn on a timer instead of ::sleep()ing

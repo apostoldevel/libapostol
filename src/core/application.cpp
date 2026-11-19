@@ -343,9 +343,20 @@ void Application::start_process()
         return;
     }
 
+    // Removed on the way out — a return, and an exception as well: a start that
+    // fails after the file is written (on_start(), the listener, the first
+    // fork) used to leave it naming a process that is gone. A child never
+    // unwinds this frame: it leaves fork_child() by std::exit().
+    struct PidFile
+    {
+        const Application& app;
+        ~PidFile() { app.remove_pid_file(); }
+    };
+
     if (role_ == ProcessRole::master)
     {
         write_pid_file();
+        PidFile pid_file{*this};
         on_start();
 
         // After on_start(), where the application may have enabled it; before
@@ -388,24 +399,22 @@ void Application::start_process()
 
         master_listener_.reset();
         listen_fd_ = -1;
-
-        remove_pid_file();
     }
     else if (role_ == ProcessRole::helper)
     {
         write_pid_file();
+        PidFile pid_file{*this};
         on_start();
         helper_run();
-        remove_pid_file();
     }
     else
     {
         // Default: single process — no fork
         role_ = ProcessRole::single;
         write_pid_file();
+        PidFile pid_file{*this};
         on_start();
         single_run();
-        remove_pid_file();
     }
 }
 
@@ -711,6 +720,9 @@ void Application::apply_config(StagedConfig&& staged)
         }
     }
 
+    // The crash report follows the log: a reload that moves "log.file" moves
+    // it too — in this process and in the children forked from it from now on.
+    set_crash_log_path(settings_.error_log.string());
 }
 
 // ─── PID file ────────────────────────────────────────────────────────────────
@@ -718,11 +730,21 @@ void Application::apply_config(StagedConfig&& staged)
 void Application::write_pid_file() const
 {
     std::filesystem::create_directories(settings_.pid_file.parent_path());
-    std::ofstream f(settings_.pid_file);
-    if (!f)
+    // 0644 whatever the umask, and a file left by an earlier run is set back to
+    // it: whoever may write this file chooses the process "-s" signals.
+    const int fd = ::open(settings_.pid_file.c_str(),
+                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
         throw std::system_error(errno, std::system_category(),
             fmt::format("cannot write PID file '{}'", settings_.pid_file.string()));
-    f << ::getpid() << '\n';
+    const std::string line = fmt::format("{}\n", ::getpid());
+    const bool ok = ::fchmod(fd, 0644) == 0
+                 && ::write(fd, line.data(), line.size()) == static_cast<ssize_t>(line.size());
+    const int err = errno;
+    ::close(fd);
+    if (!ok)
+        throw std::system_error(err, std::system_category(),
+            fmt::format("cannot write PID file '{}'", settings_.pid_file.string()));
 }
 
 void Application::remove_pid_file() const
@@ -741,6 +763,20 @@ bool Application::check_running() const
     f >> pid;
     if (pid <= 0)
         return false;
+
+    // This very process is not another copy of it. A run that ended without
+    // removing the file (SIGKILL, the OOM killer, a container stopped hard)
+    // leaves its number there, and a container started again gives the new
+    // process the same number — pid 1 most often: kill(pid, 0) succeeds on
+    // ourselves, and every start would be refused.
+    if (pid == ::getpid())
+    {
+        logger_->notice("removing stale PID file '{}' (pid={} is this process)",
+            settings_.pid_file.string(), pid);
+        std::error_code ec;
+        std::filesystem::remove(settings_.pid_file, ec);
+        return false;
+    }
 
     // Check if the process is alive via kill(pid, 0):
     //   0     → process exists and we can signal it → running
@@ -769,7 +805,10 @@ void Application::daemonize()
         std::exit(0); // parent exits
 
     ::setsid();
-    ::umask(0);
+    // The umask the daemon was started with, never looser than 022: with 0 the
+    // files it makes — the pid file, the logs — were writable by everyone.
+    const mode_t inherited = ::umask(022);
+    ::umask(inherited | 022);
 
     // Second fork — ensure we can't acquire a controlling terminal
     pid = ::fork();
@@ -855,7 +894,27 @@ void Application::master_run()
 
     // SIGCHLD — child exited: reap, then stop loop once all children are gone.
     // Also cancels the kill escalation timer if it is still armed.
-    loop.add_signal(SIGCHLD, [this, &loop, &kill_timer_id](const signalfd_siginfo&) {
+    // A handler of the master that throws would leave its loop, and the master
+    // with it: every child goes by PDEATHSIG, the pid file stays. A reload whose
+    // on_reload() throws, a log that cannot be reopened, a child that cannot be
+    // forked — each is logged, and the master goes on. The stop signals are not
+    // wrapped: a stop that fails half way still ends the master.
+    auto guarded = [this](std::string_view what, EventLoop::SignalCallback fn) {
+        return [this, what, fn = std::move(fn)](const signalfd_siginfo& si) {
+            try
+            {
+                fn(si);
+            }
+            catch (const std::exception& e)
+            {
+                try {
+                    logger_->error("master: {} failed: {}", what, e.what());
+                } catch (...) {}
+            }
+        };
+    };
+
+    loop.add_signal(SIGCHLD, guarded("SIGCHLD", [this, &loop, &kill_timer_id](const signalfd_siginfo&) {
         reap_children();
         if ((shutting_down_ || graceful_) && children_.empty())
         {
@@ -866,7 +925,7 @@ void Application::master_run()
             }
             loop.stop();
         }
-    });
+    }));
 
     // SIGTERM / SIGINT — fast shutdown:
     //   1. Send SIGTERM to all children and mark shutting_down_.
@@ -925,15 +984,15 @@ void Application::master_run()
     // restarts nothing, so telling the application to reconfigure would have it
     // act on a file that never took effect. Same rule as the single-process
     // branch below.
-    loop.add_signal(SIGHUP, [this](const signalfd_siginfo&) {
+    loop.add_signal(SIGHUP, guarded("SIGHUP", [this](const signalfd_siginfo&) {
         logger_->notice("SIGHUP received — reloading config");
         if (rolling_restart())
             on_reload();
-    });
+    }));
 
     // SIGWINCH — gracefully stop workers only (keep custom + helper alive).
     // Mirrors v1: SignalToProcess(ptWorker, SIG_SHUTDOWN).
-    loop.add_signal(SIGWINCH, [this](const signalfd_siginfo&) {
+    loop.add_signal(SIGWINCH, guarded("SIGWINCH", [this](const signalfd_siginfo&) {
         logger_->notice("SIGWINCH received — gracefully stopping workers");
         for (auto& child : children_)
         {
@@ -944,15 +1003,16 @@ void Application::master_run()
                 ::kill(child.pid, SIGQUIT);
             }
         }
-    });
+    }));
 
     // SIGUSR1 — reopen logs, forward to all children
-    loop.add_signal(SIGUSR1, [this](const signalfd_siginfo&) {
+    loop.add_signal(SIGUSR1, guarded("SIGUSR1", [this](const signalfd_siginfo&) {
         logger_->notice("SIGUSR1 received — reopening logs, forwarding to children");
-        logger_->reopen();
+        // The children are told even when this log cannot be reopened.
         for (auto& child : children_)
             ::kill(child.pid, SIGUSR1);
-    });
+        logger_->reopen();
+    }));
 
     // Reap any children that died during the spawn→eventloop window
     // (their SIGCHLD was lost before signalfd was set up).
@@ -1289,6 +1349,9 @@ void Application::single_run()
     {
         on_worker_start(loop);
         module_manager_.on_start();
+        // Drop privileges after initialization (sockets bound, DB connected).
+        // Inside the startup: a switch that fails is a start that fails.
+        set_user(cfg_user(), cfg_group());
     }
     catch (const std::exception& e)
     {
@@ -1304,9 +1367,6 @@ void Application::single_run()
         return;
     }
     ipc_.ready();
-
-    // Drop privileges after initialization (sockets bound, DB connected)
-    set_user(cfg_user(), cfg_group());
 
     // Set process title AFTER modules are registered
     auto names = module_manager_.module_names();
@@ -1365,6 +1425,9 @@ void Application::worker_run()
     {
         on_worker_start(loop);
         module_manager_.on_start();
+        // Drop privileges after initialization (sockets bound, DB connected).
+        // Inside the startup: a switch that fails is a start that fails.
+        set_user(cfg_user(), cfg_group());
     }
     catch (const std::exception& e)
     {
@@ -1375,9 +1438,6 @@ void Application::worker_run()
         return;
     }
     ipc_.ready();
-
-    // Drop privileges after initialization (sockets bound, DB connected)
-    set_user(cfg_user(), cfg_group());
 
     // Set process title AFTER modules are registered
     auto names = module_manager_.module_names();
@@ -1435,6 +1495,9 @@ void Application::helper_run()
         {
             on_helper_start(loop);
             module_manager_.on_start();
+            // Drop privileges after initialization (DB connected). Inside the
+            // startup: a switch that fails is a start that fails.
+            set_user(cfg_user(), cfg_group());
         }
         catch (const std::exception& e)
         {
@@ -1444,9 +1507,6 @@ void Application::helper_run()
         }
 
         started = true;
-
-        // Drop privileges after initialization (DB connected)
-        set_user(cfg_user(), cfg_group());
 
         // Set process title AFTER modules are registered
         auto names = module_manager_.module_names();
@@ -1585,6 +1645,10 @@ void Application::custom_process_run(CustomProcess& proc)
         // 6. Process on_start
         try {
             proc.on_start(loop, *this);
+            // 7. Drop privileges after initialization (sockets bound; the pool
+            // is lazy — it connects at the first query, after this). Inside the
+            // startup: a switch that fails is a start that fails.
+            set_user(cfg_user(), cfg_group());
         } catch (const std::exception& e) {
             logger_->error("{} process '{}' startup failed: {}",
                            name_, proc.name(), e.what());
@@ -1593,10 +1657,6 @@ void Application::custom_process_run(CustomProcess& proc)
         }
 
         started = true;
-
-        // 7. Drop privileges after initialization (sockets bound; the pool is
-        // lazy — it connects at the first query, after this)
-        set_user(cfg_user(), cfg_group());
 
         // Set process title AFTER on_start (modules may be registered)
         auto names = module_manager_.module_names();
@@ -1863,6 +1923,56 @@ void Application::spawn_helper()
     fork_child(ProcessRole::helper, "helper");
 }
 
+bool Application::respawn_child(ProcessRole role, std::string name)
+{
+    std::function<void()> run;
+    if (role == ProcessRole::custom)
+    {
+        // The entry by name; the child calls custom_process_run() on it.
+        auto it = std::find_if(custom_processes_.begin(), custom_processes_.end(),
+            [&name](const CustomProcessEntry& cp) { return cp.name == name; });
+        if (it == custom_processes_.end())
+        {
+            logger_->error("cannot respawn custom '{}': entry not found", name);
+            return false;
+        }
+#ifdef WITH_POSTGRESQL
+        run = [this, &cp = *it] { custom_process_run(*cp.process); };
+#else
+        run = [this, fn = it->fn, n = it->name] { custom_fn_run(fn, n); };
+#endif
+    }
+
+    // fork() refused (EAGAIN at the process limit, ENOMEM) is the state of the
+    // host, not of this child. Out of here it would leave the master's loop and
+    // the master with it — and every child after it, by PDEATHSIG. The master
+    // stays, and tries again later; the child is missing until then.
+    try
+    {
+        fork_child(role, name, std::move(run));
+        return true;
+    }
+    catch (const std::exception& e)
+    {
+        logger_->error("cannot start {} '{}': {} — trying again in {} s",
+                       role_name(role), name, e.what(), kForkRetry.count());
+    }
+
+    if (master_loop_)
+    {
+        master_loop_->add_timer(kForkRetry, [this, role, name]() {
+            if (shutting_down_)
+                return;
+            // A reload since then has started a process of this name.
+            for (const auto& child : children_)
+                if (child.name == name && !child.shutting_down)
+                    return;
+            respawn_child(role, name);
+        }, /*repeat=*/false);
+    }
+    return false;
+}
+
 // ─── Reaping children ────────────────────────────────────────────────────────
 
 void Application::reap_children()
@@ -2009,33 +2119,7 @@ void Application::reap_children()
                 if (!quiet)
                     logger_->notice("respawning {} '{}'", role_name(respawn_role), respawn_name);
 
-                if (respawn_role == ProcessRole::custom)
-                {
-                    // Find the CustomProcessEntry by name and re-create the lambda
-                    // so that custom_process_run() is called in the child.
-                    bool found = false;
-                    for (auto& cp : custom_processes_) {
-                        if (cp.name == respawn_name) {
-#ifdef WITH_POSTGRESQL
-                            fork_child(respawn_role, std::move(respawn_name),
-                                [this, &cp] { custom_process_run(*cp.process); });
-#else
-                            auto fn = cp.fn;
-                            fork_child(respawn_role, std::move(respawn_name),
-                                [this, fn, name = cp.name] { custom_fn_run(fn, name); });
-#endif
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        logger_->error("cannot respawn custom '{}': entry not found", respawn_name);
-                    }
-                }
-                else
-                {
-                    fork_child(respawn_role, std::move(respawn_name));
-                }
+                respawn_child(respawn_role, std::move(respawn_name));
             };
 
             // Backoff logging. Up the ramp (delay 2→4→8→16s) each step is announced —
@@ -2167,26 +2251,17 @@ bool Application::rolling_restart()
         ipc_.master_retire(child.pid);
     }
 
-    // Spawn fresh custom processes
+    // The new generation: custom processes, the helper (if configured), the
+    // workers. A fork refused here is tried again later (respawn_child); the
+    // rest of the generation starts, and the old one is told to stop as ever.
     for (auto& cp : custom_processes_)
-    {
-#ifdef WITH_POSTGRESQL
-        fork_child(ProcessRole::custom, cp.name, [this, &cp] {
-            custom_process_run(*cp.process);
-        });
-#else
-        auto fn = cp.fn;
-        fork_child(ProcessRole::custom, cp.name, [this, fn, name = cp.name] {
-            custom_fn_run(fn, name);
-        });
-#endif
-    }
+        respawn_child(ProcessRole::custom, cp.name);
 
-    // Spawn fresh helper (if configured)
-    if (cfg_helper()) spawn_helper();
+    if (cfg_helper())
+        respawn_child(ProcessRole::helper, "helper");
 
-    // Spawn fresh workers
-    spawn_workers();
+    for (int i = 0, n = settings_.effective_workers(); i < n; ++i)
+        respawn_child(ProcessRole::worker, fmt::format("worker#{}", i + 1));
 
     // Allow new processes a moment to start before old ones stop
     // (mirrors v1 usleep(100 * 1000) in CProcessMaster::Run sig_reconfigure branch)
@@ -2272,6 +2347,14 @@ void Application::set_limit_nofile(std::uint32_t limit)
     }
 }
 
+namespace
+{
+[[noreturn]] void privilege_error(const std::string& what, int err)
+{
+    throw std::system_error(err, std::system_category(), "cannot drop privileges: " + what);
+}
+} // namespace
+
 void Application::set_user(std::string_view user, std::string_view group)
 {
     if (user.empty())
@@ -2281,52 +2364,39 @@ void Application::set_user(std::string_view user, std::string_view group)
     if (::getuid() != 0)
         return;
 
+    // A switch that fails is a start that fails: the process would serve on
+    // as root — or as root with another group, when setgid() had passed. The
+    // caller runs it inside its startup, so the error ends the process with
+    // code 1 and one line in the log, as any other failed start.
+    const std::string user_s(user);
+    const std::string group_s(group);
+
     // Look up group first (if specified)
-    if (!group.empty())
+    if (!group_s.empty())
     {
         errno = 0;
-        struct group* grp = ::getgrnam(std::string(group).c_str());
+        struct group* grp = ::getgrnam(group_s.c_str());
         if (!grp)
-        {
-            std::fprintf(stderr, "getgrnam('%s'): %s\n",
-                std::string(group).c_str(),
-                errno ? std::strerror(errno) : "group not found");
-            return;
-        }
+            privilege_error(fmt::format("group '{}' not found", group_s), errno ? errno : ENOENT);
         if (::setgid(grp->gr_gid) == -1)
-        {
-            std::fprintf(stderr, "setgid(%u): %s\n", grp->gr_gid, std::strerror(errno));
-            return;
-        }
+            privilege_error(fmt::format("setgid({})", grp->gr_gid), errno);
     }
 
     errno = 0;
-    struct passwd* pw = ::getpwnam(std::string(user).c_str());
+    struct passwd* pw = ::getpwnam(user_s.c_str());
     if (!pw)
-    {
-        std::fprintf(stderr, "getpwnam('%s'): %s\n",
-            std::string(user).c_str(),
-            errno ? std::strerror(errno) : "user not found");
-        return;
-    }
+        privilege_error(fmt::format("user '{}' not found", user_s), errno ? errno : ENOENT);
 
-    if (group.empty() && ::setgid(pw->pw_gid) == -1)
-    {
-        std::fprintf(stderr, "setgid(%u): %s\n", pw->pw_gid, std::strerror(errno));
-        return;
-    }
+    if (group_s.empty() && ::setgid(pw->pw_gid) == -1)
+        privilege_error(fmt::format("setgid({})", pw->pw_gid), errno);
 
     // Initialize supplementary groups (required before setuid for proper group access).
     // By this point setgid() has already been called with the correct gid.
     if (::initgroups(pw->pw_name, ::getgid()) == -1)
-    {
-        std::fprintf(stderr, "initgroups('%s', %u): %s\n",
-            pw->pw_name, ::getgid(), std::strerror(errno));
-        return;
-    }
+        privilege_error(fmt::format("initgroups('{}', {})", pw->pw_name, ::getgid()), errno);
 
     if (::setuid(pw->pw_uid) == -1)
-        std::fprintf(stderr, "setuid(%u): %s\n", pw->pw_uid, std::strerror(errno));
+        privilege_error(fmt::format("setuid({})", pw->pw_uid), errno);
 }
 
 // ─── Directories ──────────────────────────────────────────────────────────────

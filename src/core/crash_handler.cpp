@@ -73,6 +73,12 @@ alignas(16) static char g_altstack[kAltStackSize];
 
 static char g_log_path[4096] = {};
 
+// The same file, opened when the path is set — in the master, before any child
+// drops its privileges. The report opens the path first, so a log rotated
+// since is followed; when that open is refused (a child that runs as another
+// user and may not open a log root made), the report goes here. -1 — none.
+static int g_log_fd = -1;
+
 // ─── Low-level I/O helpers ───────────────────────────────────────────────────
 
 // Async-signal-safe write of a C string to fd.
@@ -289,8 +295,14 @@ static void crash_handler(int signo, siginfo_t* si, void* ctx)
 
     // ── Open log file (if configured) ─────────────────────────────────────────
     int log_fd = -1;
+    bool own_fd = false;
     if (g_log_path[0] != '\0')
-        log_fd = ::open(g_log_path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    {
+        log_fd = ::open(g_log_path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+        own_fd = log_fd >= 0;
+        if (!own_fd)
+            log_fd = g_log_fd;
+    }
 
     int e = STDERR_FILENO;
 
@@ -375,7 +387,8 @@ static void crash_handler(int signo, siginfo_t* si, void* ctx)
     if (log_fd >= 0)
     {
         raw_write(log_fd, "-----END CRASH REPORT-----\n");
-        ::close(log_fd);
+        if (own_fd)
+            ::close(log_fd);
     }
 
     // ── Re-raise with default handler → core dump ─────────────────────────────
@@ -402,6 +415,9 @@ void set_crash_log_path(std::string_view log_file) noexcept
     if (log_file.empty())
     {
         g_log_path[0] = '\0';
+        if (g_log_fd >= 0)
+            ::close(g_log_fd);
+        g_log_fd = -1;
         return;
     }
     size_t n = log_file.size();
@@ -409,6 +425,16 @@ void set_crash_log_path(std::string_view log_file) noexcept
         n = sizeof(g_log_path) - 1;
     ::memcpy(g_log_path, log_file.data(), n);
     g_log_path[n] = '\0';
+
+    // The new file's descriptor, or — when it cannot be opened now — the one
+    // held so far: a report in the old file is better than none.
+    const int fd = ::open(g_log_path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    if (fd >= 0)
+    {
+        if (g_log_fd >= 0)
+            ::close(g_log_fd);
+        g_log_fd = fd;
+    }
 }
 
 void install_crash_handler(std::string_view log_file) noexcept
