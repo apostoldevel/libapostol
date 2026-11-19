@@ -318,7 +318,17 @@ public:
     /// Access site configurations (loaded from conf/sites/*.json).
     const SiteConfigs& sites() const noexcept { return sites_; }
 
-    /// Dedicated stream logger (writes to stream.log). Created on demand.
+    /// A logger of the caller's own, kept by name: lines go to stderr and to
+    /// `file` (relative to the prefix; its directory is made; rotated as the
+    /// error log is). The first call by a name creates it; later calls by
+    /// that name return it, whatever `file` they pass. Its level follows
+    /// log.level, on a reload too. The file follows its path on every write,
+    /// so a log moved away is made again where it was. Empty `file`: stderr only.
+    Logger& file_logger(std::string_view name, const std::filesystem::path& file);
+
+    /// Deprecated: the logger of the name "stream" at log.stream (default:
+    /// the compiled stream log). Kept for its callers; a module names its own
+    /// log with file_logger().
     Logger& stream_logger();
 
 protected:
@@ -548,7 +558,7 @@ private:
     WsHandler                ws_handler_;
     WsUpgradeFilter          ws_upgrade_filter_;
     EventLoop*               worker_loop_{nullptr};
-    std::unique_ptr<Logger>  stream_logger_;
+    std::map<std::string, std::unique_ptr<Logger>, std::less<>> file_loggers_;
 
     std::unique_ptr<TcpListener> master_listener_;  // listening socket (master only)
     // Workers sharing master_listener_: who holds how many connections (made

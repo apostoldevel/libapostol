@@ -310,3 +310,11 @@ target_link_libraries(yaml_writer_test PRIVATE apostol)
 target_compile_options(yaml_writer_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME yaml_writer COMMAND yaml_writer_test "${CMAKE_CURRENT_BINARY_DIR}")
 set_tests_properties(yaml_writer PROPERTIES SKIP_RETURN_CODE 77)
+
+# file_logger_test — stream_logger() and file_logger() in a master, a worker,
+# the helper and a custom process: the configured path, reopened on SIGUSR1.
+add_executable(file_logger_test file_logger_test.cpp)
+target_link_libraries(file_logger_test PRIVATE apostol)
+target_compile_options(file_logger_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME file_logger COMMAND file_logger_test "${CMAKE_CURRENT_BINARY_DIR}/file_logger_test.d")
+set_tests_properties(file_logger PROPERTIES TIMEOUT 60)

@@ -721,10 +721,10 @@ void Application::apply_config(StagedConfig&& staged)
 
         // The service loggers are created once, so a reload has to reach them too;
         // otherwise raising log.level and sending SIGHUP silently does nothing for
-        // PostgreSQL and stream diagnostics. A dedicated postgres.log stays at
-        // debug by design — see setup_db().
-        if (stream_logger_)
-            stream_logger_->set_level(safe_log_level(settings_.log_level));
+        // PostgreSQL and the file_logger() diagnostics. A dedicated postgres.log
+        // stays at debug by design — see setup_db().
+        for (auto& [_, file_log] : file_loggers_)
+            file_log->set_level(safe_log_level(settings_.log_level));
     }
     catch (const std::invalid_argument&)
     {
@@ -1415,7 +1415,7 @@ void Application::single_run()
 #ifdef WITH_POSTGRESQL
         if (pg_logger_) pg_logger_->reopen();
 #endif
-        if (stream_logger_) stream_logger_->reopen();
+        for (auto& [_, file_log] : file_loggers_) file_log->reopen();
     });
 
     try
@@ -1509,7 +1509,7 @@ void Application::worker_run()
 #ifdef WITH_POSTGRESQL
         if (pg_logger_) pg_logger_->reopen();
 #endif
-        if (stream_logger_) stream_logger_->reopen();
+        for (auto& [_, file_log] : file_loggers_) file_log->reopen();
     });
 
     try
@@ -2759,28 +2759,32 @@ PgPool& Application::db_pool(std::string_view role)
 
 #endif // WITH_POSTGRESQL
 
-// ─── Stream logger ───────────────────────────────────────────────────────────
+// ─── File loggers ────────────────────────────────────────────────────────────
+
+Logger& Application::file_logger(std::string_view name, const std::filesystem::path& file)
+{
+    if (auto it = file_loggers_.find(name); it != file_loggers_.end())
+        return *it->second;
+
+    auto log = std::make_unique<Logger>();
+    log->set_level(safe_log_level(settings_.log_level));
+    log->add_target(std::make_unique<StderrTarget>());
+
+    if (const auto path = settings_.resolve(file.string()); !path.empty()) {
+        try {
+            std::filesystem::create_directories(path.parent_path());
+            log->set_file_target(path.string(), settings_.log_max_size,
+                settings_.log_keep_rotated, settings_.log_compress);
+        } catch (const std::exception& e) {
+            logger_->warn("cannot open log '{}' of '{}': {}", path.string(), name, e.what());
+        }
+    }
+    return *file_loggers_.emplace(std::string(name), std::move(log)).first->second;
+}
 
 Logger& Application::stream_logger()
 {
-    if (!stream_logger_) {
-        stream_logger_ = std::make_unique<Logger>();
-        stream_logger_->set_level(safe_log_level(settings_.log_level));
-        stream_logger_->add_target(std::make_unique<StderrTarget>());
-
-        auto stream_log = settings_.resolve(APP_STREAM_LOG_FILE);
-        if (!stream_log.empty()) {
-            try {
-                std::filesystem::create_directories(stream_log.parent_path());
-                stream_logger_->set_file_target(stream_log.string(), settings_.log_max_size,
-                    settings_.log_keep_rotated, settings_.log_compress);
-            } catch (const std::exception& e) {
-                logger_->warn("cannot open stream log '{}': {}",
-                    stream_log.string(), e.what());
-            }
-        }
-    }
-    return *stream_logger_;
+    return file_logger("stream", settings_.stream_log);
 }
 
 // ─── Stop: HTTP side ─────────────────────────────────────────────────────────
