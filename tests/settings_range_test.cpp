@@ -1,4 +1,4 @@
-// settings_test — a number its setting cannot hold is a validation error,
+// settings_range_test — a number its setting cannot hold is a validation error,
 // and the setting keeps its value; numbers in range pass as before.
 
 #include "apostol/config.hpp"
@@ -16,7 +16,7 @@ int g_failed = 0;
 
 void check(bool ok, const std::string& what)
 {
-    std::printf("settings_test: %s %s\n", ok ? "ok  " : "FAIL", what.c_str());
+    std::printf("settings_range_test: %s %s\n", ok ? "ok  " : "FAIL", what.c_str());
     if (!ok)
         ++g_failed;
 }
@@ -57,6 +57,6 @@ int main()
         check(s.workers == 3 && s.log_max_size == 1048576 && s.limit_nofile == 4096 && s.server_port == 8080,
               "in range: the values are taken");
     }
-    std::printf("settings_test: %s\n", g_failed ? "FAIL" : "PASS");
+    std::printf("settings_range_test: %s\n", g_failed ? "FAIL" : "PASS");
     return g_failed ? 1 : 0;
 }
