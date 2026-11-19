@@ -133,16 +133,11 @@ bool is_safe_path(std::string_view path)
     if (path.find('\0') != std::string_view::npos)
         return false;
 
-    // A ".." segment: either separator counts, so that a path meant for
-    // another platform is refused as well. A name holding two dots is not one.
-    while (true) {
-        const auto sep = path.find_first_of("/\\");
-        if (path.substr(0, sep) == "..")
-            return false;
-        if (sep == std::string_view::npos)
-            return true;
-        path.remove_prefix(sep + 1);
-    }
+    // Check for ".." path traversal
+    if (path.find("..") != std::string_view::npos)
+        return false;
+
+    return true;
 }
 
 // ─── path_under_root ─────────────────────────────────────────────────────────

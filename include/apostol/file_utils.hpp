@@ -24,8 +24,7 @@ std::string sha256_hex(std::string_view data);
 /// Returns "application/octet-stream" for unknown extensions.
 std::string_view file_mime_type(std::string_view extension);
 
-/// Check that a path is safe: not empty, no null bytes, no ".." segment
-/// (between '/' or '\\' separators; "a..b" is a name, not a segment).
+/// Check that a path component is safe (no "..", not empty, no null bytes).
 bool is_safe_path(std::string_view path);
 
 /// Resolve a request path (e.g. "/css/app.css") against a document root.

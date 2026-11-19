@@ -4,8 +4,8 @@
 //      when the handler set the header itself (a HEAD answer keeps its own);
 //   2. content_length() of a request and of a client response is 0 for a value
 //      that is not a number or does not fit, never a wrapped number;
-//   3. is_safe_path() refuses a ".." segment, not a name holding two dots;
-//      a query string decodes as url_decode() does;
+//   3. is_safe_path() refuses ".." anywhere in the path, a name holding two
+//      dots included; a query string decodes as url_decode() does;
 //   3a. trailers of a chunked message are not taken for headers, by either
 //      parser;
 //   5. a FIFO is refused as a file body without waiting; one file response
@@ -107,9 +107,10 @@ void content_length_value()
 
 void paths()
 {
-    for (const char* p : {"a..b.txt", "/files/v1..2/x", "..hidden", "name..", "/a/.../b"})
+    // ".." anywhere, not only as a segment: a consumer's rule stands on it.
+    for (const char* p : {"/a/b.txt", "a/.b", "/a/b/c"})
         check(is_safe_path(p), std::string("is_safe_path(\"") + p + "\") = false");
-    for (const char* p : {"..", "../etc/passwd", "/a/../b", "/a/..", "a/..\\b", "..\\x", ""})
+    for (const char* p : {"..", "../etc/passwd", "/a/../b", "/a/..", "a..b.txt", "name..", ""})
         check(!is_safe_path(p), std::string("is_safe_path(\"") + p + "\") = true");
     check(!is_safe_path(std::string_view("a\0b", 3)), "is_safe_path: NUL accepted");
 
