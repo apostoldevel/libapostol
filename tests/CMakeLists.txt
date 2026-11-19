@@ -236,3 +236,19 @@ add_executable(base64_test base64_test.cpp)
 target_link_libraries(base64_test PRIVATE apostol)
 target_compile_options(base64_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME base64 COMMAND base64_test)
+
+# ws_close_test — WsClient after a refused upgrade, and the close handshake
+# with a silent, a dropping and an answering server.
+add_executable(ws_close_test ws_close_test.cpp)
+target_link_libraries(ws_close_test PRIVATE apostol)
+target_compile_options(ws_close_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME ws_close COMMAND ws_close_test)
+set_tests_properties(ws_close PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+# ws_message_client_test — WsMessageClient links with WsMessage (one
+# definition of to_json/from_json); an unanswered request is reported.
+add_executable(ws_message_client_test ws_message_client_test.cpp)
+target_link_libraries(ws_message_client_test PRIVATE apostol)
+target_compile_options(ws_message_client_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME ws_message_client COMMAND ws_message_client_test)
+set_tests_properties(ws_message_client PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)

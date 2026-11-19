@@ -6,31 +6,7 @@
 namespace apostol
 {
 
-// ── WsMessage ────────────────────────────────────────────────────────────────
-
-std::string WsMessage::to_json() const
-{
-    nlohmann::json j;
-    if (!id.empty())        j["id"]      = id;
-    if (!action.empty())    j["action"]  = action;
-    if (!payload.is_null()) j["payload"] = payload;
-    return j.dump();
-}
-
-WsMessage WsMessage::from_json(std::string_view text)
-{
-    auto j = nlohmann::json::parse(text, nullptr, false);
-    if (j.is_discarded()) return {};
-
-    WsMessage msg;
-    if (j.contains("id") && j["id"].is_string())
-        msg.id = j["id"].get<std::string>();
-    if (j.contains("action") && j["action"].is_string())
-        msg.action = j["action"].get<std::string>();
-    if (j.contains("payload"))
-        msg.payload = j["payload"];
-    return msg;
-}
+// WsMessage::to_json/from_json live in ws_client.cpp, with WsMessage itself.
 
 // ── WsMessageClient ──────────────────────────────────────────────────────────
 
@@ -124,6 +100,8 @@ void WsMessageClient::send(const WsMessage& message, ResponseHandler on_response
             auto it = pending_responses_.find(id);
             if (it != pending_responses_.end()) {
                 pending_responses_.erase(it);
+                // The caller learns the answer is not coming, as from WsClient::send.
+                report_error(fmt::format("response timeout for {}", id));
             }
         }, false);
 

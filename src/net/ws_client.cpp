@@ -174,8 +174,14 @@ void WsClient::do_connect()
     });
 
     tcp_.on_close([this] {
-        if (state_ == WsClientState::Closing || state_ == WsClientState::Closed ||
-            state_ == WsClientState::Reconnecting)
+        if (dropping_)
+            return;
+        if (state_ == WsClientState::Closing) {
+            // Our Close went out; the connection ended before the server's.
+            finish_close(1006, "connection closed");
+            return;
+        }
+        if (state_ == WsClientState::Closed || state_ == WsClientState::Reconnecting)
             return;
 
         cancel_ping_timer();
@@ -259,7 +265,7 @@ void WsClient::on_tcp_data(const char* data, std::size_t len)
         if (upgrade_buf_.size() > kMaxUpgradeResponse &&
             upgrade_buf_.find("\r\n\r\n") == std::string::npos)
         {
-            enter_error("upgrade response too large");
+            fail_connection("upgrade response too large");
             return;
         }
 
@@ -272,7 +278,7 @@ void WsClient::on_tcp_data(const char* data, std::size_t len)
 
         auto sp1 = status_line.find(' ');
         if (sp1 == std::string_view::npos) {
-            enter_error("invalid upgrade response");
+            fail_connection("invalid upgrade response");
             return;
         }
         auto sp2 = status_line.find(' ', sp1 + 1);
@@ -282,7 +288,7 @@ void WsClient::on_tcp_data(const char* data, std::size_t len)
         std::from_chars(code_sv.data(), code_sv.data() + code_sv.size(), code);
 
         if (code != 101) {
-            enter_error(fmt::format("upgrade failed: {}", status_line));
+            fail_connection(fmt::format("upgrade failed: {}", status_line));
             return;
         }
 
@@ -314,7 +320,7 @@ void WsClient::on_tcp_data(const char* data, std::size_t len)
         // Validate Sec-WebSocket-Accept
         auto it = headers.find("sec-websocket-accept");
         if (it == headers.end() || it->second != ws_accept_key(ws_key_)) {
-            enter_error("invalid Sec-WebSocket-Accept");
+            fail_connection("invalid Sec-WebSocket-Accept");
             return;
         }
 
@@ -427,6 +433,7 @@ void WsClient::handle_close_frame(std::string_view payload)
     }
 
     bool we_initiated = (state_ == WsClientState::Closing);
+    cancel_close_timer();
 
     // If server initiated, echo close frame
     if (!we_initiated) {
@@ -508,6 +515,32 @@ void WsClient::close(uint16_t code, std::string_view reason)
     payload.push_back(static_cast<char>(code & 0xFF));
     payload.append(reason.data(), reason.size());
     tcp_.send(ws_build_client_frame(WS_OP_CLOSE, payload));
+
+    // A server that never answers the Close would leave the client in
+    // Closing for good: the timer ends the wait with 1006.
+    cancel_close_timer();
+    if (close_timeout_.count() > 0)
+        close_timer_ = loop_.add_timer(close_timeout_, [this] {
+            close_timer_ = EventLoop::kInvalidTimer;
+            if (state_ != WsClientState::Closing) return;
+            drop_tcp();
+            finish_close(1006, "close timeout");
+        }, false);
+}
+
+void WsClient::finish_close(uint16_t code, std::string_view reason)
+{
+    cancel_close_timer();
+    state_ = WsClientState::Closed;
+    if (on_close_) on_close_(code, reason);
+}
+
+void WsClient::cancel_close_timer()
+{
+    if (close_timer_ != EventLoop::kInvalidTimer) {
+        loop_.cancel_timer(close_timer_);
+        close_timer_ = EventLoop::kInvalidTimer;
+    }
 }
 
 void WsClient::reconnect()
@@ -578,7 +611,7 @@ void WsClient::start_ping_timer()
                         tcp_.close();
                         start_reconnect_timer();
                     } else {
-                        enter_error("pong timeout");
+                        fail_connection("pong timeout");
                     }
                     return;
                 }
@@ -640,6 +673,32 @@ void WsClient::do_reconnect()
 
 // ── Error / cleanup ──────────────────────────────────────────────────────────
 
+// The TCP connection goes without a word to our own on_close handler: the
+// caller of drop_tcp() decides what the end means.
+void WsClient::drop_tcp()
+{
+    dropping_ = true;
+    tcp_.close();
+    dropping_ = false;
+}
+
+// A failure of the WebSocket protocol on a live TCP connection (a refused or
+// broken upgrade, a peer gone silent). The connection goes with it, or it
+// would stay open and refuse the next connect(); with auto-reconnect on, the
+// client dials again after the backoff, as it does after a TCP error.
+void WsClient::fail_connection(std::string_view msg)
+{
+    cancel_ping_timer();
+    drop_tcp();
+    if (auto_reconnect_ && !url_.host.empty()) {
+        if (on_error_) on_error_(msg);
+        state_ = WsClientState::Reconnecting;
+        start_reconnect_timer();
+        return;
+    }
+    enter_error(msg);
+}
+
 void WsClient::enter_error(std::string_view msg)
 {
     cancel_ping_timer();
@@ -652,6 +711,7 @@ void WsClient::cleanup()
 {
     cancel_ping_timer();
     cancel_reconnect_timer();
+    cancel_close_timer();
 
     for (auto& [id, pending] : pending_responses_)
         loop_.cancel_timer(pending.timer);

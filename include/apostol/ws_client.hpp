@@ -95,7 +95,11 @@ public:
     void connect(std::string_view url,
                  const std::vector<std::string>& protocols = {},
                  const std::vector<std::pair<std::string, std::string>>& headers = {});
+    /// Send a Close frame and wait for the server's. on_close fires once:
+    /// with the server's code when its Close comes, or with 1006 when the
+    /// connection ends without it or nothing comes within the close timeout.
     void close(uint16_t code = 1000, std::string_view reason = {});
+    void set_close_timeout(std::chrono::milliseconds ms) { close_timeout_ = ms; }
     void reconnect();
     bool connected() const noexcept { return state_ == WsClientState::Connected; }
     WsClientState state() const noexcept { return state_; }
@@ -142,6 +146,8 @@ protected:
     EventLoop&    loop_;
     static std::string generate_id();
     virtual void on_before_reconnect() {}
+    /// Hand a message to the on_error handler, if one is set.
+    void report_error(std::string_view msg) { if (on_error_) on_error_(msg); }
 
 private:
     struct ParsedUrl {
@@ -168,6 +174,10 @@ private:
     void cancel_reconnect_timer();
     void do_reconnect();
     void enter_error(std::string_view msg);
+    void fail_connection(std::string_view msg);
+    void cancel_close_timer();
+    void drop_tcp();
+    void finish_close(uint16_t code, std::string_view reason);
     void cleanup();
 
     TcpClient     tcp_;
@@ -194,6 +204,11 @@ private:
     // Ping/pong
     std::chrono::seconds   ping_interval_{30};
     EventLoop::TimerId     ping_timer_{EventLoop::kInvalidTimer};
+
+    // Close handshake
+    std::chrono::milliseconds close_timeout_{5000};
+    EventLoop::TimerId     close_timer_{EventLoop::kInvalidTimer};
+    bool                   dropping_{false};   // drop_tcp(): its on_close is ours
     bool                   pong_pending_{false};
     int                    pong_miss_count_{0};
 
