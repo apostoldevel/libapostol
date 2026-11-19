@@ -1312,6 +1312,10 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
 
     auto file_size = static_cast<std::size_t>(st.st_size);
 
+    // The type goes into a header line: cut at a control byte, as set_header()
+    // does with every value.
+    const auto content_type = header_safe(std::string(mime_type));
+
     // The headers the request carries (set_carried_header), read before
     // response_started() ends the wait they are for. Their values went
     // through header_safe() when they were set.
@@ -1331,7 +1335,7 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
         "{}"
         "{}"
         "\r\n",
-        mime_type, file_size, carried, (draining_ || close_after_send_) ? "Connection: close\r\n" : "");
+        content_type, file_size, carried, (draining_ || close_after_send_) ? "Connection: close\r\n" : "");
 
     // If there are already pending writes, append headers and queue file
     if (write_pos_ < write_buf_.size() || file_fd_ >= 0) {
@@ -1340,10 +1344,25 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
             throttled_ = true;   // headers behind a held tail count too
         // Can't queue two files — fallback to buffered read
         if (file_fd_ >= 0) {
-            // Read entire file into write buffer (rare edge case)
+            // Read entire file into write buffer (rare edge case). A file
+            // that ends before the size fstat() gave (cut meanwhile) leaves
+            // the body short of its Content-Length: what was read goes out
+            // and the connection closes after it, so that the client sees
+            // the answer cut, not the next one as the rest of its body.
             std::string buf(file_size, '\0');
-            [[maybe_unused]] ssize_t n = ::read(fd, buf.data(), file_size);
+            std::size_t got = 0;
+            while (got < file_size) {
+                ssize_t n = ::read(fd, buf.data() + got, file_size - got);
+                if (n < 0 && errno == EINTR)
+                    continue;
+                if (n <= 0)
+                    break;
+                got += static_cast<std::size_t>(n);
+            }
             ::close(fd);
+            buf.resize(got);
+            if (got < file_size)
+                close_after_send_ = true;
             write_buf_.append(buf);
             if (buffered_bytes() > kWriteHighWater)
                 throttled_ = true;
@@ -1472,15 +1491,29 @@ bool HttpConnection::drain_file()
             break;
         }
         if (n == 0)
-            break;  // EOF
+            break;  // EOF — before file_remaining_ bytes if the file was cut
         file_remaining_ -= static_cast<std::size_t>(n);
     }
+
+    // The file ended before the size its Content-Length announced: the body
+    // on the wire is short. Kept open, the connection would have the next
+    // answer read as the rest of this body; closed, the client sees the
+    // answer cut.
+    const bool cut = !fatal && file_remaining_ > 0;
 
     ::close(file_fd_);
     file_fd_ = -1;
     file_remaining_ = 0;
 
-    if (fatal) {
+    if (cut) {
+        if (logger_)
+            logger_->warn("http: file ended before its Content-Length on {}:{} — closing the connection",
+                          conn_.peer_address(), conn_.peer_port());
+        shutdown_and_drain();
+        closed_ = true;
+        if (loop_)
+            loop_->remove_io(conn_.fd());
+    } else if (fatal) {
         closed_ = true;
         if (loop_)
             loop_->remove_io(conn_.fd());

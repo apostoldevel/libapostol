@@ -113,6 +113,13 @@ target_link_libraries(http_split_test PRIVATE apostol)
 target_compile_options(http_split_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME http_split COMMAND http_split_test)
 
+# http_send_file_test — send_file(): the content type cannot add a header line;
+# a file cut while it is sent closes the connection after the short body.
+add_executable(http_send_file_test http_send_file_test.cpp)
+target_link_libraries(http_send_file_test PRIVATE apostol)
+target_compile_options(http_send_file_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME http_send_file COMMAND http_send_file_test)
+
 # debug_mask_test — masking of the _DEBUG request/response dump, in this
 # process: what is not recognised is not written; credentials masked by name.
 add_executable(debug_mask_test debug_mask_test.cpp)
