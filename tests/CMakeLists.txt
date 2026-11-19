@@ -285,3 +285,10 @@ add_executable(settings_test settings_test.cpp)
 target_link_libraries(settings_test PRIVATE apostol)
 target_compile_options(settings_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME settings COMMAND settings_test)
+
+# yaml_writer_test — json_to_yaml read back by a YAML parser (python3 yaml).
+add_executable(yaml_writer_test yaml_writer_test.cpp)
+target_link_libraries(yaml_writer_test PRIVATE apostol)
+target_compile_options(yaml_writer_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME yaml_writer COMMAND yaml_writer_test "${CMAKE_CURRENT_BINARY_DIR}")
+set_tests_properties(yaml_writer PROPERTIES SKIP_RETURN_CODE 77)

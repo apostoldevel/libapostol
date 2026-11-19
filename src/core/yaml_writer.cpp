@@ -40,6 +40,16 @@ bool needs_quotes(std::string_view s)
             || c == '\n' || c == '\r')
             return true;
 
+    // Starts with an indicator that opens another construct: a sequence entry,
+    // a complex key, a reserved character.
+    if (s.front() == '-' || s.front() == '?' || s.front() == '`')
+        return true;
+
+    // A tab anywhere, or another control character: quoted as well.
+    for (char c : s)
+        if (static_cast<unsigned char>(c) < 0x20)
+            return true;
+
     // Starts or ends with whitespace?
     if (std::isspace(static_cast<unsigned char>(s.front()))
         || std::isspace(static_cast<unsigned char>(s.back())))
@@ -89,7 +99,12 @@ void write_yaml(std::ostringstream& os, const nlohmann::json& j,
                 os << pad;
             }
 
-            os << key << ":";
+            // A key is a scalar too: "a: b" or "#x" unquoted reads as another
+            // mapping or a comment.
+            if (needs_quotes(key))
+                os << quote(key) << ":";
+            else
+                os << key << ":";
 
             if (is_block_value(val)) {
                 os << "\n";
