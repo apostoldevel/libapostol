@@ -1,5 +1,7 @@
 #include "apostol/ip_allow_list.hpp"
 
+#include "apostol/config.hpp"
+
 #include <nlohmann/json.hpp>
 #include <fmt/format.h>
 
@@ -122,29 +124,13 @@ IpAllowList IpAllowList::configured(const nlohmann::json* value, std::string_vie
                                     const std::vector<std::string>& defaults, std::string& error)
 {
     error.clear();
-    std::vector<std::string> entries;
     try {
-        if (value != nullptr && value->is_array()) {
-            for (const auto& e : *value)
-                if (e.is_string())
-                    entries.push_back(e.get<std::string>());
-                else
-                    throw std::invalid_argument("every entry must be a string");
-        } else if (value != nullptr && value->is_string()) {
-            std::string token;
-            for (char c : value->get<std::string>() + ",") {
-                // Any ASCII blank: a value read from a file ends with a newline.
-                if (c == ',' || c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f') {
-                    if (!token.empty())
-                        entries.push_back(std::move(token));
-                    token.clear();
-                } else {
-                    token += c;
-                }
-            }
-        } else if (value != nullptr && !value->is_null()) {
+        auto list = config_list(value);
+        if (list.wrong_type)
             throw std::invalid_argument("an array of strings or a string");
-        }
+        if (!list.rejected.empty())
+            throw std::invalid_argument("every entry must be a string");
+        const auto& entries = list.items;
         return parse(entries, defaults);
     } catch (const std::exception& e) {
         error = fmt::format("{}: {}", key, e.what());

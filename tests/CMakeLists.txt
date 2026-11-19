@@ -56,6 +56,12 @@ foreach(case empty_datagram part_flood no_timer)
     set_tests_properties(ipc_frames_${case} PROPERTIES TIMEOUT 90)
 endforeach()
 
+# config_list_test — config_list(): the forms of a list in the configuration.
+add_executable(config_list_test config_list_test.cpp)
+target_link_libraries(config_list_test PRIVATE apostol)
+target_compile_options(config_list_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME config_list COMMAND config_list_test)
+
 # ip_allow_list_test — IpAllowList in this process; no node, no files.
 add_executable(ip_allow_list_test ip_allow_list_test.cpp)
 target_link_libraries(ip_allow_list_test PRIVATE apostol)

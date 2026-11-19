@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -117,5 +118,21 @@ private:
     nlohmann::json data_;
     std::filesystem::path path_;
 };
+
+// ─── config_list ─────────────────────────────────────────────────────────────
+
+// A list in the configuration: an array of strings, or one string — the form
+// an environment variable gives ("hosts": "${HOSTS}") — split at commas and
+// ASCII blanks (a value read from a file ends with a newline). An element of
+// an array is taken whole. Absent (nullptr) or null — an empty list. What to
+// do with a rejected element or a value of another type is the caller's.
+struct ConfigList
+{
+    std::vector<std::string> items;
+    std::vector<std::string> rejected;     // array elements that are not strings, as JSON
+    bool                     wrong_type{false};   // neither an array, a string nor null
+};
+
+ConfigList config_list(const nlohmann::json* value);
 
 } // namespace apostol

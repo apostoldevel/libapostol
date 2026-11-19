@@ -360,4 +360,39 @@ nlohmann::json Config::expand_all(const nlohmann::json& node)
     return node;
 }
 
+// ─── config_list ─────────────────────────────────────────────────────────────
+
+ConfigList config_list(const nlohmann::json* value)
+{
+    ConfigList list;
+    if (value == nullptr || value->is_null())
+        return list;
+    if (value->is_array()) {
+        for (const auto& e : *value)
+            if (e.is_string())
+                list.items.push_back(e.get<std::string>());
+            else
+                list.rejected.push_back(e.dump(-1, ' ', true, nlohmann::json::error_handler_t::replace));
+        return list;
+    }
+    if (!value->is_string()) {
+        list.wrong_type = true;
+        return list;
+    }
+    const auto& s = value->get_ref<const std::string&>();
+    const auto separator = [](char c) {
+        return c == ',' || c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
+    };
+    for (std::size_t i = 0; i < s.size();) {
+        while (i < s.size() && separator(s[i]))
+            ++i;
+        const std::size_t from = i;
+        while (i < s.size() && !separator(s[i]))
+            ++i;
+        if (i > from)
+            list.items.emplace_back(s, from, i - from);
+    }
+    return list;
+}
+
 } // namespace apostol
