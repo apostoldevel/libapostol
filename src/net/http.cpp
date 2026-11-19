@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 
 #include <sys/socket.h>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -360,7 +361,9 @@ HttpResponse::FileBody::~FileBody()
 
 bool HttpResponse::set_file(const std::string& path, std::string content_type)
 {
-    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    // Non-blocking: a FIFO or a device opens at once and is refused below
+    // instead of holding the loop in open(); reads of a regular file ignore it.
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0)
         return false;
     struct stat st;
@@ -539,6 +542,7 @@ int HttpResponseParser::cb_on_headers_complete(llhttp_t* p)
 {
     auto* rp = resp_self(p);
 
+    rp->headers_done_ = true;
     rp->current_.status_code = static_cast<int>(llhttp_get_status_code(p));
 
     rp->current_.version = fmt::format("HTTP/{}.{}",
@@ -564,12 +568,15 @@ int HttpResponseParser::cb_on_message_complete(llhttp_t* p)
     rp->current_       = {};
     rp->current_field_ = {};
     rp->current_value_ = {};
+    rp->headers_done_  = false;
     return 0;
 }
 
 void HttpResponseParser::flush_header()
 {
-    current_.headers.emplace_back(std::move(current_field_),
+    // A trailer of a chunked body is not a header (RFC 9110 §6.5.1).
+    if (!headers_done_)
+        current_.headers.emplace_back(std::move(current_field_),
                                    std::move(current_value_));
     current_field_.clear();
     current_value_.clear();
@@ -676,6 +683,7 @@ int HttpParser::cb_on_header_value_complete(llhttp_t* p)
 int HttpParser::cb_on_headers_complete(llhttp_t* p)
 {
     HttpParser* hp = self(p);
+    hp->headers_done_ = true;
 
     // Method string
     hp->current_.method = llhttp_method_name(
@@ -736,6 +744,7 @@ int HttpParser::cb_on_message_complete(llhttp_t* p)
     hp->current_       = {};
     hp->current_field_ = {};
     hp->current_value_ = {};
+    hp->headers_done_  = false;
 
     // hold(): stop here; llhttp resumes after this message on the next execute.
     if (hp->hold_) {
@@ -747,7 +756,9 @@ int HttpParser::cb_on_message_complete(llhttp_t* p)
 
 void HttpParser::flush_header()
 {
-    current_.headers.emplace_back(std::move(current_field_),
+    // A trailer of a chunked body is not a header (RFC 9110 §6.5.1).
+    if (!headers_done_)
+        current_.headers.emplace_back(std::move(current_field_),
                                   std::move(current_value_));
     current_field_.clear();
     current_value_.clear();
@@ -910,6 +921,12 @@ bool HttpConnection::on_readable(RequestHandler handler)
 
     // Set the handler so the parser calls it per-request
     parser_.set_handler([&](HttpRequest req) {
+        // Closed while this request was read (a failed "100 Continue"): the
+        // client is gone, the request is not run.
+        if (closed_) {
+            parser_.hold();
+            return;
+        }
         req.peer_ip   = conn_.peer_address();
         req.peer_port = conn_.peer_port();
         req.socket_fd = conn_.fd();
@@ -1367,10 +1384,19 @@ void HttpConnection::attach_file(int fd, std::size_t size)
     // body short of its Content-Length: what was read goes out and the
     // connection closes after it, so that the client sees the answer cut, not
     // the next one as the rest of its body.
-    std::string buf(size, '\0');
+    // pread: the descriptor is a duplicate and shares its offset with the
+    // response's own, which another send of the same response may have moved.
+    std::string buf;
+    try {
+        buf.resize(size);
+    } catch (const std::bad_alloc&) {
+        ::close(fd);
+        close_after_send_ = true;   // the head went out; the body cannot follow
+        return;
+    }
     std::size_t got = 0;
     while (got < size) {
-        ssize_t n = ::read(fd, buf.data() + got, size - got);
+        ssize_t n = ::pread(fd, buf.data() + got, size - got, static_cast<off_t>(got));
         if (n < 0 && errno == EINTR)
             continue;
         if (n <= 0)
@@ -1388,7 +1414,9 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
 {
     if (closed_) return;
 
-    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    // Non-blocking: a FIFO or a device opens at once and is refused below
+    // instead of holding the loop in open(); reads of a regular file ignore it.
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) {
         HttpResponse r;
         r.set_status(HttpStatus::not_found).set_body("file not readable");

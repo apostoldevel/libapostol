@@ -289,6 +289,7 @@ private:
     bool          malformed_{false};
     bool          hold_{false};
     bool          in_message_{false};
+    bool          headers_done_{false};   // what follows is a trailer
     std::size_t   consumed_{0};
     std::string   error_msg_;
 
@@ -366,6 +367,7 @@ private:
     std::string        current_value_;
     bool               error_{false};
     bool               no_body_{false};
+    bool               headers_done_{false};   // what follows is a trailer
     std::string        error_msg_;
 
     Handler handler_;
