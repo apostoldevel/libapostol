@@ -475,9 +475,17 @@ protected:
     /// fails is logged and tried again kForkRetry later, on the master's loop;
     /// it never leaves the master. False when the fork failed.
     bool respawn_child(ProcessRole role, std::string name);
+    /// At the start, before the master's loop, a refused fork fails the start;
+    /// from the loop (a reload) a child goes through respawn_child().
     virtual void spawn_workers();
     virtual void spawn_helper();
     void reap_children();
+    /// A child to start at `due`: a respawn held back by the backoff, a fork
+    /// tried again. Started by the master's tick, once a second — no timer is
+    /// made for it when the descriptors may have run out.
+    void spawn_later(ProcessRole role, std::string name,
+                     std::chrono::steady_clock::time_point due, bool quiet);
+    void spawn_due();
 
 private:
     // ── State ─────────────────────────────────────────────────────────────────
@@ -604,9 +612,19 @@ private:
     // The pause before a failed fork is tried again (respawn_child).
     static constexpr auto kForkRetry = std::chrono::seconds(5);
 
-    // The master's own EventLoop while master_run() is running, else nullptr. Lets
-    // reap_children() schedule a throttled respawn on a timer instead of ::sleep()ing
-    // inside the SIGCHLD handler, which would stall the master for the whole backoff.
+    struct LaterSpawn
+    {
+        ProcessRole                           role;
+        std::string                           name;
+        std::chrono::steady_clock::time_point due;
+        bool                                  quiet{false};   // a storm: no "respawning" line
+    };
+    std::vector<LaterSpawn> later_spawns_;
+
+    // The master's own EventLoop while master_run() is running, else nullptr. With
+    // it reap_children() holds a throttled respawn for the master's tick instead of
+    // ::sleep()ing inside the SIGCHLD handler, which would stall the master for the
+    // whole backoff.
     EventLoop*               master_loop_{nullptr};
 };
 

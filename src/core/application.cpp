@@ -766,8 +766,12 @@ void Application::write_pid_file() const
         throw std::system_error(errno, std::system_category(),
             fmt::format("cannot write PID file '{}'", settings_.pid_file.string()));
     const std::string line = fmt::format("{}\n", ::getpid());
-    const bool ok = ::fchmod(fd, 0644) == 0
-                 && ::write(fd, line.data(), line.size()) == static_cast<ssize_t>(line.size());
+    // A file of another owner that this process may write keeps its mode:
+    // only the owner can change it. Said, not a refused start.
+    if (::fchmod(fd, 0644) != 0 && logger_)
+        logger_->warn("PID file '{}': its mode is left as it is ({})",
+                      settings_.pid_file.string(), std::strerror(errno));
+    const bool ok = ::write(fd, line.data(), line.size()) == static_cast<ssize_t>(line.size());
     const int err = errno;
     ::close(fd);
     if (!ok)
@@ -937,13 +941,26 @@ void Application::master_run()
 
     EventLoop loop;
 
-    // Visible to reap_children() so a throttled respawn is scheduled on this loop
+    // Visible to reap_children() so a throttled respawn waits for this loop's tick
     // rather than run under a blocking ::sleep(). Cleared before the loop is
     // destroyed at the end of this function.
     master_loop_ = &loop;
     // Control messages the children forked before this loop could not take at
     // once go from here; and the watch over processes that do not start.
     ipc_.master_attach(loop);
+    // The tick: the children held back (backoff) or refused a fork start here.
+    loop.add_timer(std::chrono::seconds(1), [this] {
+        try
+        {
+            spawn_due();
+        }
+        catch (const std::exception& e)
+        {
+            try {
+                logger_->error("master: a respawn failed: {}", e.what());
+            } catch (...) {}
+        }
+    });
 
     // Timer ID for the SIGKILL escalation one-shot timer (armed on SIGTERM).
     EventLoop::TimerId kill_timer_id = EventLoop::kInvalidTimer;
@@ -1405,9 +1422,6 @@ void Application::single_run()
     {
         on_worker_start(loop);
         module_manager_.on_start();
-        // Drop privileges after initialization (sockets bound, DB connected).
-        // Inside the startup: a switch that fails is a start that fails.
-        set_user(cfg_user(), cfg_group());
     }
     catch (const std::exception& e)
     {
@@ -1417,6 +1431,24 @@ void Application::single_run()
         // "Disconnected" into pg_logger_, already destroyed by then, and the
         // process sat on the dead logger's mutex with every signal blocked
         // for signalfd — only kill -9 ended it.
+        detach_ipc();
+        stop_db();
+        exit_code_ = 1;
+        return;
+    }
+    // Drop privileges after initialization (sockets bound, DB connected). A
+    // switch that fails is a start that fails; the modules have started, so
+    // they stop as on any exit.
+    try
+    {
+        set_user(cfg_user(), cfg_group());
+    }
+    catch (const std::exception& e)
+    {
+        logger_->error("{} startup failed: {}", name_, e.what());
+        retire_ipc();
+        stop_http_server(loop);
+        stop_modules(loop);
         detach_ipc();
         stop_db();
         exit_code_ = 1;
@@ -1484,15 +1516,29 @@ void Application::worker_run()
     {
         on_worker_start(loop);
         module_manager_.on_start();
-        // Drop privileges after initialization (sockets bound, DB connected).
-        // Inside the startup: a switch that fails is a start that fails.
-        set_user(cfg_user(), cfg_group());
     }
     catch (const std::exception& e)
     {
         logger_->error("{} worker startup failed: {}", name_, e.what());
         detach_ipc();
         stop_db();   // while the loop is alive, before ~Application — see single_run
+        exit_code_ = 1;
+        return;
+    }
+    // Drop privileges after initialization (sockets bound, DB connected) — see
+    // single_run: a switch that fails stops the started modules as any exit.
+    try
+    {
+        set_user(cfg_user(), cfg_group());
+    }
+    catch (const std::exception& e)
+    {
+        logger_->error("{} worker startup failed: {}", name_, e.what());
+        retire_ipc();
+        stop_http_server(loop);
+        stop_modules(loop);
+        detach_ipc();
+        stop_db();
         exit_code_ = 1;
         return;
     }
@@ -1555,9 +1601,6 @@ void Application::helper_run()
         {
             on_helper_start(loop);
             module_manager_.on_start();
-            // Drop privileges after initialization (DB connected). Inside the
-            // startup: a switch that fails is a start that fails.
-            set_user(cfg_user(), cfg_group());
         }
         catch (const std::exception& e)
         {
@@ -1567,6 +1610,20 @@ void Application::helper_run()
         }
 
         started = true;
+
+        // Drop privileges after initialization (DB connected). A switch that
+        // fails is a start that fails; the modules have started (`started`),
+        // so they stop as on any exit.
+        try
+        {
+            set_user(cfg_user(), cfg_group());
+        }
+        catch (const std::exception& e)
+        {
+            logger_->error("{} helper startup failed: {}", name_, e.what());
+            exit_code_ = 1;
+            return false;
+        }
 
         // Set process title AFTER modules are registered
         auto names = module_manager_.module_names();
@@ -1618,20 +1675,24 @@ void Application::helper_run()
         exit_code_ = 1;
         return;
     }
-    if (!lock && !start())
+    const bool up = lock || start();
 #else
-    if (!start())
+    const bool up = start();
 #endif
+    if (!up && !started)
     {
         detach_ipc();
         stop_db();   // while the loop is alive, before ~Application — see single_run
         return;
     }
     // Started — or, under "process.leader", a standby waiting for the lock: it
-    // answers too (a gather sees it, with its modules not running).
-    ipc_.ready();
-
-    loop.run();
+    // answers too (a gather sees it, with its modules not running). A start
+    // that failed once its modules had started goes to the stop below.
+    if (up)
+    {
+        ipc_.ready();
+        loop.run();
+    }
 
     retire_ipc();   // first — see single_run
 
@@ -1706,10 +1767,6 @@ void Application::custom_process_run(CustomProcess& proc)
         // 6. Process on_start
         try {
             proc.on_start(loop, *this);
-            // 7. Drop privileges after initialization (sockets bound; the pool
-            // is lazy — it connects at the first query, after this). Inside the
-            // startup: a switch that fails is a start that fails.
-            set_user(cfg_user(), cfg_group());
         } catch (const std::exception& e) {
             logger_->error("{} process '{}' startup failed: {}",
                            name_, proc.name(), e.what());
@@ -1718,6 +1775,19 @@ void Application::custom_process_run(CustomProcess& proc)
         }
 
         started = true;
+
+        // 7. Drop privileges after initialization (sockets bound; the pool is
+        // lazy — it connects at the first query, after this). A switch that
+        // fails is a start that fails; on_start() has run (`started`), so the
+        // process stops as on any exit.
+        try {
+            set_user(cfg_user(), cfg_group());
+        } catch (const std::exception& e) {
+            logger_->error("{} process '{}' startup failed: {}",
+                           name_, proc.name(), e.what());
+            exit_code_ = 1;
+            return false;
+        }
 
         // Set process title AFTER on_start (modules may be registered)
         auto names = module_manager_.module_names();
@@ -1774,15 +1844,19 @@ void Application::custom_process_run(CustomProcess& proc)
         return;
     }
 
-    if (!lock && !start()) {
+    const bool up = lock || start();
+    if (!up && !started) {
         detach_ipc();
         stop_db();
         return;
     }
-    ipc_.ready();   // started, or a standby — see helper_run
+    // A start that failed once on_start() had run goes to the stop below.
+    if (up) {
+        ipc_.ready();   // started, or a standby — see helper_run
 
-    // 8. Event loop
-    loop.run();
+        // 8. Event loop
+        loop.run();
+    }
     stopping = true;
     retire_ipc();   // first — see single_run
 
@@ -1897,6 +1971,15 @@ std::unique_ptr<PgLeaderLock> Application::run_as_leader(
 
 // ─── Process spawning ────────────────────────────────────────────────────────
 
+namespace
+{
+// fork() refused: the state of the host, not of the child (respawn_child).
+struct ForkRefused : std::system_error
+{
+    using std::system_error::system_error;
+};
+} // namespace
+
 pid_t Application::fork_child(ProcessRole role, std::string child_name,
                                std::function<void()> custom_fn)
 {
@@ -1918,7 +2001,7 @@ pid_t Application::fork_child(ProcessRole role, std::string child_name,
         const int err = errno;
         accept_balance_.reserved_for(pid);
         ipc_.master_fork_failed();
-        throw std::system_error(err, std::system_category(), "fork");
+        throw ForkRefused(err, std::system_category(), "fork");
     }
 
     if (pid == 0)
@@ -1984,12 +2067,60 @@ void Application::spawn_workers()
 {
     int count = settings_.effective_workers();
     for (int i = 0; i < count; ++i)
-        fork_child(ProcessRole::worker, fmt::format("worker#{}", i + 1));
+    {
+        auto name = fmt::format("worker#{}", i + 1);
+        if (master_loop_)
+            respawn_child(ProcessRole::worker, std::move(name));
+        else
+            fork_child(ProcessRole::worker, std::move(name));
+    }
 }
 
 void Application::spawn_helper()
 {
-    fork_child(ProcessRole::helper, "helper");
+    if (master_loop_)
+        respawn_child(ProcessRole::helper, "helper");
+    else
+        fork_child(ProcessRole::helper, "helper");
+}
+
+void Application::spawn_later(ProcessRole role, std::string name,
+                              std::chrono::steady_clock::time_point due, bool quiet)
+{
+    later_spawns_.push_back({role, std::move(name), due, quiet});
+}
+
+void Application::spawn_due()
+{
+    if (later_spawns_.empty())
+        return;
+    if (shutting_down_)
+        return later_spawns_.clear();
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<LaterSpawn> due;
+    for (auto it = later_spawns_.begin(); it != later_spawns_.end();)
+    {
+        if (it->due <= now)
+        {
+            due.push_back(std::move(*it));
+            it = later_spawns_.erase(it);
+        }
+        else
+            ++it;
+    }
+    for (auto& d : due)
+    {
+        // A reload since then has started a process of this name.
+        bool running = false;
+        for (const auto& child : children_)
+            if (child.name == d.name && !child.shutting_down)
+                running = true;
+        if (running || shutting_down_)
+            continue;
+        if (!d.quiet)
+            logger_->notice("respawning {} '{}'", role_name(d.role), d.name);
+        respawn_child(d.role, std::move(d.name));
+    }
 }
 
 bool Application::respawn_child(ProcessRole role, std::string name)
@@ -2016,29 +2147,21 @@ bool Application::respawn_child(ProcessRole role, std::string name)
     // host, not of this child. Out of here it would leave the master's loop and
     // the master with it — and every child after it, by PDEATHSIG. The master
     // stays, and tries again later; the child is missing until then.
+    // Only the refusal: a failure after the fork leaves a child behind, and a
+    // second fork for it would be a second process of the name.
     try
     {
         fork_child(role, name, std::move(run));
         return true;
     }
-    catch (const std::exception& e)
+    catch (const ForkRefused& e)
     {
         logger_->error("cannot start {} '{}': {} — trying again in {} s",
                        role_name(role), name, e.what(), kForkRetry.count());
     }
 
     if (master_loop_)
-    {
-        master_loop_->add_timer(kForkRetry, [this, role, name]() {
-            if (shutting_down_)
-                return;
-            // A reload since then has started a process of this name.
-            for (const auto& child : children_)
-                if (child.name == name && !child.shutting_down)
-                    return;
-            respawn_child(role, name);
-        }, /*repeat=*/false);
-    }
+        spawn_later(role, std::move(name), std::chrono::steady_clock::now() + kForkRetry, false);
     return false;
 }
 
@@ -2172,10 +2295,10 @@ void Application::reap_children()
             // SIGCHLD handler, so that sleep stalled the master's entire event loop:
             // for up to 30s it reaped no other dead children and answered no signals,
             // SIGTERM included, so a shutdown could hang half a minute. Now the fork is
-            // packaged and, when throttled, scheduled on the master loop by a one-shot
-            // timer; the master keeps turning through the delay. The rate limit itself
-            // is unchanged — a crash loop is still spaced out, just not by freezing the
-            // master to do it.
+            // packaged and, when throttled, held for the master's tick (once a second,
+            // spawn_due); the master keeps turning through the delay. The rate limit
+            // itself is unchanged, give or take the tick — a crash loop is still spaced
+            // out, just not by freezing the master to do it.
             auto do_respawn = [this, respawn_role, respawn_name, quiet = storm_now]() mutable {
                 // Re-check at fire time, not only when this was scheduled: a delayed
                 // respawn could otherwise fork a new child into a master that began
@@ -2224,10 +2347,9 @@ void Application::reap_children()
 
             if (delay > 0 && master_loop_)
             {
-                // One-shot (repeat=false): fire once after the backoff, then drop.
-                master_loop_->add_timer(std::chrono::seconds(delay),
-                    [do_respawn = std::move(do_respawn)]() mutable { do_respawn(); },
-                    /*repeat=*/false);
+                // The master's tick starts it: no timer is made here, where the
+                // descriptors may be what has run out.
+                spawn_later(respawn_role, respawn_name, now + std::chrono::seconds(delay), storm_now);
             }
             else
             {
@@ -2327,10 +2449,9 @@ bool Application::rolling_restart()
         respawn_child(ProcessRole::custom, cp.name);
 
     if (cfg_helper())
-        respawn_child(ProcessRole::helper, "helper");
+        spawn_helper();
 
-    for (int i = 0, n = settings_.effective_workers(); i < n; ++i)
-        respawn_child(ProcessRole::worker, fmt::format("worker#{}", i + 1));
+    spawn_workers();
 
     // Allow new processes a moment to start before old ones stop
     // (mirrors v1 usleep(100 * 1000) in CProcessMaster::Run sig_reconfigure branch)

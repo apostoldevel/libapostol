@@ -60,14 +60,45 @@ bool needs_quotes(std::string_view s)
 
 std::string quote(std::string_view s)
 {
-    std::string result = "'";
-    for (char c : s) {
-        if (c == '\'')
-            result += "''";
-        else
-            result += c;
+    // A line break or another control character cannot stand in single quotes
+    // (a break folds into a space, the others are not allowed there): such a
+    // string goes in double quotes, escaped.
+    const bool escaped = std::any_of(s.begin(), s.end(), [](char c) {
+        const auto u = static_cast<unsigned char>(c);
+        return (u < 0x20 && c != '\t') || u == 0x7f;
+    });
+    if (!escaped) {
+        std::string result = "'";
+        for (char c : s) {
+            if (c == '\'')
+                result += "''";
+            else
+                result += c;
+        }
+        result += '\'';
+        return result;
     }
-    result += '\'';
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string result = "\"";
+    for (char c : s) {
+        const auto u = static_cast<unsigned char>(c);
+        switch (c) {
+            case '"':  result += "\\\""; break;
+            case '\\': result += "\\\\"; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
+            default:
+                if (u < 0x20 || u == 0x7f) {
+                    result += "\\x";
+                    result += hex[u >> 4];
+                    result += hex[u & 0xf];
+                } else {
+                    result += c;
+                }
+        }
+    }
+    result += '"';
     return result;
 }
 

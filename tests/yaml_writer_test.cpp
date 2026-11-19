@@ -22,7 +22,8 @@ int main(int argc, char* argv[])
     const nlohmann::json in = {
         {"summary", "- starts with dash"}, {"q", "? question"}, {"b", "`backtick"},
         {"tab", "a\tb"}, {"a b: c", "k"}, {"#hash", "v"}, {"plain", "text"},
-        {"nested", {{"k: v", "- x"}}}, {"list", {"- one", "two"}}};
+        {"nested", {{"k: v", "- x"}}}, {"list", {"- one", "two"}},
+        {"lines", "a\nb\r\nc"}, {"ctl", "x\x01y\x7f"}, {"esc", "q\"\\ \n"}, {"key\nbreak", "v"}};
     const auto yaml = apostol::json_to_yaml(in);
     const std::string y = dir + "/yaml_writer_test.yaml", j = dir + "/yaml_writer_test.json";
     std::ofstream(y) << yaml;

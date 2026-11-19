@@ -28,6 +28,12 @@
 //                 start is refused with code 1.
 //   daemon_refused -d and a pid file naming another live process: the
 //                 launcher exits 1, not 0.
+//   fork_retry_nofd a refused respawn while the master has no descriptor
+//                 left: it is tried again once the limits are back.
+//   reload_spawn  SIGHUP starts the new workers through spawn_workers(), the
+//                 application's own when it has one.
+//   privilege_stop a privilege switch that fails once the modules have
+//                 started: their on_stop() runs before the exit with code 1.
 //
 // Usage: process_model_test <case> <dir>
 // Exit: 0 pass, 1 fail, 77 skipped (run as root: limits and permissions do
@@ -35,6 +41,7 @@
 
 #include "apostol/application.hpp"
 #include "apostol/crash_handler.hpp"
+#include "apostol/module.hpp"
 
 #include <fmt/format.h>
 
@@ -130,10 +137,42 @@ bool log_has(const std::string& what, std::size_t times = 1)
     return count_of(read_file(error_log()), what) >= times;
 }
 
+fs::path spawns_file()  { return g_dir / "spawns"; }
+fs::path stopped_file() { return g_dir / "stopped"; }
+
+// A worker module that leaves a mark when it is stopped.
+class StopMark final : public Module
+{
+public:
+    std::string_view name() const override { return "StopMark"; }
+    bool enabled() const override { return true; }
+    bool execute(const HttpRequest&, HttpResponse&) override { return false; }
+    void on_stop() override
+    {
+        std::ofstream f(stopped_file(), std::ios::app);
+        f << ::getpid() << '\n';
+    }
+};
+
 class TestApp final : public Application
 {
 public:
     TestApp() : Application("process_model_test") {}
+
+protected:
+    void on_worker_start(EventLoop&) override
+    {
+        module_manager().add_module(std::make_unique<StopMark>());
+    }
+
+    void spawn_workers() override
+    {
+        {
+            std::ofstream f(spawns_file(), std::ios::app);
+            f << "spawn_workers\n";
+        }
+        Application::spawn_workers();
+    }
 };
 
 // The application in a child of this process, with -p and -c of the case and
@@ -283,6 +322,84 @@ void case_fork_retry()
     ::kill(master, SIGTERM);
     check(wait_exit(master, 15s) == 0, "SIGTERM: the master exits 0");
     check(!fs::exists(pid_file()), "the pid file is removed");
+}
+
+// ─── fork_retry_nofd, reload_spawn, privilege_stop ───────────────────────────
+
+pid_t nth_worker(std::size_t nth);
+
+void case_fork_retry_nofd()
+{
+    config(R"("master": true, "helper": false, "user": "")");
+    const pid_t master = start_app();
+    const std::string spawned = "spawned worker 'worker#1'";
+    check(wait_for([&] { return log_has(spawned); }, 10s), "the worker is spawned");
+    const pid_t worker = nth_worker(1);
+    if (worker <= 1 || worker == master) {
+        check(false, fmt::format("the worker's pid is read from the log ({})", worker));
+        ::kill(master, SIGKILL);
+        ::waitpid(master, nullptr, 0);
+        return;
+    }
+    struct rlimit nproc{}, nofile{};
+    ::prlimit(master, RLIMIT_NPROC, nullptr, &nproc);
+    ::prlimit(master, RLIMIT_NOFILE, nullptr, &nofile);
+    // No descriptor above what the master holds now: no timer can be made.
+    int top = 0;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(fmt::format("/proc/{}/fd", master), ec))
+        top = std::max(top, std::atoi(e.path().filename().c_str()));
+    struct rlimit low{static_cast<rlim_t>(top + 1), nofile.rlim_max};
+    check(set_nproc(master, 1) && ::prlimit(master, RLIMIT_NOFILE, &low, nullptr) == 0,
+          fmt::format("the master's limits lowered (processes 1, descriptors {})", top + 1));
+    ::kill(worker, SIGKILL);
+    check(wait_for([&] { return log_has("cannot start worker 'worker#1'"); }, 5s),
+          "the refused fork is logged");
+    std::this_thread::sleep_for(1500ms);
+    set_nproc(master, nproc.rlim_cur);
+    ::prlimit(master, RLIMIT_NOFILE, &nofile, nullptr);
+    check(alive(master), "the master stays up");
+    check(wait_for([&] { return log_has(spawned, 2); }, 15s),
+          "the worker is started again once the limits are back");
+    ::kill(master, SIGTERM);
+    check(wait_exit(master, 15s) == 0, "SIGTERM: the master exits 0");
+}
+
+void case_reload_spawn()
+{
+    config(R"("master": true, "helper": false, "user": "")");
+    const pid_t master = start_app();
+    check(wait_for([&] { return log_has("spawned worker 'worker#1'"); }, 10s), "the worker is spawned");
+    ::kill(master, SIGHUP);
+    check(wait_for([&] { return log_has("spawned worker 'worker#1'", 2); }, 10s),
+          "SIGHUP: a new worker is spawned");
+    const auto calls = count_of(read_file(spawns_file()), "spawn_workers");
+    check(calls == 2, fmt::format("both through the application's spawn_workers() ({} calls)", calls));
+    ::kill(master, SIGTERM);
+    check(wait_exit(master, 15s) == 0, "SIGTERM: the master exits 0");
+}
+
+void case_privilege_stop()
+{
+    for (const char* process : {R"("master": false, "helper": false)", R"("master": true, "helper": false)"}) {
+        fs::remove(error_log());
+        fs::remove(stopped_file());
+        config(fmt::format(R"({}, "user": "no-such-user-apostol-test", "group": "")", process));
+        const pid_t pid = start_app({}, [] { g_fake_root = true; });
+        const bool master = std::string(process).find("\"master\": true") != std::string::npos;
+        if (master) {
+            // The worker fails its start and is respawned with a backoff: one is enough.
+            check(wait_for([&] { return fs::exists(stopped_file()); }, 10s),
+                  "worker: the started module is stopped before the exit");
+            ::kill(pid, SIGTERM);
+            wait_exit(pid, 15s);
+        } else {
+            check(wait_exit(pid, 10s) == 1, "single: the process ends with code 1");
+            check(fs::exists(stopped_file()), "single: the started module is stopped before the exit");
+        }
+        check(log_has("cannot drop privileges: user 'no-such-user-apostol-test' not found"),
+              "and the reason is logged");
+    }
 }
 
 // ─── own_pid ─────────────────────────────────────────────────────────────────
@@ -550,6 +667,9 @@ int main(int argc, char* argv[])
     else if (name == "environ")        case_environ();
     else if (name == "args")           case_args();
     else if (name == "daemon_refused") case_daemon_refused();
+    else if (name == "fork_retry_nofd") case_fork_retry_nofd();
+    else if (name == "reload_spawn")   case_reload_spawn();
+    else if (name == "privilege_stop") case_privilege_stop();
     else {
         std::fprintf(stderr, "process_model_test: unknown case '%s'\n", name.c_str());
         return 2;
