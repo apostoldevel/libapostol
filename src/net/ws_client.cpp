@@ -202,6 +202,13 @@ void WsClient::do_connect()
     tcp_.on_error([this](std::string_view err) {
         cancel_ping_timer();
 
+        if (state_ == WsClientState::Closing) {
+            // Our Close went out; the connection failed before the server's
+            // answer (a reset, TLS without close_notify): the close ends here.
+            finish_close(1006, err);
+            return;
+        }
+
         if (auto_reconnect_ && (state_ == WsClientState::Connected ||
                                 state_ == WsClientState::Connecting ||
                                 state_ == WsClientState::Upgrading))
@@ -691,9 +698,10 @@ void WsClient::fail_connection(std::string_view msg)
     cancel_ping_timer();
     drop_tcp();
     if (auto_reconnect_ && !url_.host.empty()) {
-        if (on_error_) on_error_(msg);
+        // State and timer first, the handler last: it may destroy the client.
         state_ = WsClientState::Reconnecting;
         start_reconnect_timer();
+        if (on_error_) on_error_(msg);
         return;
     }
     enter_error(msg);

@@ -68,7 +68,7 @@ public:
 
     /// Connect to SMTP server and send all queued messages. A message whose
     /// envelope address holds a control byte, a space or an angle bracket, or
-    /// that has no recipient, is not sent: it leaves the queue and its on_error
+    /// that has no recipient or an empty one, is not sent: it leaves the queue and its on_error
     /// is called before send_mail() returns, after the rest are under way.
     void send_mail();
 

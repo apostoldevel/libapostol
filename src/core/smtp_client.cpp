@@ -63,7 +63,7 @@ void SmtpClient::send_mail()
             why = "no envelope recipient";
         else
             for (const auto& to : it->to)
-                if (!envelope_address_ok(to)) { why = "invalid envelope recipient"; break; }
+                if (to.empty() || !envelope_address_ok(to)) { why = "invalid envelope recipient"; break; }
 
         if (why.empty()) { ++it; continue; }
         refused.emplace_back(std::move(*it), std::move(why));

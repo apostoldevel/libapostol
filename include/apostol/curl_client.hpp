@@ -73,8 +73,9 @@ public:
 
     void set_timeout(long ms) noexcept { timeout_ms_ = ms; }
 
-    /// The largest response body a transfer keeps, after content decoding;
-    /// a larger one — announced or received — fails the transfer with
+    /// The largest response body a transfer keeps, counted after content
+    /// decoding (an announced Content-Length is checked as sent); a larger
+    /// one fails the transfer with
     /// "response larger than <n> bytes". Zero lifts the limit.
     static constexpr std::size_t kDefaultMaxResponseSize = 64 * 1024 * 1024;
     void set_max_response_size(std::size_t bytes) noexcept { max_response_size_ = bytes; }

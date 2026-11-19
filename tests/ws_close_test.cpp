@@ -11,7 +11,10 @@
 //      on_close(1006, ...) once;
 //   4. close() with a server that answers with its own Close frame: on_close
 //      with the server's code once, and no second call when the close timeout
-//      would have elapsed.
+//      would have elapsed;
+//   5. close() with a server that resets the connection on the Close frame
+//      (TCP RST, a socket error rather than an end of stream): on_close(1006)
+//      once, and no second call when the close timeout would have elapsed.
 //
 // Usage: ws_close_test (exit 77 — skipped — without a loopback listener)
 
@@ -100,7 +103,7 @@ struct CloseResult
     long        at_ms{0};
 };
 
-enum class Peer { ignore_close, drop_on_close, echo_close };
+enum class Peer { reset_on_close, ignore_close, drop_on_close, echo_close };
 
 // Connect, call close() once connected, and watch on_close for `wait_ms`.
 CloseResult close_with(Peer peer, int wait_ms)
@@ -108,6 +111,13 @@ CloseResult close_with(Peer peer, int wait_ms)
     Server srv([peer](Conn& c, int) {
         if (!ws_handshake(c))
             return;
+        if (peer == Peer::reset_on_close) {
+            // Wait for the client's Close frame without reading it: a socket
+            // closed with unread data in its receive queue answers with RST.
+            c.wait(POLLIN, 3000);
+            c.close_now();
+            return;
+        }
         std::string b;
         // The client's Close frame: opcode 0x8 in the first byte.
         while (!c.stopping() && c.read(b, 200) != Rd::eof) {
@@ -168,6 +178,11 @@ int main()
     {
         const auto r = close_with(Peer::drop_on_close, 1200);
         check(r.calls == 1 && r.code == 1006, "server drops the connection on Close: on_close(1006) once, got "
+                                                  + std::to_string(r.calls) + " call(s), code " + std::to_string(r.code));
+    }
+    {
+        const auto r = close_with(Peer::reset_on_close, 1200);
+        check(r.calls == 1 && r.code == 1006, "server resets the connection on Close: on_close(1006) once, got "
                                                   + std::to_string(r.calls) + " call(s), code " + std::to_string(r.code));
     }
     {

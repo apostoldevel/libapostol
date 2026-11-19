@@ -4,11 +4,12 @@
 // SSL_CERT_FILE; the client dials "127.0.0.1", the certificate names it).
 //
 //   1. envelope addresses: a recipient or a sender with a control byte (CR LF
-//      among them), or a message with no recipient, is refused with its own
-//      on_error ("invalid envelope recipient", "invalid envelope sender", "no
-//      envelope recipient") and the relay never sees it — no injected
-//      command; a good message queued with them is delivered (RCPT, DATA,
-//      on_done); when every message is refused nothing is dialled;
+//      among them), an empty recipient string, or a message with no recipient,
+//      is refused with its own on_error ("invalid envelope recipient",
+//      "invalid envelope sender", "no envelope recipient") and the relay never
+//      sees it — no injected command; a good message queued with them is
+//      delivered (RCPT, DATA, on_done); when every message is refused nothing
+//      is dialled;
 //   2. data after the 220 of STARTTLS, in the same write, is refused ("data
 //      after the 220");
 //   3. a reply line that never ends is refused once it is longer than 4096
@@ -252,6 +253,7 @@ void test_envelope(const Identity& id)
     queue(smtp, sent, "bad-to", "a@x.test", {"a@x.test>\r\nRCPT TO:<evil@x.test"});
     queue(smtp, sent, "bad-from", "a@x.test>\r\nRCPT TO:<evil@x.test", {"b@x.test"});
     queue(smtp, sent, "no-to", "a@x.test", {});
+    queue(smtp, sent, "empty-to", "a@x.test", {""});
     queue(smtp, sent, "good", "a@x.test", {"b@x.test"});
     smtp.send_mail();
 
@@ -262,6 +264,8 @@ void test_envelope(const Identity& id)
           "sender with CR LF: on_error 'invalid envelope sender', got '" + error_of(sent, "bad-from") + "'");
     check(error_of(sent, "no-to") == "no envelope recipient",
           "no recipient: on_error 'no envelope recipient', got '" + error_of(sent, "no-to") + "'");
+    check(error_of(sent, "empty-to") == "invalid envelope recipient",
+          "empty recipient string: on_error 'invalid envelope recipient', got '" + error_of(sent, "empty-to") + "'");
 
     run_until(loop, [&] { return delivered(sent, "good") || !error_of(sent, "good").empty(); }, 5000);
     check(delivered(sent, "good"), "good message queued with the bad ones: delivered, error '"
@@ -269,9 +273,10 @@ void test_envelope(const Identity& id)
     check(!relay.saw_containing("evil"), "the relay never saw the injected command");
     check(relay.count("RCPT TO:") == 1 && relay.saw("RCPT TO:<b@x.test>"),
           "the relay saw exactly the good recipient, RCPT count " + std::to_string(relay.count("RCPT TO:")));
+    check(!relay.saw("RCPT TO:<>"), "the relay never saw an empty recipient");
     check(relay.count("MAIL FROM:") == 1, "the relay saw one MAIL FROM, got " + std::to_string(relay.count("MAIL FROM:")));
     check(relay.count("DATA") == 1, "the relay saw one DATA");
-    check(sent.failed.size() == 3, "three refusals, got " + std::to_string(sent.failed.size()));
+    check(sent.failed.size() == 4, "four refusals, got " + std::to_string(sent.failed.size()));
 
     // Credentials go as base64 (the relay answers 334/235 only to these).
     check(relay.saw("AUTH LOGIN") && relay.saw("dXNlckB4LnRlc3Q=") && relay.saw("c2VjcmV0"),
