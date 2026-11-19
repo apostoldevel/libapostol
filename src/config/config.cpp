@@ -7,7 +7,6 @@
 #include <fstream>
 #include <optional>
 #include <regex>
-#include <sstream>
 #include <stdexcept>
 
 namespace apostol
@@ -316,7 +315,6 @@ std::string Config::expand_env(std::string_view value)
 
     std::string result(value);
     std::smatch match;
-    std::string::const_iterator search_start(result.cbegin());
 
     std::string out;
     out.reserve(result.size());

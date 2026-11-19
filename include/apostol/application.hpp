@@ -376,8 +376,9 @@ private:
     void load_config(bool reload = false);
     void write_pid_file() const;
     void remove_pid_file() const;
+    void daemon_ready() noexcept;   // -d: tell the launcher the start went on
     bool check_running() const;
-    static void daemonize();
+    void daemonize();
     void send_signal_to_running(std::string_view sig_name) const;
 
     void print_version() const;
@@ -492,6 +493,8 @@ private:
     std::string send_signal_; // non-empty if -s flag was given
     std::string locale_;
     std::string conf_param_;  // global config directives (-g)
+    std::string args_error_;  // parse_args(): an unknown option, a missing value
+    int         daemon_ready_fd_{-1};  // -d: the launcher waits on it (daemonize)
     std::string cmdline_;     // original command line (for process title)
     int         cli_workers_{-1}; // -1 = not set via CLI; ≥0 = explicit -w value
     int         os_argc_{0};

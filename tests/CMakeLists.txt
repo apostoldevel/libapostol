@@ -266,7 +266,8 @@ set_tests_properties(fetch_limit PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 add_executable(process_model_test process_model_test.cpp)
 target_link_libraries(process_model_test PRIVATE apostol)
 target_compile_options(process_model_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
-foreach(case fork_retry own_pid pid_mode privilege crash_fd crash_reload)
+foreach(case fork_retry own_pid pid_mode privilege crash_fd crash_reload
+             worker_sigint child_fds environ args daemon_refused)
     add_test(NAME process_model_${case}
              COMMAND process_model_test ${case} "${CMAKE_CURRENT_BINARY_DIR}/process_model_${case}.d")
     set_tests_properties(process_model_${case} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)

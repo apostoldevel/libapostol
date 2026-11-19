@@ -20,6 +20,14 @@
 //                 when the path was set.
 //   crash_reload  "log.file" changed and SIGHUP: a crash after it reports into
 //                 the new file.
+//   worker_sigint SIGINT to a worker: it stops as on SIGTERM and exits 0.
+//   child_fds     a worker forked by a respawn holds no descriptor of the
+//                 master's loop: one epoll instance and one signalfd, its own.
+//   environ       the environment reads as before after ~Application.
+//   args          "-s" without its value, an unknown option, "-w" last: the
+//                 start is refused with code 1.
+//   daemon_refused -d and a pid file naming another live process: the
+//                 launcher exits 1, not 0.
 //
 // Usage: process_model_test <case> <dir>
 // Exit: 0 pass, 1 fail, 77 skipped (run as root: limits and permissions do
@@ -48,6 +56,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -393,6 +402,123 @@ void case_crash_reload()
     check(read_file(a).find("CRASH REPORT") == std::string::npos, "and not in the old one");
 }
 
+// ─── worker_sigint, child_fds ────────────────────────────────────────────────
+
+pid_t nth_worker(std::size_t nth)
+{
+    const std::string spawned = "spawned worker 'worker#1'";
+    const auto text = read_file(error_log());
+    std::size_t pos = std::string::npos;
+    for (std::size_t i = 0, from = 0; i < nth; ++i, from = pos + 1)
+        if ((pos = text.find(spawned, from)) == std::string::npos)
+            return 0;
+    const auto at = text.find("pid=", pos);
+    return at == std::string::npos ? 0 : static_cast<pid_t>(std::atoi(text.c_str() + at + 4));
+}
+
+// How many descriptors of `pid` link to `what` ("anon_inode:[eventpoll]").
+int fds_of(pid_t pid, const std::string& what)
+{
+    int n = 0;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(fmt::format("/proc/{}/fd", pid), ec)) {
+        std::error_code lec;
+        if (fs::read_symlink(e.path(), lec).string() == what)
+            ++n;
+    }
+    return n;
+}
+
+void case_worker_sigint()
+{
+    config(R"("master": true, "helper": false, "user": "")");
+    const pid_t master = start_app();
+    check(wait_for([&] { return nth_worker(1) > 1; }, 10s), "the worker is spawned");
+    const pid_t worker = nth_worker(1);
+    if (worker > 1 && worker != master)
+        ::kill(worker, SIGINT);
+    check(wait_for([&] { return log_has(fmt::format("(pid={}) exited with code 0", worker)); }, 10s),
+          "SIGINT to a worker: it stops as on SIGTERM and exits 0");
+    check(!log_has(fmt::format("(pid={}) killed by signal", worker)), "it is not killed by the signal");
+    ::kill(master, SIGTERM);
+    check(wait_exit(master, 15s) == 0, "the master exits 0");
+}
+
+void case_child_fds()
+{
+    config(R"("master": true, "helper": false, "user": "")");
+    const pid_t master = start_app();
+    check(wait_for([&] { return nth_worker(1) > 1; }, 10s), "the worker is spawned");
+    const pid_t first = nth_worker(1);
+    if (first > 1 && first != master)
+        ::kill(first, SIGKILL);
+    check(wait_for([&] { return nth_worker(2) > 1; }, 10s), "the master forks its successor from its loop");
+    const pid_t second = nth_worker(2);
+    std::this_thread::sleep_for(500ms);
+    const int epolls = second > 1 ? fds_of(second, "anon_inode:[eventpoll]") : -1;
+    const int sigfds = second > 1 ? fds_of(second, "anon_inode:[signalfd]") : -1;
+    check(epolls == 1, fmt::format("the successor holds one epoll instance, its own ({})", epolls));
+    check(sigfds == 1, fmt::format("and one signalfd ({})", sigfds));
+    ::kill(master, SIGTERM);
+    check(wait_exit(master, 15s) == 0, "the master exits 0");
+}
+
+// ─── environ ─────────────────────────────────────────────────────────────────
+
+void case_environ()
+{
+    config(R"("master": false, "helper": false, "user": "")");
+    ::setenv("APOSTOL_TEST_ENV", "the value", 1);
+    std::fflush(stdout);
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        std::string a0 = "process_model_test", a1 = "-v";
+        char* argv[] = {a0.data(), a1.data(), nullptr};
+        {
+            TestApp app;
+            app.run(2, argv);
+        }
+        // The freed block, if it was freed, is taken again and overwritten.
+        std::vector<std::unique_ptr<char[]>> blocks;
+        for (int i = 0; i < 64; ++i) {
+            for (std::size_t size : {std::size_t(1) << 10, std::size_t(1) << 12, std::size_t(1) << 14}) {
+                blocks.emplace_back(new char[size]);
+                std::memset(blocks.back().get(), 'Z', size);
+            }
+        }
+        const char* v = ::getenv("APOSTOL_TEST_ENV");
+        ::_exit(v && std::string(v) == "the value" ? 0 : 1);
+    }
+    check(wait_exit(pid, 10s) == 0, "the environment reads as before after ~Application");
+}
+
+// ─── args ────────────────────────────────────────────────────────────────────
+
+void case_args()
+{
+    config(R"("master": false, "helper": false, "user": "")");
+    for (const std::vector<std::string>& extra : {std::vector<std::string>{"-s"},
+                                                  std::vector<std::string>{"--bogus-option"},
+                                                  std::vector<std::string>{"-w"}}) {
+        fs::remove(error_log());
+        const pid_t pid = start_app(extra);
+        const int rc = wait_exit(pid, 5s);
+        check(rc == 1, fmt::format("'{}': refused with code 1 (rc {})", extra.front(), rc));
+        check(!log_has("single process started"), fmt::format("'{}': nothing starts", extra.front()));
+    }
+}
+
+// ─── daemon_refused ──────────────────────────────────────────────────────────
+
+void case_daemon_refused()
+{
+    config(R"("master": false, "helper": false, "user": "")");
+    write_file(pid_file(), fmt::format("{}\n", ::getpid()));   // another live process
+    const pid_t launcher = start_app({"-d"});
+    check(wait_exit(launcher, 10s) == 1, "-d: a refused start is the launcher's exit code 1");
+    fs::remove(pid_file());
+}
+
 } // namespace
 
 int main(int argc, char* argv[])
@@ -419,6 +545,11 @@ int main(int argc, char* argv[])
     else if (name == "privilege")    case_privilege();
     else if (name == "crash_fd")     case_crash_fd();
     else if (name == "crash_reload") case_crash_reload();
+    else if (name == "worker_sigint")  case_worker_sigint();
+    else if (name == "child_fds")      case_child_fds();
+    else if (name == "environ")        case_environ();
+    else if (name == "args")           case_args();
+    else if (name == "daemon_refused") case_daemon_refused();
     else {
         std::fprintf(stderr, "process_model_test: unknown case '%s'\n", name.c_str());
         return 2;

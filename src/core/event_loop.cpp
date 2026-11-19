@@ -43,6 +43,25 @@ EventLoop::~EventLoop()
         ::close(epoll_fd_);
 }
 
+void EventLoop::release_after_fork() noexcept
+{
+    // close() only: an epoll_ctl() on the shared instance would take the
+    // parent's registrations off with it. A registration goes when the last
+    // descriptor of its file is closed, and the parent keeps its own.
+    for (auto& [id, entry] : timers_)
+    {
+        if (entry.fd >= 0)
+            ::close(entry.fd);
+        entry.fd = -1;
+    }
+    if (signal_fd_ >= 0)
+        ::close(signal_fd_);
+    signal_fd_ = -1;
+    if (epoll_fd_ >= 0)
+        ::close(epoll_fd_);
+    epoll_fd_ = -1;
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 void EventLoop::run()

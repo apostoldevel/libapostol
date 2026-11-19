@@ -98,7 +98,9 @@ Application::Application(std::string_view name) : name_(name), logger_(std::make
 Application::~Application()
 {
     EventLoop::unset_diagnostics(logger_.get());
-    delete[] os_environ_;
+    // os_environ_ is not freed: environ points into it, and the environment
+    // is the process's, not this object's — getenv() after the destructor
+    // read freed memory. It is allocated once per process (init_setproctitle).
 }
 
 // ─── set_info ────────────────────────────────────────────────────────────────
@@ -185,6 +187,11 @@ int Application::run(int argc, char* argv[])
         config_file_ = settings_.conf_file;
 
     parse_args(argc, argv);
+    if (!args_error_.empty())
+    {
+        std::fprintf(stderr, "%s: %s (-h for help)\n", name_.c_str(), args_error_.c_str());
+        return 1;
+    }
 
     // Resolve config file against prefix if a relative path was given via -c
     // (handles both orderings: -p before -c and -c before -p)
@@ -357,6 +364,7 @@ void Application::start_process()
     {
         write_pid_file();
         PidFile pid_file{*this};
+        daemon_ready();   // -d: the launcher exits 0 now
         on_start();
 
         // After on_start(), where the application may have enabled it; before
@@ -404,6 +412,7 @@ void Application::start_process()
     {
         write_pid_file();
         PidFile pid_file{*this};
+        daemon_ready();   // -d: the launcher exits 0 now
         on_start();
         helper_run();
     }
@@ -413,6 +422,7 @@ void Application::start_process()
         role_ = ProcessRole::single;
         write_pid_file();
         PidFile pid_file{*this};
+        daemon_ready();   // -d: the launcher exits 0 now
         on_start();
         single_run();
     }
@@ -422,9 +432,22 @@ void Application::start_process()
 
 void Application::parse_args(int argc, char* argv[])
 {
+    // An option this parser does not know, or one without its value, is an
+    // error (args_error_): it used to be skipped, and "-s" with no signal, or
+    // a mistyped option, started the service instead.
+    static constexpr std::string_view kWithValue[] = {
+        "-c", "--config", "-p", "--prefix", "-s", "--signal", "-w", "--workers",
+        "-l", "--locale", "-g", "--global"};
     for (int i = 1; i < argc; ++i)
     {
         std::string_view arg = argv[i];
+
+        if (i + 1 >= argc
+            && std::find(std::begin(kWithValue), std::end(kWithValue), arg) != std::end(kWithValue))
+        {
+            args_error_ = fmt::format("option '{}' needs a value", arg);
+            return;
+        }
 
         if (arg == "-d" || arg == "--daemon")
         {
@@ -501,6 +524,11 @@ void Application::parse_args(int argc, char* argv[])
                 "  -h, --help             show this help\n",
                 name_.c_str());
             std::exit(0);
+        }
+        else
+        {
+            args_error_ = fmt::format("unknown option '{}'", arg);
+            return;
         }
     }
 }
@@ -747,6 +775,16 @@ void Application::write_pid_file() const
             fmt::format("cannot write PID file '{}'", settings_.pid_file.string()));
 }
 
+void Application::daemon_ready() noexcept
+{
+    if (daemon_ready_fd_ < 0)
+        return;
+    const char byte = 1;
+    [[maybe_unused]] auto n = ::write(daemon_ready_fd_, &byte, 1);
+    ::close(daemon_ready_fd_);
+    daemon_ready_fd_ = -1;
+}
+
 void Application::remove_pid_file() const
 {
     std::error_code ec;
@@ -797,12 +835,30 @@ bool Application::check_running() const
 
 void Application::daemonize()
 {
+    // The launcher exits with the daemon's verdict, not at once: it waits for
+    // one byte the daemon writes once its pid file is written (daemon_ready),
+    // and reads the end of the pipe instead when the daemon gives up first —
+    // already running, a failed start. It used to exit 0 before any check.
+    int ready[2] = {-1, -1};
+    if (::pipe2(ready, O_CLOEXEC) != 0)
+        throw std::system_error(errno, std::system_category(), "pipe (daemonize)");
+
     // First fork — detach from terminal
     pid_t pid = ::fork();
     if (pid < 0)
         throw std::system_error(errno, std::system_category(), "fork (daemonize)");
     if (pid > 0)
-        std::exit(0); // parent exits
+    {
+        ::close(ready[1]);
+        char byte = 0;
+        ssize_t n;
+        do
+            n = ::read(ready[0], &byte, 1);
+        while (n < 0 && errno == EINTR);
+        std::_Exit(n == 1 ? 0 : 1);
+    }
+    ::close(ready[0]);
+    daemon_ready_fd_ = ready[1];
 
     ::setsid();
     // The umask the daemon was started with, never looser than 022: with 0 the
@@ -1412,6 +1468,9 @@ void Application::worker_run()
 
     loop.add_signal(SIGTERM, stop_signal(loop));
     loop.add_signal(SIGQUIT, stop_signal(loop));
+    // SIGINT as SIGTERM in every child: Ctrl-C reaches the whole foreground
+    // group, and its default action ended a child at once, its work dropped.
+    loop.add_signal(SIGINT,  stop_signal(loop));
     loop.add_signal(SIGUSR1, [this](const signalfd_siginfo&) {
         logger_->notice("SIGUSR1 — worker reopening logs");
         logger_->reopen();
@@ -1473,6 +1532,7 @@ void Application::helper_run()
 
     loop.add_signal(SIGTERM, stop_signal(loop));
     loop.add_signal(SIGQUIT, stop_signal(loop));
+    loop.add_signal(SIGINT,  stop_signal(loop));
     loop.add_signal(SIGUSR1, [this](const signalfd_siginfo&) {
         logger_->notice("SIGUSR1 — helper reopening logs");
         logger_->reopen();
@@ -1616,6 +1676,7 @@ void Application::custom_process_run(CustomProcess& proc)
 
     loop.add_signal(SIGTERM, stop_signal(loop));
     loop.add_signal(SIGQUIT, stop_signal(loop));
+    loop.add_signal(SIGINT,  stop_signal(loop));
     loop.add_signal(SIGUSR1, [this](const signalfd_siginfo&) {
         logger_->notice("SIGUSR1 — process reopening logs");
         logger_->reopen();
@@ -1763,6 +1824,7 @@ void Application::custom_fn_run(const std::function<void(EventLoop&)>& fn, std::
     attach_ipc(loop, ProcessRole::custom, name);
     loop.add_signal(SIGTERM, [&loop](const signalfd_siginfo&) { loop.stop(); });
     loop.add_signal(SIGQUIT, [&loop](const signalfd_siginfo&) { loop.stop(); });
+    loop.add_signal(SIGINT,  [&loop](const signalfd_siginfo&) { loop.stop(); });
     try
     {
         fn(loop);
@@ -1864,6 +1926,13 @@ pid_t Application::fork_child(ProcessRole role, std::string child_name,
         // ── Child process ──────────────────────────────────────────────────
         // First: what of the master's channels is not this child's is closed.
         ipc_.master_forked_child();
+        // A child forked by a respawn or a reload, from inside the master's
+        // loop, holds copies of that loop's descriptors for its whole life.
+        if (master_loop_)
+        {
+            master_loop_->release_after_fork();
+            master_loop_ = nullptr;
+        }
         ::prctl(PR_SET_PDEATHSIG, SIGTERM);
 
         role_ = role;
@@ -2291,7 +2360,12 @@ void Application::init_setproctitle(int argc, char* argv[])
             os_argv_last_ = os_argv_[i] + std::strlen(os_argv_[i]) + 1;
     }
 
-    // Copy environ to heap, extend os_argv_last_ through contiguous environ entries
+    // Copy environ to heap, extend os_argv_last_ through contiguous environ entries.
+    // Once per process: a second Application finds it moved already.
+    static bool environ_moved = false;
+    if (environ_moved)
+        return;
+    environ_moved = true;
     std::size_t env_size = 0;
     for (int i = 0; environ[i]; ++i)
         env_size += std::strlen(environ[i]) + 1;

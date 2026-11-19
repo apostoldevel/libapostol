@@ -117,6 +117,16 @@ public:
     // Unregister a signal handler and unblock the signal.
     void remove_signal(int signum);
 
+    // ── After fork ────────────────────────────────────────────────────────────
+
+    // In a child forked while this loop runs in its parent: close this
+    // process's copies of the loop's own descriptors — the epoll instance, the
+    // signalfd, the timers — without touching the parent's registrations. The
+    // loop is not to be run or used in this process afterwards; destroying it
+    // stays harmless. Descriptors given by add_io() belong to their holders
+    // and stay open.
+    void release_after_fork() noexcept;
+
 private:
     void rebuild_signal_fd();
     void dispatch_signals();
