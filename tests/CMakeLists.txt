@@ -45,6 +45,17 @@ set(IPC_TEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/ipc_test.d")
 add_test(NAME ipc COMMAND ipc_test -p "${IPC_TEST_DIR}/" -c "${IPC_TEST_DIR}/ipc_test.json")
 set_tests_properties(ipc PROPERTIES TIMEOUT 120)
 
+# ipc_frames_test — datagrams no sender of the library writes, and a request
+# with no descriptor left; a master and two workers, one case per test.
+add_executable(ipc_frames_test ipc_frames_test.cpp)
+target_link_libraries(ipc_frames_test PRIVATE apostol)
+target_compile_options(ipc_frames_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+foreach(case empty_datagram part_flood no_timer)
+    add_test(NAME ipc_frames_${case}
+             COMMAND ipc_frames_test ${case} "${CMAKE_CURRENT_BINARY_DIR}/ipc_frames_${case}.d")
+    set_tests_properties(ipc_frames_${case} PROPERTIES TIMEOUT 90)
+endforeach()
+
 # ip_allow_list_test — IpAllowList in this process; no node, no files.
 add_executable(ip_allow_list_test ip_allow_list_test.cpp)
 target_link_libraries(ip_allow_list_test PRIVATE apostol)

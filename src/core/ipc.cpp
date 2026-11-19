@@ -4,6 +4,7 @@
 #include "apostol/logger.hpp"
 #include "apostol/node_directory.hpp"
 
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -107,6 +109,16 @@ std::vector<std::string> make_frames(std::uint8_t kind, std::uint8_t status, int
         offset += n;
     } while (offset < body.size());
     return frames;
+}
+
+// A read of 0 bytes from a SEQPACKET socket is an empty datagram or the end:
+// the end only when the other side is closed for good.
+bool peer_gone(int fd) noexcept
+{
+    pollfd p{fd, POLLRDHUP, 0};
+    if (::poll(&p, 1, 0) < 0)
+        return true;
+    return (p.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0;
 }
 
 bool role_in(ProcessRole role, unsigned roles) noexcept
@@ -258,6 +270,7 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
     std::deque<std::function<void()>>          deferred;
     EventLoop::TimerId                         defer_timer{EventLoop::kInvalidTimer};
     EventLoop::TimerId                         beat_timer{EventLoop::kInvalidTimer};
+    bool                                       timers_starved{false};
     std::vector<char>                          rbuf;
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -318,13 +331,36 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
         if (!loop || defer_timer != EventLoop::kInvalidTimer)
             return;
         std::weak_ptr<IpcCore> w = weak_from_this();
-        defer_timer = loop->add_timer(std::chrono::milliseconds(1), [w] {
-            if (auto c = w.lock())
-            {
-                c->defer_timer = EventLoop::kInvalidTimer;
-                c->run_deferred();
-            }
-        }, /*repeat=*/false);
+        try
+        {
+            defer_timer = loop->add_timer(std::chrono::milliseconds(1), [w] {
+                if (auto c = w.lock())
+                {
+                    c->defer_timer = EventLoop::kInvalidTimer;
+                    c->run_deferred();
+                }
+            }, /*repeat=*/false);
+            timers_starved = false;
+        }
+        catch (const std::exception& e)
+        {
+            // The beat runs what is left (run_left).
+            no_timer(e, "the callbacks wait for the next beat");
+        }
+    }
+
+    // Deferred work no timer could be had for.
+    void run_left()
+    {
+        if (!deferred.empty() && defer_timer == EventLoop::kInvalidTimer)
+            run_deferred();
+    }
+
+    // A timer refused (no descriptor left): said once until one is had again.
+    void no_timer(const std::exception& e, std::string_view what)
+    {
+        if (!std::exchange(timers_starved, true))
+            warn("ipc: no timer ({}) — {}", e.what(), what);
     }
 
     void run_deferred()
@@ -753,6 +789,10 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
         const std::size_t payload = n - sizeof(h) - type_len;
         if (static_cast<std::size_t>(h.offset) + payload > h.total)
             return void(++stats.dropped);
+        // A message longer than one datagram comes as full chunks and a last
+        // one with the rest (make_frames): any other chunk is dropped.
+        if (!last && (payload != Ipc::kChunk || static_cast<std::size_t>(h.offset) + payload >= h.total))
+            return void(++stats.dropped);
 
         const char* type_ptr = data + sizeof(h);
         const char* body_ptr = type_ptr + type_len;
@@ -773,7 +813,8 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
                 return void(++stats.dropped);
             parts.erase(key);
             // What is being put together is bounded like a queue: by the
-            // totals announced, not by what has arrived so far.
+            // totals announced, not by what has arrived so far. Each is over
+            // one chunk, so there are fewer than kMaxQueue / kChunk of them.
             std::size_t announced = h.total;
             for (const auto& [k, q] : parts)
                 announced += q.total;
@@ -837,6 +878,11 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
                 on_datagram(rbuf.data(), static_cast<std::size_t>(n));
                 continue;
             }
+            if (n == 0 && !peer_gone(inbox_fd))
+            {
+                ++stats.dropped;   // an empty datagram
+                continue;
+            }
             if (n < 0 && errno == EINTR)
                 continue;
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
@@ -845,8 +891,8 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
                     loop->rearm_io(inbox_fd);
                 return;
             }
-            // 0 — no writer left at all (the master is gone); an error: stop
-            // watching, or the loop would spin on it.
+            // 0 with the other side closed — no writer left at all (the master
+            // is gone); an error: stop watching, or the loop would spin on it.
             warn("ipc: the inbox of '{}' is closed ({}) — no message reaches this process any more",
                  me.name, n == 0 ? "no writer left" : std::strerror(errno));
             if (loop)
@@ -878,7 +924,9 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
                     loop->rearm_io(control_fd);
                 return;
             }
-            if (n <= 0)
+            // 0 with the other side open is an empty datagram: dropped below
+            // as a frame of the wrong size.
+            if (n < 0 || (n == 0 && peer_gone(control_fd)))
             {
                 warn("ipc: the control channel of '{}' is closed ({}) — no process of the node "
                      "is opened or closed here any more", me.name,
@@ -963,6 +1011,7 @@ struct detail::IpcCore : std::enable_shared_from_this<detail::IpcCore>
 
     void on_beat()
     {
+        run_left();
         if (connected)
             dir.stamp(me.slot);
         const long long now = now_ms();
@@ -1289,10 +1338,20 @@ void Ipc::request(int slot, std::string_view type, std::string body, RequestDone
     const auto ms = std::max<long long>(1, timeout.count());
     std::weak_ptr<detail::IpcCore> w = core_;
     // The timer first: if it cannot be had, nothing is left waiting for it.
-    const auto timer = c.loop->add_timer(std::chrono::milliseconds(ms), [w, id] {
-        if (auto core = w.lock())
-            core->on_timeout(id);
-    }, /*repeat=*/false);
+    EventLoop::TimerId timer = EventLoop::kInvalidTimer;
+    try
+    {
+        timer = c.loop->add_timer(std::chrono::milliseconds(ms), [w, id] {
+            if (auto core = w.lock())
+                core->on_timeout(id);
+        }, /*repeat=*/false);
+        c.timers_starved = false;
+    }
+    catch (const std::exception& e)
+    {
+        c.no_timer(e, "requests are refused as 'failed'");
+        return fail_later(IpcError::failed);
+    }
     auto& p = c.pending[id];
     p.slot       = slot;
     p.generation = generation;
@@ -1430,6 +1489,7 @@ void Ipc::master_forked_child()
     // live on the master's loop (not cancelled — that is not ours either), its
     // requests wait for answers addressed to the master.
     c.master_timer = c.defer_timer = c.beat_timer = c.owed_timer = EventLoop::kInvalidTimer;
+    c.timers_starved = false;
     c.deferred.clear();
     c.pending.clear();
     c.held.clear();
@@ -1555,7 +1615,10 @@ void Ipc::master_attach(EventLoop& loop)
     std::weak_ptr<detail::IpcCore> w = core_;
     c.master_timer = loop.add_timer(std::chrono::seconds(1), [w] {
         if (auto core = w.lock())
+        {
+            core->run_left();
             core->check_starting();
+        }
     });
 }
 
@@ -1585,16 +1648,21 @@ void Ipc::attach(EventLoop& loop, Logger& log, ProcessRole role, std::string_vie
     c.log      = &log;
     c.attached = true;
     c.stopping = false;
+    std::weak_ptr<detail::IpcCore> w = core_;
     if (!c.connected)
     {
         c.me = {};
         c.me.role = role;
         c.me.name = std::string(name);
         c.me.pid  = ::getpid();
+        // The beat runs the callbacks no timer of their own could be had for.
+        c.beat_timer = loop.add_timer(std::chrono::seconds(1), [w] {
+            if (auto core = w.lock())
+                core->on_beat();
+        });
         return;
     }
 
-    std::weak_ptr<detail::IpcCore> w = core_;
     loop.add_io(c.inbox_fd, EPOLLIN, [w](std::uint32_t) {
         if (auto core = w.lock())
             core->on_inbox();
