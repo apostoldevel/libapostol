@@ -13,6 +13,7 @@
 #ifdef WITH_SSL
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 #endif
 
 namespace apostol
@@ -423,6 +424,10 @@ void TcpClient::cancel_idle_timer()
 
 void TcpClient::enable_tls(bool verify)
 {
+    // The context carries the verification mode it was made with: a changed
+    // mode makes the next handshake build a new one.
+    if (ssl_ctx_ && verify != tls_verify_)
+        ssl_ctx_.reset();
     tls_enabled_ = true;
     tls_verify_  = verify;
 }
@@ -434,7 +439,9 @@ void TcpClient::start_tls()
         return;
     }
 
-    tls_enabled_ = true;
+    // The upgrade is this connection's only: tls_enabled_ (implicit TLS on
+    // connect) stays as enable_tls() left it, so the next connect() of the
+    // same client starts in plain text again, as the protocol expects.
     state_ = TcpClientState::TlsHandshake;
     if (watch(EPOLLIN | EPOLLOUT))
         do_tls_handshake();
@@ -470,9 +477,27 @@ void TcpClient::do_tls_handshake()
         // only: RFC 6066 §3 leaves a literal IPv4 or IPv6 address out.
         in_addr  a4{};
         in6_addr a6{};
-        if (!hostname_.empty() && ::inet_pton(AF_INET, hostname_.c_str(), &a4) != 1
-            && ::inet_pton(AF_INET6, hostname_.c_str(), &a6) != 1)
+        const bool literal = !hostname_.empty()
+            && (::inet_pton(AF_INET, hostname_.c_str(), &a4) == 1
+                || ::inet_pton(AF_INET6, hostname_.c_str(), &a6) == 1);
+        if (!hostname_.empty() && !literal)
             ::SSL_set_tlsext_host_name(ssl_.get(), hostname_.c_str());
+
+        // A verified chain proves only that some trusted authority signed the
+        // certificate; it must also name the host dialled — a DNS name against
+        // the subject alternative names (no partial wildcards), an address
+        // against the IP entries.
+        if (tls_verify_ && !hostname_.empty()) {
+            const int set = literal
+                ? ::X509_VERIFY_PARAM_set1_ip_asc(::SSL_get0_param(ssl_.get()), hostname_.c_str())
+                : ::SSL_set1_host(ssl_.get(), hostname_.c_str());
+            if (set != 1) {
+                enter_error("SSL: the host name cannot be checked");
+                return;
+            }
+            if (!literal)
+                ::SSL_set_hostflags(ssl_.get(), X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        }
     }
 
     int rc = ::SSL_connect(ssl_.get());

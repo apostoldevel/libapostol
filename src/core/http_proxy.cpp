@@ -16,6 +16,8 @@ struct HttpProxy::ForwardCtx
     SendResponse        send_response;
     OnFailure           on_failure;
     bool                done{false};
+    bool                connecting{false};  // inside tcp.connect(), called from forward()
+    bool                deferred{false};    // a failure from inside connect() waits for the loop
     bool                request_sent{false};
     std::string         request_method;   // HEAD answers keep the upstream's Content-Length
     EventLoop::TimerId  response_timer{EventLoop::kInvalidTimer};
@@ -90,7 +92,7 @@ void HttpProxy::forward_impl(const HttpRequest& req, SendResponse send_response,
 
 #ifdef WITH_SSL
     if (tls_enabled_)
-        ptr->tcp.enable_tls(false);
+        ptr->tcp.enable_tls(tls_verify_);
 #endif
 
     // Serialize the request for the upstream
@@ -137,21 +139,43 @@ void HttpProxy::forward_impl(const HttpRequest& req, SendResponse send_response,
         ptr->cancel_response_timer();
         schedule_cleanup();
 
-        if (ptr->on_failure)
-            ptr->on_failure(ForwardFailure{reason, msg, ptr->request_sent});
-        else if (ptr->send_response) {
+        // The handler is taken out of the context before it runs: destroying
+        // the proxy destroys the context, and with it a handler left inside.
+        if (ptr->on_failure) {
+            auto on_failure = std::move(ptr->on_failure);
+            on_failure(ForwardFailure{reason, msg, ptr->request_sent});
+        } else if (ptr->send_response) {
             HttpResponse resp;
             resp.set_status(502, "Bad Gateway")
                 .set_body(fmt::format("upstream error: {}", msg), "text/plain");
-            ptr->send_response(resp);
+            auto send_response = std::move(ptr->send_response);
+            send_response(resp);
         }
     };
 
     // Every way out of a forward that is not an upstream response. Runs once:
     // the tcp callbacks and the response timer can each fire after another
     // has already settled the context.
+    //
+    // A failure inside tcp.connect() (a name that does not resolve, a refused
+    // address, no socket) comes while forward() and connect() are still on
+    // the stack: reporting it there would let the caller destroy the proxy
+    // under both. It is reported from the loop instead, a millisecond later
+    // (a zero timer never fires). The context stays unsettled until then, so
+    // no sweep takes it first; `deferred` keeps the other callbacks out.
     auto fail = [ptr, report](Reason reason, std::string_view msg) {
-        if (ptr->done) return;
+        if (ptr->done || ptr->deferred) return;
+        if (ptr->connecting) {
+            ptr->deferred = true;
+            ptr->loop.add_timer(std::chrono::milliseconds(1),
+                [ptr, report, reason, text = std::string(msg),
+                 alive = std::weak_ptr<int>(ptr->alive)] {
+                    if (alive.expired()) return;   // proxy destroyed meanwhile
+                    ptr->done = true;
+                    report(reason, text);
+                }, /*repeat=*/false);
+            return;
+        }
         ptr->done = true;
         report(reason, msg);
     };
@@ -212,8 +236,10 @@ void HttpProxy::forward_impl(const HttpRequest& req, SendResponse send_response,
         ptr->tcp.close();
         schedule_cleanup();
 
-        if (ptr->send_response)
-            ptr->send_response(resp);
+        if (ptr->send_response) {
+            auto send_response = std::move(ptr->send_response);
+            send_response(resp);
+        }
     });
 
     ptr->tcp.on_connect([ptr, report, data = std::move(serialized),
@@ -259,9 +285,13 @@ void HttpProxy::forward_impl(const HttpRequest& req, SendResponse send_response,
              "upstream closed connection");
     });
 
-    ptr->tcp.connect(upstream_host_, upstream_port_);
-
+    // The context is kept before connect(): nothing of this proxy is touched
+    // after it, and a failure inside it is reported from the loop (fail).
     contexts_.push_back(std::move(ctx));
+
+    ptr->connecting = true;
+    ptr->tcp.connect(upstream_host_, upstream_port_);
+    ptr->connecting = false;
 }
 
 void HttpProxy::schedule_cleanup()

@@ -95,10 +95,15 @@ public:
 
     // ── TLS ─────────────────────────────────────────────────────────────────
 #ifdef WITH_SSL
-    /// Enable TLS. Call before connect() for implicit TLS.
+    /// Enable TLS. Call before connect() for implicit TLS; it holds for every
+    /// later connect() of this client. With verify, the handshake fails unless
+    /// the chain leads to the system trust store and the certificate names the
+    /// host given to connect() (a DNS name, or an IP address written as one).
     void enable_tls(bool verify = true);
 
-    /// Upgrade an already-connected plain connection to TLS (STARTTLS).
+    /// Upgrade an already-connected plain connection to TLS (STARTTLS), with
+    /// the verification enable_tls() set (verified by default). The upgrade
+    /// is this connection's: the next connect() starts in plain text.
     void start_tls();
 #endif
 

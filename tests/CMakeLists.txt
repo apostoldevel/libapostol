@@ -204,3 +204,20 @@ add_executable(http_framing_test http_framing_test.cpp)
 target_link_libraries(http_framing_test PRIVATE apostol)
 target_compile_options(http_framing_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME http_framing COMMAND http_framing_test)
+
+# The tests below talk to a scripted peer on 127.0.0.1 (net_test_util.hpp);
+# those that need a TLS server or a WebSocket handshake use OpenSSL.
+# tls_client_test — host name check of a verified TcpClient, STARTTLS for one
+# connection, HttpProxy to a TLS upstream; certificates made at run time.
+add_executable(tls_client_test tls_client_test.cpp)
+target_link_libraries(tls_client_test PRIVATE apostol)
+target_compile_options(tls_client_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME tls_client COMMAND tls_client_test)
+set_tests_properties(tls_client PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+# http_proxy_test — a forward() that fails at once is reported from the loop.
+add_executable(http_proxy_test http_proxy_test.cpp)
+target_link_libraries(http_proxy_test PRIVATE apostol)
+target_compile_options(http_proxy_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME http_proxy COMMAND http_proxy_test)
+set_tests_properties(http_proxy PROPERTIES TIMEOUT 30)

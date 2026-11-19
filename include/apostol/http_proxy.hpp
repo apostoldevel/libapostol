@@ -90,7 +90,15 @@ public:
     void set_append_forwarded_for(bool on) { append_forwarded_for_ = on; }
 
 #ifdef WITH_SSL
-    void set_tls(bool enable = true) { tls_enabled_ = enable; }
+    /// TLS to the upstream. With verify (the default) the upstream's
+    /// certificate must chain to the system trust store and name the host
+    /// this proxy was made for (TcpClient::enable_tls); an upstream that
+    /// fails it is a connect failure. verify=false accepts any certificate.
+    void set_tls(bool enable = true, bool verify = true)
+    {
+        tls_enabled_ = enable;
+        tls_verify_  = verify;
+    }
 #endif
 
 private:
@@ -120,6 +128,7 @@ private:
 
 #ifdef WITH_SSL
     bool tls_enabled_{false};
+    bool tls_verify_{true};
 #endif
 };
 
