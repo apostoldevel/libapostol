@@ -252,3 +252,11 @@ target_link_libraries(ws_message_client_test PRIVATE apostol)
 target_compile_options(ws_message_client_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME ws_message_client COMMAND ws_message_client_test)
 set_tests_properties(ws_message_client PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+# fetch_limit_test — the response size limit of HttpClient, CurlClient and
+# FetchClient against servers that never stop sending.
+add_executable(fetch_limit_test fetch_limit_test.cpp)
+target_link_libraries(fetch_limit_test PRIVATE apostol)
+target_compile_options(fetch_limit_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME fetch_limit COMMAND fetch_limit_test)
+set_tests_properties(fetch_limit PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)

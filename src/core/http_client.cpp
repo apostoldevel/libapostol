@@ -18,6 +18,8 @@ struct HttpClient::PendingRequest
     ResponseHandler     on_response;
     ErrorHandler        on_error;
     bool                done{false};
+    std::size_t         received{0};   // bytes of the response so far
+    std::size_t         max_received{0};   // 0 — no limit
 
     explicit PendingRequest(EventLoop& loop)
         : tcp(loop) {}
@@ -131,6 +133,7 @@ void HttpClient::request(std::string_view method, std::string_view url_str,
 
     ptr->on_response = std::move(on_response);
     ptr->on_error    = std::move(on_error);
+    ptr->max_received = max_response_size_;
 
     if (timeout_.count() > 0) {
         ptr->tcp.set_connect_timeout(timeout_);
@@ -168,9 +171,22 @@ void HttpClient::request(std::string_view method, std::string_view url_str,
         ptr->tcp.send(req_data);
     });
 
-    ptr->tcp.on_data([ptr](const char* data, size_t len) {
-        if (!ptr->done)
-            ptr->parser.feed(data, len);
+    ptr->tcp.on_data([ptr, this](const char* data, size_t len) {
+        if (ptr->done) return;
+        ptr->received += len;
+        if (ptr->max_received > 0 && ptr->received > ptr->max_received) {
+            // Settled first: close() reports on_close, which must find it done.
+            // The handler goes last, taken out of the request: it may destroy
+            // this client.
+            ptr->done = true;
+            ptr->tcp.close();
+            loop_.add_timer(std::chrono::milliseconds(0), [this] { cleanup_done(); }, false);
+            auto on_error = std::move(ptr->on_error);
+            if (on_error)
+                on_error(fmt::format("response larger than {} bytes", ptr->max_received));
+            return;
+        }
+        ptr->parser.feed(data, len);
     });
 
     ptr->tcp.on_error([ptr, this](std::string_view msg) {

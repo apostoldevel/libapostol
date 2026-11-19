@@ -63,6 +63,12 @@ public:
 
     void set_timeout(std::chrono::milliseconds ms) { timeout_ = ms; }
 
+    /// The most bytes one response may take on the wire (status line, headers
+    /// and body as sent); past it the request fails with "response larger
+    /// than <n> bytes" and the connection is closed. Zero lifts the limit.
+    static constexpr std::size_t kDefaultMaxResponseSize = 64 * 1024 * 1024;
+    void set_max_response_size(std::size_t bytes) noexcept { max_response_size_ = bytes; }
+
 #ifdef WITH_SSL
     void set_tls(bool enable = true, bool verify = true)
     {
@@ -88,6 +94,7 @@ private:
 
     EventLoop& loop_;
     std::chrono::milliseconds timeout_{30000};
+    std::size_t max_response_size_{kDefaultMaxResponseSize};
     std::vector<std::unique_ptr<PendingRequest>> pending_;
     std::vector<EventLoop::TimerId> refusal_timers_;  // refusals in flight: scheme, invalid URL
 

@@ -66,6 +66,10 @@ public:
 
     void set_timeout(long ms);
 
+    /// Limit on one response, passed to the backend in use (CurlClient or
+    /// HttpClient set_max_response_size); 64 MiB unless set, zero — none.
+    void set_max_response_size(std::size_t bytes);
+
 #ifdef WITH_CURL
     void set_proxy(std::string_view proxy);
 #endif

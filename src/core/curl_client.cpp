@@ -4,6 +4,8 @@
 #include "apostol/fetch_policy.hpp"
 
 #include <algorithm>
+
+#include <fmt/format.h>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -31,6 +33,8 @@ struct CurlClient::Transfer
     // reload mid-transfer does not change the rules under it; null when off.
     std::shared_ptr<const FetchAddressPolicy> policy;
     std::string  refused;       // why the filter refused a connection, if it did
+    std::size_t  max_body{0};   // set_max_response_size() at the start; 0 — none
+    bool         too_large{false};
 
     ~Transfer()
     {
@@ -145,6 +149,13 @@ void CurlClient::perform(std::string_view url,
     // Timeout
     if (timeout_ms_ > 0)
         curl_easy_setopt(xfer->easy, CURLOPT_TIMEOUT_MS, timeout_ms_);
+
+    // Response size: an announced length over the limit is refused before the
+    // body (MAXFILESIZE); what arrives is counted in write_callback.
+    xfer->max_body = max_response_size_;
+    if (max_response_size_ > 0)
+        curl_easy_setopt(xfer->easy, CURLOPT_MAXFILESIZE_LARGE,
+                         static_cast<curl_off_t>(max_response_size_));
 
     // Proxy
     if (!proxy_.empty()) {
@@ -375,6 +386,13 @@ size_t CurlClient::write_callback(char* ptr, size_t size, size_t nmemb, void* us
     auto* xfer = static_cast<Transfer*>(userdata);
     size_t total = size * nmemb;
 
+    // Over the limit: a short count makes libcurl end the transfer
+    // (CURLE_WRITE_ERROR), reported as too large in check_multi_info.
+    if (xfer->max_body > 0 && total > xfer->max_body - std::min(xfer->body.size(), xfer->max_body)) {
+        xfer->too_large = true;
+        return 0;
+    }
+
     if (xfer->on_write) {
         xfer->on_write(std::string_view(ptr, total));
     }
@@ -487,6 +505,9 @@ void CurlClient::check_multi_info()
             if (xfer->on_fail) {
                 if (code == CURLE_COULDNT_CONNECT && !xfer->refused.empty())
                     xfer->on_fail(static_cast<int>(code), xfer->refused);
+                else if (xfer->too_large || code == CURLE_FILESIZE_EXCEEDED)
+                    xfer->on_fail(static_cast<int>(code),
+                                  fmt::format("response larger than {} bytes", xfer->max_body));
                 else
                     xfer->on_fail(static_cast<int>(code), curl_easy_strerror(code));
             }

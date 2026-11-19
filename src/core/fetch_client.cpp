@@ -115,6 +115,17 @@ void FetchClient::set_timeout(long ms)
     http_->set_timeout(std::chrono::milliseconds(ms));
 }
 
+void FetchClient::set_max_response_size(std::size_t bytes)
+{
+#ifdef WITH_CURL
+    if (curl_) {
+        curl_->set_max_response_size(bytes);
+        return;
+    }
+#endif
+    http_->set_max_response_size(bytes);
+}
+
 // ─── set_proxy (curl only) ─────────────────────────────────────────────────
 
 #ifdef WITH_CURL

@@ -72,6 +72,12 @@ public:
               FailHandler on_fail);
 
     void set_timeout(long ms) noexcept { timeout_ms_ = ms; }
+
+    /// The largest response body a transfer keeps, after content decoding;
+    /// a larger one — announced or received — fails the transfer with
+    /// "response larger than <n> bytes". Zero lifts the limit.
+    static constexpr std::size_t kDefaultMaxResponseSize = 64 * 1024 * 1024;
+    void set_max_response_size(std::size_t bytes) noexcept { max_response_size_ = bytes; }
     void set_proxy(std::string_view proxy) { proxy_ = std::string(proxy); }
 
 private:
@@ -96,6 +102,7 @@ private:
     CURLM*      multi_{nullptr};
     EventLoop::TimerId timer_id_{EventLoop::kInvalidTimer};
     long        timeout_ms_{0};
+    std::size_t max_response_size_{kDefaultMaxResponseSize};
     std::string proxy_;
 
     // Track registered socket fds so we can clean up properly
