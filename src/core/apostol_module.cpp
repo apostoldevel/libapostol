@@ -8,7 +8,6 @@
 
 #include <cstdio>
 #include <fmt/format.h>
-#include <fstream>
 #include <nlohmann/json.hpp>
 #include <unordered_map>
 
@@ -70,7 +69,8 @@ static void debug_request(const HttpRequest& req)
 /// Mirrors v1 DebugReply(): dump [ip:port] [fd] + status-line, headers, body.
 static void debug_response(const HttpRequest& req, const HttpResponse& resp)
 {
-    std::string s = resp.serialize();
+    // A file body (set_file()) is not read for the dump: the header block only.
+    std::string s = resp.file_body() ? resp.serialize_head() : resp.serialize();
 
     // Mask header values and the body as debug_request() does: the head is
     // rebuilt line by line, the body follows the first empty line.
@@ -354,18 +354,12 @@ bool ApostolModule::match_path(std::string_view path,
 bool ApostolModule::serve_file(const std::filesystem::path& path,
                                 HttpResponse& resp, bool head_only)
 {
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(path, ec) || ec)
+    // The file is opened here and sent from the file by the connection
+    // (sendfile) — never read whole into memory, whatever its size.
+    if (!resp.set_file(path.string(), std::string(mime_type(path.extension().string()))))
         return false;
 
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open())
-        return false;
-
-    std::string content((std::istreambuf_iterator<char>(f)), {});
-    const auto  mime = std::string(mime_type(path.extension().string()));
-
-    resp.set_status(HttpStatus::ok).set_body(std::move(content), mime);
+    resp.set_status(HttpStatus::ok);
     if (head_only)
         resp.suppress_body();
 

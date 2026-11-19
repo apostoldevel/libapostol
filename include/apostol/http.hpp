@@ -153,6 +153,27 @@ public:
 
     HttpResponse& set_body(std::string body, std::string content_type = "text/plain");
 
+    /// An open regular file as the body (set_file()); closed with the last
+    /// copy of the response that holds it.
+    struct FileBody
+    {
+        int         fd{-1};
+        std::size_t size{0};   // Content-Length: the size when it was opened
+        FileBody(int f, std::size_t s) noexcept : fd(f), size(s) {}
+        ~FileBody();
+        FileBody(const FileBody&)            = delete;
+        FileBody& operator=(const FileBody&) = delete;
+    };
+
+    /// The body is the regular file at `path`: HttpConnection sends it from
+    /// the file as the socket takes it (sendfile), never whole in memory.
+    /// Content-Length is its size now. False — not a regular file that can be
+    /// opened for reading — leaves the response unchanged. set_body() and
+    /// clear() drop the file.
+    bool set_file(const std::string& path, std::string content_type);
+    const std::shared_ptr<const FileBody>& file_body() const noexcept { return file_; }
+    bool body_suppressed() const noexcept { return suppress_body_; }
+
     /// For HEAD responses: body_ drives Content-Length but is not sent.
     HttpResponse& suppress_body() noexcept { suppress_body_ = true; return *this; }
 
@@ -178,8 +199,13 @@ public:
     HttpResponse& clear();
 
     /// Serialize to a complete HTTP/1.1 response string, including
-    /// auto-computed Content-Length.
+    /// auto-computed Content-Length. A file body (set_file()) is read into it:
+    /// HttpConnection sends serialize_head() and the file instead.
     std::string serialize() const;
+
+    /// The status line and the header block, up to and including the blank
+    /// line, with Content-Length as serialize() writes it; no body.
+    std::string serialize_head() const;
 
 private:
     int         status_code_{200};
@@ -187,6 +213,7 @@ private:
     std::vector<std::pair<std::string, std::string>> headers_;
     std::vector<std::string> carried_;   // names, set_carried_header()
     std::string body_;
+    std::shared_ptr<const FileBody> file_;   // set_file(): the body is this file
     bool        suppress_body_{false};
     bool        deferred_{false};
 };
@@ -515,6 +542,9 @@ private:
 
     bool drain_buffer();
     bool drain_file();
+    // The body file after its header block: queued for sendfile, or — behind
+    // a file already in flight — read into the write buffer. Takes `fd`.
+    void attach_file(int fd, std::size_t size);
     void update_interest();
 };
 

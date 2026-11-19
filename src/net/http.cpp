@@ -373,8 +373,31 @@ std::vector<std::pair<std::string, std::string>> HttpResponse::carried_headers()
 HttpResponse& HttpResponse::set_body(std::string body, std::string content_type)
 {
     body_ = std::move(body);
+    file_.reset();
     set_header("Content-Type", std::move(content_type));
     return *this;
+}
+
+HttpResponse::FileBody::~FileBody()
+{
+    if (fd >= 0)
+        ::close(fd);
+}
+
+bool HttpResponse::set_file(const std::string& path, std::string content_type)
+{
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    struct stat st;
+    if (::fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        ::close(fd);
+        return false;
+    }
+    file_ = std::make_shared<const FileBody>(fd, static_cast<std::size_t>(st.st_size));
+    body_.clear();
+    set_header("Content-Type", std::move(content_type));
+    return true;
 }
 
 HttpResponse& HttpResponse::set_close(bool close)
@@ -418,6 +441,7 @@ HttpResponse& HttpResponse::clear()
     headers_.clear();
     carried_.clear();
     body_.clear();
+    file_.reset();
     suppress_body_ = false;
     deferred_      = false;
     return *this;
@@ -425,8 +449,36 @@ HttpResponse& HttpResponse::clear()
 
 std::string HttpResponse::serialize() const
 {
+    auto out = serialize_head();
+    if (suppress_body_)
+        return out;
+    if (!file_) {
+        out += body_;
+        return out;
+    }
+    // A file body read here, for a caller that wants the whole response as a
+    // string; HttpConnection sends the file from the file instead.
+    const auto head = out.size();
+    out.resize(head + file_->size);
+    std::size_t got = 0;
+    while (got < file_->size) {
+        ssize_t n = ::pread(file_->fd, out.data() + head + got, file_->size - got,
+                            static_cast<off_t>(got));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        got += static_cast<std::size_t>(n);
+    }
+    out.resize(head + got);
+    return out;
+}
+
+std::string HttpResponse::serialize_head() const
+{
+    const std::size_t body_size = file_ ? file_->size : body_.size();
     std::string out;
-    out.reserve(256 + body_.size());
+    out.reserve(256);
 
     out += fmt::format("HTTP/1.1 {} {}\r\n", status_code_, status_text_);
 
@@ -446,12 +498,9 @@ std::string HttpResponse::serialize() const
                 break;
             }
     if (!has_content_length)
-        out += fmt::format("Content-Length: {}\r\n", body_.size());
+        out += fmt::format("Content-Length: {}\r\n", body_size);
 
     out += "\r\n";
-    if (!suppress_body_)
-        out += body_;
-
     return out;
 }
 
@@ -1241,14 +1290,33 @@ void HttpConnection::send_response(const HttpResponse& resp)
         }
         if (add_close)
             last.set_close(true);
-        data = last.serialize();
+        data = resp.file_body() ? last.serialize_head() : last.serialize();
     } else {
-        data = resp.serialize();
+        data = resp.file_body() ? resp.serialize_head() : resp.serialize();
+    }
+
+    // A file body goes out from the file after the header block (not for HEAD).
+    // Its own descriptor: the response's one closes with the response.
+    int file_fd = -1;
+    std::size_t file_size = 0;
+    if (const auto& file = resp.file_body(); file && !resp.body_suppressed()) {
+        file_fd = ::fcntl(file->fd, F_DUPFD_CLOEXEC, 0);
+        file_size = file->size;
+        if (file_fd < 0) {
+            // The header block would promise a body that cannot be sent.
+            HttpResponse r;
+            r.set_status(HttpStatus::internal_server_error).set_body("file not readable");
+            r.set_close(true);
+            data = r.serialize();
+            close_after_send_ = true;
+        }
     }
 
     // If there are already pending writes, just append
     if (write_pos_ < write_buf_.size() || file_fd_ >= 0) {
         write_buf_.append(data);
+        if (file_fd >= 0)
+            attach_file(file_fd, file_size);
         if (buffered_bytes() > kWriteHighWater)
             throttled_ = true;   // bound memory of a non-reading client
         after_response();
@@ -1263,6 +1331,8 @@ void HttpConnection::send_response(const HttpResponse& resp)
         if (n == -2) {
             // Fatal error (EPIPE / ECONNRESET / EBADF) — peer or socket
             // is gone. Mark closed and bail; retrying spins forever.
+            if (file_fd >= 0)
+                ::close(file_fd);
             closed_ = true;
             if (loop_)
                 loop_->remove_io(conn_.fd());
@@ -1273,6 +1343,8 @@ void HttpConnection::send_response(const HttpResponse& resp)
             if (loop_) {
                 write_buf_.assign(ptr, rem);
                 write_pos_ = 0;
+                if (file_fd >= 0)
+                    attach_file(file_fd, file_size);
                 if (buffered_bytes() > kWriteHighWater)
                     throttled_ = true;
                 after_response();
@@ -1286,7 +1358,48 @@ void HttpConnection::send_response(const HttpResponse& resp)
         rem -= static_cast<std::size_t>(n);
     }
 
+    if (file_fd >= 0) {
+        if (rem > 0) {
+            ::close(file_fd);   // the header block did not go out (write() gave 0)
+        } else {
+            // Header block out: the file now — whole, or the rest on EPOLLOUT,
+            // or, on a failed sendfile, closed (drain_file).
+            attach_file(file_fd, file_size);
+            drain_file();
+        }
+    }
+
     after_response();
+}
+
+void HttpConnection::attach_file(int fd, std::size_t size)
+{
+    if (file_fd_ < 0) {
+        file_fd_ = fd;
+        file_offset_ = 0;
+        file_remaining_ = size;
+        return;
+    }
+    // Can't queue two files — the second is read into the write buffer (rare
+    // edge case). A file that ends before `size` (cut meanwhile) leaves the
+    // body short of its Content-Length: what was read goes out and the
+    // connection closes after it, so that the client sees the answer cut, not
+    // the next one as the rest of its body.
+    std::string buf(size, '\0');
+    std::size_t got = 0;
+    while (got < size) {
+        ssize_t n = ::read(fd, buf.data() + got, size - got);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        got += static_cast<std::size_t>(n);
+    }
+    ::close(fd);
+    buf.resize(got);
+    if (got < size)
+        close_after_send_ = true;
+    write_buf_.append(buf);
 }
 
 void HttpConnection::send_file(const std::string& path, std::string_view mime_type)
@@ -1340,38 +1453,9 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
     // If there are already pending writes, append headers and queue file
     if (write_pos_ < write_buf_.size() || file_fd_ >= 0) {
         write_buf_.append(headers);
+        attach_file(fd, file_size);
         if (buffered_bytes() > kWriteHighWater)
-            throttled_ = true;   // headers behind a held tail count too
-        // Can't queue two files — fallback to buffered read
-        if (file_fd_ >= 0) {
-            // Read entire file into write buffer (rare edge case). A file
-            // that ends before the size fstat() gave (cut meanwhile) leaves
-            // the body short of its Content-Length: what was read goes out
-            // and the connection closes after it, so that the client sees
-            // the answer cut, not the next one as the rest of its body.
-            std::string buf(file_size, '\0');
-            std::size_t got = 0;
-            while (got < file_size) {
-                ssize_t n = ::read(fd, buf.data() + got, file_size - got);
-                if (n < 0 && errno == EINTR)
-                    continue;
-                if (n <= 0)
-                    break;
-                got += static_cast<std::size_t>(n);
-            }
-            ::close(fd);
-            buf.resize(got);
-            if (got < file_size)
-                close_after_send_ = true;
-            write_buf_.append(buf);
-            if (buffered_bytes() > kWriteHighWater)
-                throttled_ = true;
-            after_response();
-            return;
-        }
-        file_fd_ = fd;
-        file_offset_ = 0;
-        file_remaining_ = file_size;
+            throttled_ = true;   // headers (and a buffered file) behind a held tail count too
         after_response();
         return;
     }
@@ -1394,9 +1478,7 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
             // EAGAIN — buffer headers + queue file
             write_buf_.assign(ptr, rem);
             write_pos_ = 0;
-            file_fd_ = fd;
-            file_offset_ = 0;
-            file_remaining_ = file_size;
+            attach_file(fd, file_size);
             after_response();
             return;
         }
@@ -1406,9 +1488,7 @@ void HttpConnection::send_file(const std::string& path, std::string_view mime_ty
     }
 
     // Headers sent — now sendfile
-    file_fd_ = fd;
-    file_offset_ = 0;
-    file_remaining_ = file_size;
+    attach_file(fd, file_size);
 
     // Fully sent, or partial with EPOLLOUT for the remainder — or, on a
     // failed sendfile, closed (drain_file).

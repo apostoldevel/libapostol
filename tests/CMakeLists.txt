@@ -120,6 +120,13 @@ target_link_libraries(http_send_file_test PRIVATE apostol)
 target_compile_options(http_send_file_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME http_send_file COMMAND http_send_file_test)
 
+# http_serve_file_test — try_files() answers with the file as the body and the
+# connection sends it from the file: memory, the bytes on the wire, HEAD.
+add_executable(http_serve_file_test http_serve_file_test.cpp)
+target_link_libraries(http_serve_file_test PRIVATE apostol)
+target_compile_options(http_serve_file_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME http_serve_file COMMAND http_serve_file_test)
+
 # debug_mask_test — masking of the _DEBUG request/response dump, in this
 # process: what is not recognised is not written; credentials masked by name.
 add_executable(debug_mask_test debug_mask_test.cpp)

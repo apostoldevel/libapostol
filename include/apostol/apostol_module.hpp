@@ -176,9 +176,10 @@ protected:
 
     // ── File serving ──────────────────────────────────────────────────────────
 
-    /// Open @p path, write its contents to @p resp (200 OK + MIME type).
-    /// If head_only is true the body is suppressed (Content-Length still set).
-    /// Returns false if the file cannot be opened.
+    /// Open @p path as the body of @p resp (200 OK + MIME type): the
+    /// connection sends it from the file (HttpResponse::set_file()), not from
+    /// memory. If head_only is true the body is suppressed (Content-Length
+    /// still set). Returns false if it is not a regular file that can be opened.
     bool serve_file(const std::filesystem::path& path,
                     HttpResponse& resp, bool head_only);
 
