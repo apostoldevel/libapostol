@@ -365,7 +365,7 @@ void WsConnection::arm_write_interest()
     // NOTE: EPOLLIN|EPOLLOUT overrides the fd's full event mask. If a caller
     // later registers the WS fd with additional flags (e.g. EPOLLRDHUP for
     // peer half-close detection), this modify_io will drop them. Revisit
-    // this assumption if the WebSocketAPI handler widens its mask.
+    // this assumption if a WebSocket handler widens its mask.
     if (loop_ && !closed_ && conn_.fd() >= 0 &&
         !loop_->modify_io(conn_.fd(), EPOLLIN | EPOLLOUT))
         lost_watch();

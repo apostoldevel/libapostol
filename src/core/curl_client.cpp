@@ -310,7 +310,7 @@ int CurlClient::socket_callback(CURL* /*easy*/, curl_socket_t s, int what,
                 // Do NOT cancel the multi timer here from `still_running`. That count
                 // was read by curl_multi_socket_action ABOVE, before check_multi_info()
                 // ran the completion callbacks — and a completion callback may start a
-                // new request. AuthServer does exactly that: the token-exchange reply
+                // new request. An OAuth 2.0 login does exactly that: the token-exchange reply
                 // issues the userinfo fetch from inside its own on_done, on this same
                 // client. That new easy handle makes curl schedule a fresh kick-off
                 // timer via timer_callback, but `still_running` still reads 0 from
@@ -362,7 +362,7 @@ int CurlClient::timer_callback(CURLM* /*multi*/, long timeout_ms, void* clientp)
         [self]() {
             // Order is load-bearing: clear timer_id_ HERE, before the calls below —
             // never after them. check_multi_info() runs completion callbacks, and a
-            // callback may start a new request (AuthServer's nested userinfo fetch),
+            // callback may start a new request (a nested userinfo fetch),
             // which schedules a fresh timer via timer_callback and stores its new
             // timer_id_. Clearing to kInvalidTimer after these calls would clobber that
             // id: the new timer would stay armed while we believe we hold none, and

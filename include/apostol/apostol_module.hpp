@@ -51,7 +51,7 @@ public:
     bool execute(const HttpRequest& req, HttpResponse& resp) override;
 
     /// Return true if this module should handle @p req.
-    /// Default: true (handle all requests, like WebServer).
+    /// Default: true (handle all requests, like a catch-all static file server).
     /// Override to filter by path (e.g. starts_with("/oauth2/")).
     virtual bool check_location(const HttpRequest& req) const;
 

@@ -227,7 +227,7 @@ public:
     /// once, and what it owed is lost.
     /// Earlier it was on_stop() first and one drain after it, and the drain
     /// handed results of earlier queries to modules already torn down: a
-    /// TaskScheduler job answering after SIGTERM reached a released BotSession
+    /// job result arriving after SIGTERM reached a module's released BotSession
     /// through a null pointer (SIGSEGV, fault 0xb0).
     void stop_work(EventLoop& loop,
                    const std::function<bool()>& busy,

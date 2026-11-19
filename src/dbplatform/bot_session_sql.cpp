@@ -298,7 +298,7 @@ void BotSession::execute_action(std::string_view session,
     //
     // With one shared text ("not authenticated") a line such as
     //
-    //   TaskScheduler: action 'cancel' failed for <uuid>: BotSession: not authenticated
+    //   <module>: action 'cancel' failed for <uuid>: BotSession: not authenticated
     //
     // points at OAuth2 and the apibot account even when the bot holds a session
     // and the caller handed over an empty one, for an object it no longer tracks.
@@ -306,7 +306,7 @@ void BotSession::execute_action(std::string_view session,
     //
     // That combination (a valid bot session, an empty one passed in) is only one
     // way to get here. Some callers keep no valid() gate of
-    // their own (MessageServer::do_send, ReportServer::do_complete and do_abort), and
+    // their own (a send, a completion or an abort of an object action), and
     // a gate that is kept may have been passed before an asynchronous callback rather
     // than inside one, in which case it is stale by the time the call lands. The first
     // branch below is genuinely reachable — a session does expire — so its text has to

@@ -20,7 +20,7 @@ using PgResultHandler = std::function<void(
 /// Deferred PG dispatch: marks response as deferred, captures connection_ctx,
 /// executes @p sql on @p pool. On PG exception, sends 500 JSON error via conn.
 ///
-/// Eliminates the duplicated on_exception lambda pattern across PGHTTP/FileServer.
+/// One on_exception lambda for every module that answers HTTP from a query.
 ///
 /// A statement containing a NUL byte is not sent: the response is set to 400
 /// at once (not deferred) and @p on_result is never called. libpq would cut

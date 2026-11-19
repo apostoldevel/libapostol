@@ -96,7 +96,7 @@ std::string sign_claims_jwt(const OAuthApp& app,
                             int expires_in_secs = 300);
 
 /// Compute HMAC-SHA256 and return the result as a lowercase hex string.
-/// Uses OpenSSL HMAC(). Used by WebSocketAPI for signed_fetch.
+/// Uses OpenSSL HMAC(); for signing a request body.
 std::string hmac_sha256_hex(std::string_view key, std::string_view data);
 
 } // namespace apostol

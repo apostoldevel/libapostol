@@ -35,8 +35,8 @@ namespace
 //     CONTEXT:  SQL statement "SELECT 1/0"
 //     PL/pgSQL function inline_code_block line 1 at PERFORM
 //
-// and this text does not only go to a log. TaskScheduler, ReportServer and
-// MessageServer pass it to api.set_object_label as the object's label, where a
+// and this text does not only go to a log. A background process may pass it
+// to the database as an object's label, where a
 // three-line value is read back by people and by screens that expect one line.
 std::string result_error_text(const PgResult& r)
 {
@@ -187,8 +187,8 @@ void PgResult::withhold_statement()
     // From the context, the lines that locate the failure in PL/pgSQL —
     // "PL/pgSQL function kernel.x(text) line 12 at SQL statement" — and only
     // those without quotes: the other context lines ("SQL statement \"…\"")
-    // are statement text. A scheduled job's label, which is where this text
-    // ends up (TaskScheduler), is useless without them.
+    // are statement text. An object's label, which is where this text may
+    // end up, is useless without them.
     if (const char* context = PQresultErrorField(res_.get(), PG_DIAG_CONTEXT)) {
         std::string_view rest(context);
         while (!rest.empty()) {
@@ -1125,7 +1125,7 @@ void PgPool::on_io(PgConnection& conn, uint32_t events)
             // A quiet statement carries credentials in its literals, and libpq
             // quotes the statement back in its error text. Reduce that text
             // before anyone sees it: the log line below, the query's exception
-            // handler (which modules log, and AuthServer answers a client with)
+            // handler (which modules log, and may answer a client with)
             // and a caller reading error_message() itself.
             const bool quiet = conn.current_query() && conn.current_query()->quiet();
             if (quiet) {
@@ -3629,9 +3629,9 @@ void PgPool::restart_listener(std::string_view reason)
     }
 
     // Re-arm from the REGISTRY, never from a literal list of channels.
-    // WebSocketAPI subscribes to channels it reads from the database at
-    // runtime (daemon.publisher_list()); enumerating channels statically here
-    // would silently drop every one of them and take the whole dashboard
+    // A module may subscribe to channels it reads from the database at
+    // runtime; enumerating channels statically here
+    // would silently drop every one of them and take the whole
     // publication with it, while a test on the compiled-in channels still
     // passed.
     for (const auto& [ch, _] : notify_handlers_)
@@ -3672,7 +3672,7 @@ void PgPool::send_pending_listens()
         pending_listens_.clear();
     }
 
-    // Quoted as an identifier: a channel name is data — WebSocketAPI reads
+    // Quoted as an identifier: a channel name is data — a module may read
     // them from the database — and a bare `"` in one made the whole batch a
     // syntax error, taking every other channel in it down too.
     std::string sql;

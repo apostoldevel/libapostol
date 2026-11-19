@@ -1101,7 +1101,7 @@ void Application::master_run()
 void Application::drain_db(EventLoop& loop)
 {
     // Every pool, not just the default one: a module may have been handed a named
-    // pool (FileServer runs on "helper"), and its session closes through that.
+    // pool (a worker module may run on "helper"), and its session closes through that.
     auto outstanding = [this] {
         std::size_t n = db_pool_ ? db_pool_->outstanding() : 0;
         for (const auto& [name, pool] : named_pools_)
@@ -1159,7 +1159,7 @@ void Application::detach_db() noexcept
 // the finish an HTTP request in flight at SIGTERM would lose its answer to the
 // detach, and without the detach a query outlasting the finish would still reach
 // the module after on_stop(). Notifications are muted before the finish,
-// not at the detach: each one starts new work (WebSocketAPI answers a NOTIFY with a
+// not at the detach: each one starts new work (a module may answer a NOTIFY with a
 // query per session), and a wait that keeps being fed never reaches zero. For the
 // same reason the listening socket leaves the loop and keep-alive ends first
 // (stop_http_server): the finish waits for the connections already open, and only
@@ -1743,8 +1743,8 @@ void Application::custom_process_run(CustomProcess& proc)
         // 7b. PgPool heartbeat — every 60 seconds, mirroring worker_run() and
         // helper_run(). A custom process is its own OS process with its own pool
         // and its own LISTEN connection, and this timer was simply absent here:
-        // nothing in the process ever checked connection health. MessageServer
-        // ("outbox") and ReportServer ("report") therefore had no way at all to
+        // nothing in the process ever checked connection health. A process
+        // listening on a channel therefore had no way at all to
         // notice a lost subscription — the recovery path in PgPool existed but
         // had nothing to drive it. Cancelled next to the one above, and for the
         // same reason: the shutdown drains re-run the loop.

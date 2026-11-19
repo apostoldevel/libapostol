@@ -82,7 +82,7 @@ private:
 // other reference to that schema in the library.
 //
 // Usage:
-//   BotSession bot(pool, "FileServer/1.0", "localhost");
+//   BotSession bot(pool, "MyModule/1.0", "localhost");
 //   bot.set_credentials("client-id", "client-secret");
 //   // In heartbeat:
 //   bot.refresh_if_needed();

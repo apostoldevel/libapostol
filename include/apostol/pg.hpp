@@ -823,8 +823,8 @@ public:
     ///
     /// For shutdown, between the drain of work in flight and on_stop(): a module
     /// tears down in on_stop() what its callbacks use, and a result that arrived
-    /// after that would be handed to the remains (TaskScheduler released its
-    /// BotSession in on_stop(), the drain delivered a late job result into it, and
+    /// after that would be handed to the remains (a module released its
+    /// BotSession in on_stop(), the drain delivered a late query result into it, and
     /// the process died on a null pointer). The handlers themselves are kept, not
     /// destroyed: what they captured goes with the pool, as it did before.
     void detach() noexcept;
@@ -1158,9 +1158,9 @@ private:
 
     /// Drop a dead listener and start a fresh one, re-arming every channel
     /// from notify_handlers_. Re-arming reads the REGISTRY, never a literal
-    /// list of channels: WebSocketAPI subscribes to channels read from the
+    /// list of channels: a module may subscribe to channels read from the
     /// database at runtime, so anything enumerating channels statically would
-    /// silently drop all of them and take the whole dashboard publication
+    /// silently drop all of them and take the whole publication
     /// with it. `reason` is logged.
     void restart_listener(std::string_view reason);
 
