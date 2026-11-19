@@ -159,6 +159,10 @@ void test_form()
     expect_withheld("control byte", mask_form(std::string("a=zz9\x01")), "zz9");
     expect_withheld("non-ASCII", mask_form("a=zz9\xd0\xb9"), "zz9");
     expect_withheld("empty name", mask_form("=zz9"), "zz9");
+    expect_withheld("multipart",
+                    mask_body("--b\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\n"
+                              "zz9\r\n--b--\r\n"),
+                    "zz9");
 }
 
 // ── 4. Names ─────────────────────────────────────────────────────────────────
@@ -181,6 +185,9 @@ void test_names()
                                "mfa_code", "pin_code", "device_code", "oob_code",
                                "client_assertion", "access_key", "accessKey", "license_key",
                                "encryption_key", "X-Authorization", "X-Auth", "Auth"})
+        check(secret_name(n), "secret_name(\"" + std::string(n) + "\") = false");
+
+    for (std::string_view n : {"pw", "PW", "psw", "user_psw", "new_pw", "sig", "x-sig", "hmac_sig"})
         check(secret_name(n), "secret_name(\"" + std::string(n) + "\") = false");
 
     for (std::string_view n : {"token_type", "token_type_hint", "username", "scope", "state",
@@ -237,6 +244,40 @@ void test_headers()
 
     const auto broken = mask_header("Referer", "https://h/cb?note=a b&password=zz9");
     check(broken.find("zz9") == std::string::npos, "Referer with a blank: \"" + shown(broken) + "\"");
+
+    // A relative URL: "://" further on, in the query or the fragment, is not a scheme.
+    expect_eq("relative Location, URL in the query",
+              mask_header("Location", "/cb?code=zz9&next=http://example.test/x"),
+              "/cb?code=<masked>&next=http://example.test/x");
+    expect_eq("relative Referer, URL in the fragment",
+              mask_header("Referer", "/cb#access_token=zz9&r=https://example.test/"),
+              "/cb#access_token=<masked>&r=https://example.test/");
+    expect_eq("relative Location, no path",
+              mask_header("Location", "?code=zz9&next=https://example.test"),
+              "?code=<masked>&next=https://example.test");
+    expect_eq("network-path Location", mask_header("Location", "//u:zz9@h/cb?code=zz9"),
+              "//<masked>@h/cb?code=<masked>");
+    expect_eq("scheme other than http", mask_header("Location", "myapp://cb?code=zz9"),
+              "myapp://cb?code=<masked>");
+    expect_eq("not a scheme before \"://\"", mask_header("Location", "a b://h?code=zz9"),
+              "a b://h?code=<masked>");
+
+    // The plain list names headers; a name that only begins like one is masked.
+    for (std::string_view h : {"Accept-Token", "Content-Signature", "If-Token", "Content-Key",
+                               "Accept-Session", "Content-Auth", "If-Secret",
+                               "Access-Control-Token", "Sec-Fetch-Token", "Sec-Ch-Session"})
+        expect_eq(std::string("prefix-only header ") + std::string(h), mask_header(h, "zz9"), masked);
+    for (std::string_view h : {"Accept", "Accept-Encoding", "Accept-Language", "Accept-Ranges",
+                               "Content-Length", "Content-Encoding", "Content-Disposition",
+                               "If-None-Match", "If-Modified-Since", "Sec-Fetch-Mode",
+                               "Sec-Ch-Ua-Platform", "Access-Control-Allow-Origin",
+                               "WWW-Authenticate", "Sec-WebSocket-Key"})
+        expect_eq(std::string("plain header ") + std::string(h), mask_header(h, "v1"), "v1");
+
+    expect_eq("form pw and sig", mask_form("user=u&pw=zz9&psw=zz9&sig=zz9"),
+              "user=u&pw=<masked>&psw=<masked>&sig=<masked>");
+    expect_eq("JSON pw", mask_body(R"({"pw":"zz9","sig":"zz9"})"),
+              R"({"pw":"<masked>","sig":"<masked>"})");
 }
 
 } // namespace

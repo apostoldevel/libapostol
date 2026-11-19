@@ -137,14 +137,28 @@ bool is_uuid(std::string_view s)
     return true;
 }
 
-/// Headers written as they are; every other header value is masked.
+/// Headers written as they are; every other header value is masked. Names are
+/// listed; the browser-set families (fetch metadata, client hints) are matched
+/// by their prefix unless the name reads as a credential.
 bool plain_header(std::string_view n)
 {
-    if (n.rfind("accept", 0) == 0 || n.rfind("access-control-", 0) == 0
-        || n.rfind("if-", 0) == 0 || n.rfind("sec-fetch-", 0) == 0 || n.rfind("sec-ch-", 0) == 0
-        || n.rfind("content-", 0) == 0)
-        return n != "content-location";
-    for (std::string_view h : {"host", "user-agent", "connection", "upgrade", "keep-alive",
+    for (std::string_view prefix : {"sec-fetch-", "sec-ch-"})
+        if (n.rfind(prefix, 0) == 0)
+            return !secret_name(n);
+    for (std::string_view h : {"access-control-allow-origin", "access-control-allow-credentials",
+                               "access-control-allow-methods", "access-control-allow-headers",
+                               "access-control-expose-headers", "access-control-max-age",
+                               "access-control-request-method", "access-control-request-headers",
+                               "access-control-allow-private-network",
+                               "access-control-request-private-network",
+                               "accept", "accept-charset", "accept-encoding", "accept-language",
+                               "accept-ranges", "accept-patch", "accept-post",
+                               "content-type", "content-length", "content-encoding",
+                               "content-language", "content-range", "content-disposition",
+                               "content-security-policy", "content-security-policy-report-only",
+                               "if-match", "if-none-match", "if-modified-since",
+                               "if-unmodified-since", "if-range",
+                               "host", "user-agent", "connection", "upgrade", "keep-alive",
                                "cache-control", "pragma", "date", "server", "vary", "etag",
                                "last-modified", "expires", "age", "allow", "origin", "range",
                                "transfer-encoding", "te", "trailer", "via", "dnt",
@@ -161,15 +175,33 @@ bool plain_header(std::string_view n)
     return false;
 }
 
+/// The length of the "scheme://" or "//" that starts @p s, 0 when @p s is a
+/// relative reference without an authority (RFC 3986, 3.1 and 4.2).
+std::size_t authority_start(std::string_view s)
+{
+    if (s.rfind("//", 0) == 0)
+        return 2;
+    if (s.empty() || !is_alpha(static_cast<unsigned char>(s.front())))
+        return 0;
+    std::size_t i = 1;
+    while (i < s.size()) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        if (!is_alnum(c) && c != '+' && c != '-' && c != '.')
+            break;
+        ++i;
+    }
+    return s.substr(i).rfind("://", 0) == 0 ? i + 3 : 0;
+}
+
 /// A URL: userinfo masked, the path through mask_path, the query and the
 /// fragment through mask_form.
 std::string mask_url(std::string_view value)
 {
     std::string out;
     std::string_view rest = value;
-    if (const auto scheme = rest.find("://"); scheme != std::string_view::npos) {
-        out.append(rest.substr(0, scheme + 3));
-        rest.remove_prefix(scheme + 3);
+    if (const auto start = authority_start(rest); start != 0) {
+        out.append(rest.substr(0, start));
+        rest.remove_prefix(start);
         const auto end = rest.find_first_of("/?#");
         auto authority = rest.substr(0, end);
         if (const auto at = authority.rfind('@'); at != std::string_view::npos) {
@@ -212,8 +244,9 @@ bool secret_name(std::string_view name)
         if (n.find(part) != std::string::npos)
             return true;
 
-    // Endings: access_key, licenseKey, ticket, sid, PIN codes.
-    for (std::string_view tail : {"key", "ticket", "sid", "pin", "pwd", "hash"})
+    // Endings: access_key, licenseKey, ticket, sid, PIN codes, short forms of
+    // password and signature (pw, psw, sig).
+    for (std::string_view tail : {"key", "ticket", "sid", "pin", "pwd", "pw", "psw", "sig", "hash"})
         if (ends_with(n, tail))
             return true;
 
