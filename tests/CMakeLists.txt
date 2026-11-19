@@ -221,3 +221,18 @@ target_link_libraries(http_proxy_test PRIVATE apostol)
 target_compile_options(http_proxy_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME http_proxy COMMAND http_proxy_test)
 set_tests_properties(http_proxy PROPERTIES TIMEOUT 30)
+
+# smtp_client_test — SmtpClient against a relay that does STARTTLS: envelope
+# addresses, data after the 220, an endless reply line, two sends in a row.
+add_executable(smtp_client_test smtp_client_test.cpp)
+target_link_libraries(smtp_client_test PRIVATE apostol)
+target_compile_options(smtp_client_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME smtp_client COMMAND smtp_client_test)
+set_tests_properties(smtp_client PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+# base64_test — base64_decode(): padding optional, data after it or a third
+# '=' refused; round trip of every length to 255.
+add_executable(base64_test base64_test.cpp)
+target_link_libraries(base64_test PRIVATE apostol)
+target_compile_options(base64_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME base64 COMMAND base64_test)

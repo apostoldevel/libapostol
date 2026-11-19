@@ -1,11 +1,32 @@
 #ifdef WITH_SSL
 
 #include "apostol/smtp_client.hpp"
+#include "apostol/base64.hpp"
 
 #include <fmt/format.h>
 
 namespace apostol
 {
+
+namespace
+{
+
+// RFC 5321 4.5.3.1.5: a reply line is at most 512 octets with its CRLF. A
+// line still open past a few times that is no SMTP reply.
+constexpr std::size_t kMaxReplyLine = 4096;
+
+// An envelope address goes into a command line between angle brackets: a
+// control byte (CR, LF among them), a space or a bracket would end the
+// address — and, with CRLF, the command — where the caller did not mean it.
+bool envelope_address_ok(std::string_view address)
+{
+    for (unsigned char c : address)
+        if (c < 0x21 || c == 0x7F || c == '<' || c == '>')
+            return false;
+    return true;
+}
+
+} // namespace
 
 // ─── Constructor / Destructor ────────────────────────────────────────────────
 
@@ -30,10 +51,40 @@ void SmtpClient::send_mail()
     if (active_ || messages_.empty())
         return;
 
+    // Every envelope is checked before anything is dialled. A refused message
+    // sends nothing and leaves the queue; the others go out. Its on_error runs
+    // last, after this client is done with itself: the handler may destroy it.
+    std::vector<std::pair<SmtpMessage, std::string>> refused;
+    for (auto it = messages_.begin(); it != messages_.end();) {
+        std::string why;
+        if (!envelope_address_ok(it->from))
+            why = "invalid envelope sender";
+        else if (it->to.empty())
+            why = "no envelope recipient";
+        else
+            for (const auto& to : it->to)
+                if (!envelope_address_ok(to)) { why = "invalid envelope recipient"; break; }
+
+        if (why.empty()) { ++it; continue; }
+        refused.emplace_back(std::move(*it), std::move(why));
+        it = messages_.erase(it);
+    }
+
+    if (!messages_.empty())
+        start_session();
+
+    for (auto& [msg, why] : refused)
+        if (msg.on_error)
+            msg.on_error(msg, why);
+}
+
+void SmtpClient::start_session()
+{
     active_ = true;
     current_msg_ = 0;
     current_rcpt_ = 0;
     state_ = State::Connecting;
+    reply_buf_.clear();   // nothing of an earlier session is read as a reply
 
     // Port 465 = implicit TLS; others = STARTTLS
     if (config_.port == 465)
@@ -75,8 +126,11 @@ void SmtpClient::process_reply()
     // Multi-line replies have "code-text\r\n" continuations.
     for (;;) {
         auto crlf = reply_buf_.find("\r\n");
-        if (crlf == std::string::npos)
+        if (crlf == std::string::npos) {
+            if (reply_buf_.size() > kMaxReplyLine)
+                enter_error(fmt::format("SMTP reply line longer than {} bytes", kMaxReplyLine));
             return;  // incomplete line
+        }
 
         auto line = std::string_view(reply_buf_).substr(0, crlf);
         if (line.size() < 4) {
@@ -140,6 +194,13 @@ void SmtpClient::advance(int code, std::string_view text)
 
         case State::SentStartTls:
             if (code != 220) { enter_error(fmt::format("STARTTLS: {} {}", code, text)); return; }
+            // Whatever came in plain text after the 220 would be read as the
+            // server's answer once TLS is up: nothing may come before the
+            // handshake (RFC 3207 5), and a server that sends it is refused.
+            if (!reply_buf_.empty()) {
+                enter_error("STARTTLS: data after the 220 reply before the TLS handshake");
+                return;
+            }
             state_ = State::TlsHandshake;
             tcp_.start_tls();
             // After TLS handshake completes, on_connect fires again — but actually
@@ -264,33 +325,6 @@ void SmtpClient::enter_error(std::string_view msg)
         messages_[current_msg_].on_error(messages_[current_msg_], msg);
 
     tcp_.close();
-}
-
-// ─── Base64 encoding (simple, no dependency) ─────────────────────────────────
-
-std::string SmtpClient::base64_encode(std::string_view input)
-{
-    static constexpr char table[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    std::string out;
-    out.reserve(((input.size() + 2) / 3) * 4);
-
-    auto bytes = reinterpret_cast<const unsigned char*>(input.data());
-    std::size_t len = input.size();
-
-    for (std::size_t i = 0; i < len; i += 3) {
-        uint32_t n = static_cast<uint32_t>(bytes[i]) << 16;
-        if (i + 1 < len) n |= static_cast<uint32_t>(bytes[i + 1]) << 8;
-        if (i + 2 < len) n |= static_cast<uint32_t>(bytes[i + 2]);
-
-        out += table[(n >> 18) & 0x3F];
-        out += table[(n >> 12) & 0x3F];
-        out += (i + 1 < len) ? table[(n >> 6) & 0x3F] : '=';
-        out += (i + 2 < len) ? table[n & 0x3F] : '=';
-    }
-
-    return out;
 }
 
 // ─── Message serialization ───────────────────────────────────────────────────

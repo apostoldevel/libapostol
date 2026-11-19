@@ -74,14 +74,21 @@ std::string base64_decode(std::string_view input)
     uint32_t accum = 0;
     int bits = 0;
 
+    int padding = 0;
     for (char c : input) {
         // Skip whitespace
         if (c == ' ' || c == '\n' || c == '\r' || c == '\t')
             continue;
 
-        // Padding — stop decoding
-        if (c == '=')
-            break;
+        // Padding ends the data: at most two '=', and nothing after them
+        // but more whitespace.
+        if (c == '=') {
+            if (++padding > 2)
+                throw std::invalid_argument("invalid base64 padding");
+            continue;
+        }
+        if (padding > 0)
+            throw std::invalid_argument("base64 data after padding");
 
         int val = kDecodeTable[static_cast<unsigned char>(c)];
         if (val < 0)

@@ -66,7 +66,10 @@ public:
     /// Add a message to the send queue. Returns reference for populating.
     SmtpMessage& add_message();
 
-    /// Connect to SMTP server and send all queued messages.
+    /// Connect to SMTP server and send all queued messages. A message whose
+    /// envelope address holds a control byte, a space or an angle bracket, or
+    /// that has no recipient, is not sent: it leaves the queue and its on_error
+    /// is called before send_mail() returns, after the rest are under way.
     void send_mail();
 
     bool active() const noexcept { return active_; }
@@ -92,6 +95,7 @@ private:
         Error
     };
 
+    void start_session();
     void on_data(const char* data, size_t len);
     void process_reply();
     void advance(int code, std::string_view text);
@@ -99,7 +103,6 @@ private:
     void send_next_message();
     void enter_error(std::string_view msg);
 
-    static std::string base64_encode(std::string_view input);
     static std::string build_message_data(const SmtpMessage& msg);
 
     EventLoop&  loop_;

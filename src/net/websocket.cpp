@@ -1,4 +1,5 @@
 #include "apostol/websocket.hpp"
+#include "apostol/base64.hpp"
 #include "apostol/config.hpp"
 
 #include "apostol/event_loop.hpp"
@@ -87,24 +88,10 @@ static std::array<uint8_t, 20> sha1(const uint8_t* data, std::size_t len)
     return out;
 }
 
-// Standard Base64 encoder
+// The library's encoder (base64.hpp), for the digest above.
 static std::string base64_encode(const uint8_t* data, std::size_t len)
 {
-    static constexpr char t[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    out.reserve(((len + 2) / 3) * 4);
-    for (std::size_t i = 0; i < len; i += 3)
-    {
-        uint32_t v = (uint32_t(data[i]) << 16)
-                   | (i+1 < len ? uint32_t(data[i+1]) << 8 : 0)
-                   | (i+2 < len ? uint32_t(data[i+2])      : 0);
-        out += t[(v >> 18) & 63];
-        out += t[(v >> 12) & 63];
-        out += (i+1 < len) ? t[(v >> 6) & 63] : '=';
-        out += (i+2 < len) ? t[ v       & 63] : '=';
-    }
-    return out;
+    return apostol::base64_encode(std::string_view(reinterpret_cast<const char*>(data), len));
 }
 
 #endif // !WITH_SSL
