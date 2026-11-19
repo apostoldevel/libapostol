@@ -497,12 +497,11 @@ int HttpResponseParser::cb_on_status(llhttp_t* p, const char* at, std::size_t le
     return 0;
 }
 
+// A name or a value may come in several calls — one per read that holds a part
+// of it — so a header is complete only when llhttp says so, once per header.
 int HttpResponseParser::cb_on_header_field(llhttp_t* p, const char* at, std::size_t len)
 {
-    auto* rp = resp_self(p);
-    if (!rp->current_field_.empty())
-        rp->flush_header();
-    rp->current_field_.append(at, len);
+    resp_self(p)->current_field_.append(at, len);
     return 0;
 }
 
@@ -512,12 +511,15 @@ int HttpResponseParser::cb_on_header_value(llhttp_t* p, const char* at, std::siz
     return 0;
 }
 
+int HttpResponseParser::cb_on_header_value_complete(llhttp_t* p)
+{
+    resp_self(p)->flush_header();
+    return 0;
+}
+
 int HttpResponseParser::cb_on_headers_complete(llhttp_t* p)
 {
     auto* rp = resp_self(p);
-
-    if (!rp->current_field_.empty())
-        rp->flush_header();
 
     rp->current_.status_code = static_cast<int>(llhttp_get_status_code(p));
 
@@ -566,6 +568,7 @@ HttpResponseParser::HttpResponseParser()
     settings_->on_status           = cb_on_status;
     settings_->on_header_field     = cb_on_header_field;
     settings_->on_header_value     = cb_on_header_value;
+    settings_->on_header_value_complete = cb_on_header_value_complete;
     settings_->on_headers_complete = cb_on_headers_complete;
     settings_->on_body             = cb_on_body;
     settings_->on_message_complete = cb_on_message_complete;
@@ -632,15 +635,11 @@ int HttpParser::cb_on_url(llhttp_t* p, const char* at, std::size_t len)
     return 0;
 }
 
+// As in HttpResponseParser: a header is complete when llhttp says so, however
+// many reads its name and value took.
 int HttpParser::cb_on_header_field(llhttp_t* p, const char* at, std::size_t len)
 {
-    HttpParser* hp = self(p);
-    // If we already have a value buffered, the previous field/value pair is done
-    if (!hp->current_value_.empty() || (!hp->current_field_.empty() && hp->current_value_.empty())) {
-        if (!hp->current_field_.empty())
-            hp->flush_header();
-    }
-    hp->current_field_.append(at, len);
+    self(p)->current_field_.append(at, len);
     return 0;
 }
 
@@ -650,13 +649,15 @@ int HttpParser::cb_on_header_value(llhttp_t* p, const char* at, std::size_t len)
     return 0;
 }
 
+int HttpParser::cb_on_header_value_complete(llhttp_t* p)
+{
+    self(p)->flush_header();
+    return 0;
+}
+
 int HttpParser::cb_on_headers_complete(llhttp_t* p)
 {
     HttpParser* hp = self(p);
-
-    // Flush last pending header
-    if (!hp->current_field_.empty())
-        hp->flush_header();
 
     // Method string
     hp->current_.method = llhttp_method_name(
@@ -737,6 +738,7 @@ HttpParser::HttpParser()
     settings_->on_url              = cb_on_url;
     settings_->on_header_field     = cb_on_header_field;
     settings_->on_header_value     = cb_on_header_value;
+    settings_->on_header_value_complete = cb_on_header_value_complete;
     settings_->on_headers_complete = cb_on_headers_complete;
     settings_->on_body             = cb_on_body;
     settings_->on_message_complete = cb_on_message_complete;

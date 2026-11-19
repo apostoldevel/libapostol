@@ -106,6 +106,13 @@ target_link_libraries(path_under_root_test PRIVATE apostol)
 target_compile_options(path_under_root_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME path_under_root COMMAND path_under_root_test)
 
+# http_split_test — HttpParser and HttpResponseParser give the same headers,
+# body and handler call however the bytes of a message are split.
+add_executable(http_split_test http_split_test.cpp)
+target_link_libraries(http_split_test PRIVATE apostol)
+target_compile_options(http_split_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME http_split COMMAND http_split_test)
+
 # debug_mask_test — masking of the _DEBUG request/response dump, in this
 # process: what is not recognised is not written; credentials masked by name.
 add_executable(debug_mask_test debug_mask_test.cpp)

@@ -268,6 +268,7 @@ private:
     static int cb_on_url             (llhttp_t*, const char* at, std::size_t len);
     static int cb_on_header_field    (llhttp_t*, const char* at, std::size_t len);
     static int cb_on_header_value    (llhttp_t*, const char* at, std::size_t len);
+    static int cb_on_header_value_complete(llhttp_t*);
     static int cb_on_headers_complete(llhttp_t*);
     static int cb_on_body            (llhttp_t*, const char* at, std::size_t len);
     static int cb_on_message_complete(llhttp_t*);
@@ -339,6 +340,7 @@ private:
     static int cb_on_status        (llhttp_t*, const char* at, std::size_t len);
     static int cb_on_header_field  (llhttp_t*, const char* at, std::size_t len);
     static int cb_on_header_value  (llhttp_t*, const char* at, std::size_t len);
+    static int cb_on_header_value_complete(llhttp_t*);
     static int cb_on_headers_complete(llhttp_t*);
     static int cb_on_body          (llhttp_t*, const char* at, std::size_t len);
     static int cb_on_message_complete(llhttp_t*);
