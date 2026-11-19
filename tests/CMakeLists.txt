@@ -271,3 +271,10 @@ foreach(case fork_retry own_pid pid_mode privilege crash_fd crash_reload)
              COMMAND process_model_test ${case} "${CMAKE_CURRENT_BINARY_DIR}/process_model_${case}.d")
     set_tests_properties(process_model_${case} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
 endforeach()
+
+# logger_test — FileTarget when a reopen or a compression is refused; no node.
+add_executable(logger_test logger_test.cpp)
+target_link_libraries(logger_test PRIVATE apostol ${CMAKE_DL_LIBS})
+target_compile_options(logger_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME logger COMMAND logger_test "${CMAKE_CURRENT_BINARY_DIR}/logger_test.d")
+set_tests_properties(logger PROPERTIES SKIP_RETURN_CODE 77)

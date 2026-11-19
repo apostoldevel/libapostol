@@ -318,14 +318,28 @@ bool FileTarget::compress_file(const std::string& src, const std::string& dst)
         return false;
     }
 
+    // Success only when every byte went in and the file closed whole: on a
+    // false the caller keeps the uncompressed backup and drops dst. A write
+    // that failed (a full disk) used to be ignored, and the source removed
+    // behind a truncated archive.
     char buf[65536];
     ssize_t n;
+    bool ok = true;
     while ((n = ::read(in_fd, buf, sizeof(buf))) > 0)
-        ::gzwrite(gz, buf, static_cast<unsigned>(n));
+    {
+        if (::gzwrite(gz, buf, static_cast<unsigned>(n)) != static_cast<int>(n))
+        {
+            ok = false;
+            break;
+        }
+    }
+    if (n < 0)
+        ok = false;
 
-    ::gzclose(gz);
+    if (::gzclose(gz) != Z_OK)
+        ok = false;
     ::close(in_fd);
-    return n >= 0;
+    return ok;
 }
 
 void FileTarget::write(LogLevel /*level*/, std::string_view message)
@@ -382,7 +396,20 @@ void FileTarget::flush()
 
 void FileTarget::reopen()
 {
-    open_file(); // close current fd (if any) and open a fresh one at path_
+    // A fresh descriptor at path_, or — when it cannot be opened (a full or
+    // read-only disk, permissions, no descriptors left) — the current one: the
+    // lines go on into the file open so far, and the next write follows the
+    // path again. Closing first, as this did, left the target with no file
+    // until the process restarted, and the throw skipped the targets after it.
+    if (try_open_file())
+        return;
+    const int err = errno;
+    if (fd_ >= 0)
+    {
+        auto note = fmt::format("[{}] cannot reopen log file '{}': {} — writing on to the file open so far\n",
+                                ::getpid(), path_, std::strerror(err));
+        [[maybe_unused]] auto n = ::write(fd_, note.data(), note.size());
+    }
 }
 
 // ─── SyslogTarget ────────────────────────────────────────────────────────────
@@ -486,9 +513,19 @@ void Logger::flush()
 
 void Logger::reopen()
 {
+    // Every target, whatever one of them does: a target that throws keeps the
+    // file it has, the ones after it still reopen theirs.
     std::lock_guard lock(mutex_);
     for (auto& target : targets_)
-        target->reopen();
+    {
+        try
+        {
+            target->reopen();
+        }
+        catch (const std::exception&)
+        {
+        }
+    }
 }
 
 // ─── Global logger ───────────────────────────────────────────────────────────
