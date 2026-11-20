@@ -224,6 +224,9 @@ protected:
     /// SQL-escape a string literal without PGconn* (manual E'...' escaping).
     static std::string pq_quote_literal(std::string_view val);
 
+    // Deprecated, the five below: forwarders to db_platform::… of the same
+    // names (db_platform_response.hpp), kept for the modules that call them.
+
     /// Convert HTTP headers to a JSON object string: {"Name":"value",...}.
     static std::string headers_to_json(
         const std::vector<std::pair<std::string, std::string>>& headers);
@@ -237,7 +240,7 @@ protected:
     static int check_pg_error(std::string_view json, std::string& error_message);
 
     /// As above, and also reports the error identifier ("ERR-401-008" and the like)
-    /// where the payload carries one. See apostol::check_pg_error.
+    /// where the payload carries one. See db_platform::check_pg_error.
     static int check_pg_error(std::string_view json, std::string& error_message,
                               std::string& error_id);
 

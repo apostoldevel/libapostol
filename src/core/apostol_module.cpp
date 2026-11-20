@@ -4,6 +4,7 @@
 #include "apostol/file_utils.hpp"
 #ifdef WITH_POSTGRESQL
 #include "apostol/pg_utils.hpp"
+#include "apostol/db_platform_response.hpp"
 #endif
 
 #include <cstdio>
@@ -471,29 +472,29 @@ std::string ApostolModule::pq_quote_literal(std::string_view val)
 std::string ApostolModule::headers_to_json(
     const std::vector<std::pair<std::string, std::string>>& headers)
 {
-    return apostol::headers_to_json(headers);
+    return db_platform::headers_to_json(headers);
 }
 
 std::string ApostolModule::params_to_json(
     const std::vector<std::pair<std::string, std::string>>& params)
 {
-    return apostol::params_to_json(params);
+    return db_platform::params_to_json(params);
 }
 
 int ApostolModule::check_pg_error(std::string_view json, std::string& error_message)
 {
-    return apostol::check_pg_error(json, error_message);
+    return db_platform::check_pg_error(json, error_message);
 }
 
 int ApostolModule::check_pg_error(std::string_view json, std::string& error_message,
                                   std::string& error_id)
 {
-    return apostol::check_pg_error(json, error_message, error_id);
+    return db_platform::check_pg_error(json, error_message, error_id);
 }
 
 HttpStatus ApostolModule::error_code_to_status(int error_code)
 {
-    return apostol::error_code_to_status(error_code);
+    return db_platform::error_code_to_status(error_code);
 }
 
 #endif // WITH_POSTGRESQL

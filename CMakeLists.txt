@@ -138,6 +138,9 @@ if(WITH_POSTGRESQL)
         src/pg/pg_leader.cpp
         src/pg/pg_resolver.cpp
         src/core/bot_session.cpp
+        # The response contract of the layer, built with PostgreSQL alone:
+        # its forwarders in pg_utils and ApostolModule need it.
+        src/dbplatform/response.cpp
     )
 
     if(WITH_DB_PLATFORM)

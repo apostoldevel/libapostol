@@ -327,3 +327,10 @@ target_link_libraries(notify_metrics_test PRIVATE apostol)
 target_compile_options(notify_metrics_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME notify_metrics COMMAND notify_metrics_test)
 set_tests_properties(notify_metrics PROPERTIES TIMEOUT 60)
+
+# db_platform_response_test — headers and parameters as JSON, the error
+# envelope and its status: db_platform::… and the forwarders of the same names.
+add_executable(db_platform_response_test db_platform_response_test.cpp)
+target_link_libraries(db_platform_response_test PRIVATE apostol)
+target_compile_options(db_platform_response_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME db_platform_response COMMAND db_platform_response_test)
