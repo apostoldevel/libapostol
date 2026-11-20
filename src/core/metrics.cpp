@@ -307,4 +307,27 @@ std::string merge_metrics(const std::vector<std::string_view>& texts)
     return out;
 }
 
+// ─── Process sources ─────────────────────────────────────────────────────────
+
+namespace
+{
+
+std::vector<ProcessMetricsSource>& process_sources() noexcept
+{
+    static std::vector<ProcessMetricsSource> sources;
+    return sources;
+}
+
+} // namespace
+
+void add_process_metrics(ProcessMetricsSource source)
+{
+    process_sources().push_back(std::move(source));
+}
+
+const std::vector<ProcessMetricsSource>& process_metrics_sources() noexcept
+{
+    return process_sources();
+}
+
 } // namespace apostol

@@ -3252,6 +3252,7 @@ void PgPool::unlisten(std::string_view channel)
     std::string ch(channel);
     notify_handlers_.erase(ch);
     ready_handlers_.erase(ch);
+    listen_labels_.erase(ch);
     pending_listens_.erase(ch);
     sent_listens_.erase(ch);
     confirmed_listens_.erase(ch);
@@ -3571,6 +3572,17 @@ std::vector<std::string> PgPool::listens() const
         out.push_back(ch);
     std::sort(out.begin(), out.end());
     return out;
+}
+
+void PgPool::set_listen_label(std::string_view channel, std::string label)
+{
+    listen_labels_.insert_or_assign(std::string(channel), std::move(label));
+}
+
+std::string PgPool::listen_label(std::string_view channel) const
+{
+    const auto it = listen_labels_.find(std::string(channel));
+    return it == listen_labels_.end() ? std::string() : it->second;
 }
 
 bool PgPool::listener_up() const

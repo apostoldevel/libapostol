@@ -318,3 +318,12 @@ target_link_libraries(file_logger_test PRIVATE apostol)
 target_compile_options(file_logger_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME file_logger COMMAND file_logger_test "${CMAKE_CURRENT_BINARY_DIR}/file_logger_test.d")
 set_tests_properties(file_logger PROPERTIES TIMEOUT 60)
+
+# notify_metrics_test — the metrics rows of a NotifySubscriber subscribed on a
+# scripted server in a child process: by the channel's code, the personal
+# channel as listen="personal".
+add_executable(notify_metrics_test notify_metrics_test.cpp)
+target_link_libraries(notify_metrics_test PRIVATE apostol)
+target_compile_options(notify_metrics_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME notify_metrics COMMAND notify_metrics_test)
+set_tests_properties(notify_metrics PROPERTIES TIMEOUT 60)

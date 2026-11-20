@@ -11,9 +11,6 @@
 #ifdef WITH_POSTGRESQL
 #include "apostol/pg.hpp"
 #endif
-#if defined(WITH_POSTGRESQL) && defined(WITH_DB_PLATFORM)
-#include "apostol/notify_subscriber.hpp"
-#endif
 #include "apostol/websocket.hpp"
 
 #include <algorithm>
@@ -3191,21 +3188,16 @@ std::string Application::process_metrics() const
         m.gauge("db_listener_up", "1 — the pool's LISTEN connection is up.",
                 pool.listener_up() ? 1 : 0, pl);
 
-        // A subscriber's personal channel carries its number, which changes
-        // with every new subscription: the row is named by the channel's code
-        // and listen="personal", so it outlives a resubscription. Two of one
-        // channel in a process: live only if both are.
-        std::map<std::string, std::string> personal;   // listened name → channel code
-#ifdef WITH_DB_PLATFORM
-        for (const auto* s : db_platform::NotifySubscriber::all())
-            if (&s->pool() == &pool && !s->personal_listen().empty())
-                personal.emplace(s->personal_listen(), s->channel());
-#endif
-        std::map<std::pair<std::string, std::string>, bool> rows;   // (code, listen) → live
+        // A channel made for one subscriber carries a name that changes with
+        // every new subscription: the row is named by its label (set by the
+        // subscriber, PgPool::set_listen_label) and listen="personal", so it
+        // outlives a resubscription. Two of one label in a process: live only
+        // if both are.
+        std::map<std::pair<std::string, std::string>, bool> rows;   // (name, listen) → live
         for (const auto& ch : channels) {
-            const auto it   = personal.find(ch);
-            const bool mine = it != personal.end();
-            auto [row, fresh] = rows.try_emplace({mine ? it->second : ch, mine ? "personal" : "shared"}, true);
+            auto       label    = pool.listen_label(ch);
+            const bool personal = !label.empty();
+            auto [row, fresh] = rows.try_emplace({personal ? std::move(label) : ch, personal ? "personal" : "shared"}, true);
             row->second = row->second && pool.listening(ch);
         }
         for (const auto& [key, live] : rows)
@@ -3222,47 +3214,14 @@ std::string Application::process_metrics() const
                 leader_lock_->held() ? 1 : 0);
 #endif
 
-#if defined(WITH_POSTGRESQL) && defined(WITH_DB_PLATFORM)
-    {
-        // Per channel: two subscribers of one channel in a process add up.
-        struct Channel
-        {
-            bool        subscribed{true};
-            std::size_t in_progress{0};
-            db_platform::NotifySubscriber::Stats stats;
-        };
-        std::map<std::string, Channel> channels;
-        for (const auto* s : db_platform::NotifySubscriber::all()) {
-            auto& c = channels[s->channel()];
-            c.subscribed  = c.subscribed && s->number() != 0 && s->policy_ok();
-            c.in_progress += s->in_progress();
-            const auto& st = s->stats();
-            c.stats.taken   += st.taken;
-            c.stats.retries += st.retries;
-            c.stats.acked   += st.acked;
-            c.stats.nacked  += st.nacked;
-            c.stats.failed  += st.failed;
-        }
-        for (const auto& [ch, c] : channels) {
-            const MetricLabels cl{{"channel", ch}};
-            m.gauge("notify_subscribed",
-                    "1 — subscribed to the notify channel, and its policy matches the mode expected.",
-                    c.subscribed ? 1 : 0, cl);
-            m.gauge("notify_in_progress", "Rows taken and not confirmed yet.",
-                    static_cast<double>(c.in_progress), cl);
-            const char* handled = "Rows handled: success — acknowledged; error — refused (nack); "
-                                  "failed — the acknowledgement was not confirmed.";
-            m.counter("notify_handled_total", handled, static_cast<double>(c.stats.acked),
-                      {{"channel", ch}, {"result", "success"}});
-            m.counter("notify_handled_total", handled, static_cast<double>(c.stats.nacked),
-                      {{"channel", ch}, {"result", "error"}});
-            m.counter("notify_handled_total", handled, static_cast<double>(c.stats.failed),
-                      {{"channel", ch}, {"result", "failed"}});
-            m.counter("notify_retries_total", "Rows taken on a repeated delivery.",
-                      static_cast<double>(c.stats.retries), cl);
+    // Rows of the library's layers (see add_process_metrics()).
+    for (const auto& source : process_metrics_sources()) {
+        try {
+            source(m);
+        } catch (const std::exception& e) {
+            logger_->error("process metrics source threw: {}", e.what());
         }
     }
-#endif
 
     const auto& st = ipc_.stats();
     for (const auto& [key, n] : st.received)

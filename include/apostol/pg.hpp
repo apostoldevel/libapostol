@@ -766,6 +766,14 @@ public:
     /// The channels listen() registered, whatever the server said of them.
     std::vector<std::string> listens() const;
 
+    /// A channel whose name is made for one subscriber (it changes with each
+    /// subscription) reports in the metrics under @p label, a name that
+    /// outlives it. unlisten() of the channel drops its label.
+    void set_listen_label(std::string_view channel, std::string label);
+
+    /// The label set_listen_label() gave @p channel; empty when none.
+    std::string listen_label(std::string_view channel) const;
+
     /// The LISTEN connection is up: it exists, its handshake is over and it is
     /// not dead. False while it connects and when there is none.
     bool listener_up() const;
@@ -1222,6 +1230,7 @@ private:
 
     std::unique_ptr<PgConnection>                               listener_;
     std::unordered_map<std::string, std::vector<NotifyHandler>> notify_handlers_;
+    std::unordered_map<std::string, std::string>                listen_labels_;   // set_listen_label()
     std::unordered_map<std::string, std::vector<ListenReadyHandler>> ready_handlers_;
     // Set by mute_listeners(): no notification or LISTEN confirmation reaches a handler.
     bool                                                        listeners_muted_{false};

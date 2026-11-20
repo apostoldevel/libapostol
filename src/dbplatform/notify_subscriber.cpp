@@ -5,6 +5,7 @@
 // channel_policy, and the order they go in. See notify_subscriber.hpp.
 
 #include "apostol/notify_subscriber.hpp"
+#include "apostol/metrics.hpp"
 #include "apostol/pg_utils.hpp"
 
 #include <fmt/format.h>
@@ -13,6 +14,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
+#include <map>
 #include <optional>
 #include <unistd.h>
 
@@ -85,6 +87,48 @@ std::vector<const NotifySubscriber*>& registry() noexcept
     return all;
 }
 
+// The rows of this process's subscribers, by channel: two subscribers of one
+// channel in a process add up. Registered with the first subscriber.
+void notify_metrics(MetricsText& m)
+{
+    struct Channel
+    {
+        bool        subscribed{true};
+        std::size_t in_progress{0};
+        NotifySubscriber::Stats stats;
+    };
+    std::map<std::string, Channel> channels;
+    for (const auto* s : NotifySubscriber::all()) {
+        auto& c = channels[s->channel()];
+        c.subscribed  = c.subscribed && s->number() != 0 && s->policy_ok();
+        c.in_progress += s->in_progress();
+        const auto& st = s->stats();
+        c.stats.taken   += st.taken;
+        c.stats.retries += st.retries;
+        c.stats.acked   += st.acked;
+        c.stats.nacked  += st.nacked;
+        c.stats.failed  += st.failed;
+    }
+    for (const auto& [ch, c] : channels) {
+        const MetricLabels cl{{"channel", ch}};
+        m.gauge("notify_subscribed",
+                "1 — subscribed to the notify channel, and its policy matches the mode expected.",
+                c.subscribed ? 1 : 0, cl);
+        m.gauge("notify_in_progress", "Rows taken and not confirmed yet.",
+                static_cast<double>(c.in_progress), cl);
+        const char* handled = "Rows handled: success — acknowledged; error — refused (nack); "
+                              "failed — the acknowledgement was not confirmed.";
+        m.counter("notify_handled_total", handled, static_cast<double>(c.stats.acked),
+                  {{"channel", ch}, {"result", "success"}});
+        m.counter("notify_handled_total", handled, static_cast<double>(c.stats.nacked),
+                  {{"channel", ch}, {"result", "error"}});
+        m.counter("notify_handled_total", handled, static_cast<double>(c.stats.failed),
+                  {{"channel", ch}, {"result", "failed"}});
+        m.counter("notify_retries_total", "Rows taken on a repeated delivery.",
+                  static_cast<double>(c.stats.retries), cl);
+    }
+}
+
 } // namespace
 
 const std::vector<const NotifySubscriber*>& NotifySubscriber::all() noexcept
@@ -106,6 +150,8 @@ NotifySubscriber::NotifySubscriber(PgPool& pool, EventLoop& loop, Logger& log, O
     , self_(std::make_shared<NotifySubscriber*>(this))
     , spread_(static_cast<std::minstd_rand::result_type>(::getpid()))
 {
+    static const bool metrics_added = (add_process_metrics(notify_metrics), true);
+    (void)metrics_added;
     registry().push_back(this);
 }
 
@@ -257,6 +303,8 @@ void NotifySubscriber::on_subscribed(int number)
             (*p)->sweep_now();
             (*p)->heartbeat_now();
         });
+    // Its metrics row is named by the channel's code, which outlives the number.
+    pool_.set_listen_label(listening_, options_.channel);
 
     if (draining_) {
         // drain() came before the number: say it now.

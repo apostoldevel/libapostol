@@ -10,6 +10,7 @@
 // give the same series. See Application::enable_metrics().
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -95,5 +96,16 @@ private:
 /// Samples of a histogram or a summary (`_bucket`, `_sum`, `_count`) go with
 /// their declared family. A sample of no declared family stays on its own.
 std::string merge_metrics(const std::vector<std::string_view>& texts);
+
+/// Rows that code with no Application at hand — a layer of the library — adds
+/// to the answer of every process it runs in. Registered for the process (a
+/// fork keeps the list); called on the process's loop at every collection,
+/// before the sources of Application::add_metrics(). Not thread-safe:
+/// register from the loop's thread, or before it runs.
+using ProcessMetricsSource = std::function<void(MetricsText&)>;
+void add_process_metrics(ProcessMetricsSource source);
+
+/// The sources add_process_metrics() registered, in that order.
+const std::vector<ProcessMetricsSource>& process_metrics_sources() noexcept;
 
 } // namespace apostol
