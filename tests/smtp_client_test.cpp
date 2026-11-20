@@ -16,9 +16,17 @@
 //      bytes ("longer than 4096 bytes") — the relay sends 1 MiB without CRLF;
 //   4. one SmtpClient sends twice (the second send_mail() after the first
 //      finished): both go through STARTTLS and are delivered;
-//   5. AUTH LOGIN carries the user name and the password as base64.
+//   5. AUTH LOGIN carries the user name and the password as base64;
+//   6. the message's handler destroys the client — on_error of a refused
+//      greeting, of a connection the relay closes, of a refused connection,
+//      and on_done of a delivered message: the client lives in sealed pages
+//      (Sealed) and is not touched after the handler returns; the message a
+//      handler is given stays readable after it destroyed the client;
+//   7. on_error sends again: the failed message is retried, the one delivered
+//      before it in the same session is not sent twice.
 //
-// Usage: smtp_client_test (exit 77 — skipped — without a loopback listener)
+// Usage: smtp_client_test [greeting|error-message|hangup|refused|done|message|retry] — one case of 6–7, or
+// every case without an argument (exit 77 — skipped — without a loopback listener)
 
 #include "net_test_util.hpp"
 
@@ -56,7 +64,7 @@ void check(bool ok, const std::string& what)
     }
 }
 
-enum class Mode { normal, glued_220, endless_line };
+enum class Mode { normal, glued_220, endless_line, refuse_greeting, hangup };
 
 // The relay: what each connection said, in order, and how it behaves.
 class Relay
@@ -121,6 +129,13 @@ private:
     void session(Conn& c, const Identity& id)
     {
         std::string buf, line;
+        if (mode_ == Mode::hangup)
+            return;   // closed before a greeting
+        if (mode_ == Mode::refuse_greeting) {
+            c.write("554 no service\r\n221 bye\r\n");   // one write: the reply text must not take the next line's bytes
+            while (!c.stopping() && c.read(buf, 200) != Rd::eof) {}
+            return;
+        }
         if (!c.write("220 relay ready\r\n"))
             return;
 
@@ -174,6 +189,8 @@ private:
                 c.write("334 UGFzc3dvcmQ6\r\n");
             else if (line == "c2VjcmV0")
                 c.write("235 ok\r\n");
+            else if (line.rfind("RCPT TO:<fail@", 0) == 0)
+                c.write("550 no such user\r\n");
             else if (line.rfind("MAIL FROM:", 0) == 0 || line.rfind("RCPT TO:", 0) == 0)
                 c.write("250 ok\r\n");
             else if (line == "DATA") {
@@ -348,11 +365,137 @@ void test_two_sends(const Identity& id)
           "both sends went through STARTTLS, STARTTLS count " + std::to_string(relay.count("STARTTLS")));
 }
 
+// The owner lets go of the client from on_error, as a sender that drops the
+// delivery it failed does.
+// read_after: the handler reads the message after it destroyed the client.
+void test_destroyed_on_error(const char* label, std::uint16_t port, const std::string& expected,
+                             bool read_after = false)
+{
+    EventLoop          loop;
+    Sealed<SmtpClient> smtp(label, loop, config(port));
+    std::string        error;
+    int                calls = 0;
+    auto& m   = smtp->add_message();
+    m.from    = "a@x.test";
+    m.to      = {"b@x.test"};
+    m.subject = "m";
+    m.body    = "hello";
+    m.on_error = [&](const SmtpMessage& msg, std::string_view e) {
+        ++calls;
+        if (!read_after)
+            error = std::string(e) + " / " + msg.subject;
+        smtp.destroy();
+        if (read_after)
+            error = std::string(e) + " / " + msg.subject;
+    };
+    smtp->send_mail();
+    run_until(loop, [&] { return smtp.destroyed(); }, 5000);
+    settle(loop, 100);
+    check(calls == 1 && error.find(expected) != std::string::npos && error.find(" / m") != std::string::npos,
+          std::string(label) + ": on_error once with '" + expected + "', got " + std::to_string(calls)
+              + " call(s), '" + error + "'");
+}
+
+// read_after: the handler reads the message after it destroyed the client —
+// the message it is given is its own, not the client's.
+void test_destroyed_on_done(const Identity& id, bool read_after)
+{
+    Relay              relay(Mode::normal, id);
+    EventLoop          loop;
+    Sealed<SmtpClient> smtp(read_after ? "the message handed to on_done, read after it destroyed the client"
+                                       : "SmtpClient destroyed by on_done",
+                            loop, config(relay.port()));
+    std::string        done;
+    auto& m   = smtp->add_message();
+    m.from    = "a@x.test";
+    m.to      = {"b@x.test"};
+    m.subject = "m";
+    m.body    = "hello";
+    m.on_done = [&, read_after](const SmtpMessage& msg) {
+        if (!read_after)
+            done = msg.subject;
+        smtp.destroy();
+        if (read_after)
+            done = msg.subject;
+    };
+    m.on_error = [&](const SmtpMessage&, std::string_view e) { check(false, "on_done case: on_error '" + std::string(e) + "'"); };
+    smtp->send_mail();
+    run_until(loop, [&] { return smtp.destroyed(); }, 5000);
+    settle(loop, 100);
+    check(done == "m", "on_done destroyed the client after delivery, got '" + done + "'");
+}
+
+void test_retry_from_on_error(const Identity& id)
+{
+    Relay      relay(Mode::normal, id);
+    EventLoop  loop;
+    Sent       sent;
+    SmtpClient smtp(loop, config(relay.port()));
+    // No on_done on the first: the delivered message stays as it was in the
+    // queue, and only the client's own bookkeeping keeps it from going twice.
+    queue(smtp, sent, "first", "a@x.test", {"b@x.test"}).on_done = nullptr;
+    auto& m    = queue(smtp, sent, "second", "a@x.test", {"fail@x.test"});
+    int  tries = 0;
+    m.on_error = [&](const SmtpMessage&, std::string_view e) {
+        sent.failed.emplace_back("second", std::string(e));
+        if (++tries == 1)
+            smtp.send_mail();   // once more
+    };
+    smtp.send_mail();
+    run_until(loop, [&] { return tries == 2; }, 8000);
+    settle(loop, 200);
+    check(tries == 2 && relay.count("<message>") == 1,
+          "a retry from on_error: the failed message tried twice (" + std::to_string(tries) + "), one message delivered ("
+              + std::to_string(relay.count("<message>")) + ")");
+    check(relay.count("RCPT TO:<b@x.test>") == 1 && relay.count("RCPT TO:<fail@x.test>") == 2,
+          "the retry did not send the delivered message again: RCPT b " + std::to_string(relay.count("RCPT TO:<b@x.test>"))
+              + ", RCPT fail " + std::to_string(relay.count("RCPT TO:<fail@x.test>")));
+    check(error_of(sent, "second") == "RCPT TO: 550 no such user",
+          "the reply text reaches on_error whole, got '" + error_of(sent, "second") + "'");
+}
+
+bool test_destroyed_by_handler(const Identity& id, const std::string& only)
+{
+    bool       ran  = false;
+    const auto want = [&](const char* name) {
+        const bool w = only.empty() || only == name;
+        ran          = ran || w;
+        return w;
+    };
+    if (want("greeting")) {
+        Relay relay(Mode::refuse_greeting, id);
+        test_destroyed_on_error("SmtpClient destroyed by on_error (greeting refused)", relay.port(),
+                                "greeting: 554 no service / m");
+    }
+    if (want("error-message")) {
+        Relay relay(Mode::refuse_greeting, id);
+        test_destroyed_on_error("the message handed to on_error, read after it destroyed the client", relay.port(),
+                                "greeting: 554", true);
+    }
+    if (want("hangup")) {
+        Relay relay(Mode::hangup, id);
+        test_destroyed_on_error("SmtpClient destroyed by on_error (relay closed)", relay.port(),
+                                "connection closed unexpectedly");
+    }
+    if (want("refused")) {
+        const ClosedPort closed;
+        test_destroyed_on_error("SmtpClient destroyed by on_error (connection refused)", closed.port(), "connect failed");
+    }
+    if (want("done"))
+        test_destroyed_on_done(id, false);
+    if (want("message"))
+        test_destroyed_on_done(id, true);
+    if (want("retry"))
+        test_retry_from_on_error(id);
+    return ran;
+}
+
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     ::signal(SIGPIPE, SIG_IGN);
+    const std::string only = argc > 1 ? argv[1] : "";
     {
         Server probe([](Conn&, int) {});
         if (!probe.ok()) {
@@ -364,11 +507,17 @@ int main()
     const Identity id("IP:127.0.0.1");
     const Trust    trust(id.pem());
 
-    test_envelope(id);
-    test_all_refused(id);
-    test_glued_220(id);
-    test_endless_line(id);
-    test_two_sends(id);
+    if (only.empty()) {
+        test_envelope(id);
+        test_all_refused(id);
+        test_glued_220(id);
+        test_endless_line(id);
+        test_two_sends(id);
+    }
+    if (!test_destroyed_by_handler(id, only)) {
+        std::printf("smtp_client_test: no case '%s'\n", only.c_str());
+        return 2;
+    }
 
     std::printf("smtp_client_test: %s\n", g_failed == 0 ? "PASS" : "FAIL");
     return g_failed == 0 ? 0 : 1;

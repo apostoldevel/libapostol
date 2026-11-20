@@ -10,6 +10,10 @@
 //            default trust store (SSL_CERT_FILE) hold it
 //   ws_upgrade  the server half of a WebSocket opening handshake
 //   run_until / settle   drive an EventLoop for a bounded time
+//   ClosedPort  a loopback port that refuses connections while it lives
+//   Sealed   an object in pages of its own: destroy() ends it and makes the
+//            pages unreadable, so whatever touches it afterwards stops the
+//            test with a report instead of reading freed memory quietly
 //
 // Header only; each test includes it.
 
@@ -20,6 +24,8 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -32,6 +38,7 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <new>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -324,6 +331,137 @@ inline void settle(apostol::EventLoop& loop, int ms)
     loop.add_timer(std::chrono::milliseconds(ms), [&loop] { loop.stop(); }, false);
     loop.run();
 }
+
+// ─── ClosedPort ──────────────────────────────────────────────────────────────
+
+// A loopback port bound and not listening: a connection to it is refused.
+// Held while the object lives, so no other listener of a parallel test run
+// can take it.
+class ClosedPort
+{
+public:
+    ClosedPort()
+    {
+        fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        sockaddr_in a{};
+        a.sin_family      = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t len     = sizeof a;
+        if (fd_ >= 0 && ::bind(fd_, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0
+            && ::getsockname(fd_, reinterpret_cast<sockaddr*>(&a), &len) == 0)
+            port_ = ntohs(a.sin_port);
+    }
+    ~ClosedPort()
+    {
+        if (fd_ >= 0)
+            ::close(fd_);
+    }
+    ClosedPort(const ClosedPort&)            = delete;
+    ClosedPort& operator=(const ClosedPort&) = delete;
+
+    std::uint16_t port() const { return port_; }
+
+private:
+    int           fd_{-1};
+    std::uint16_t port_{0};
+};
+
+// ─── Sealed ──────────────────────────────────────────────────────────────────
+
+// An object of type T in anonymous pages of its own. destroy() runs the
+// destructor and then takes all access away from the pages: a later read or
+// write of the object — by the library, after a handler destroyed its owner —
+// faults inside them, and the fault is reported as a test failure under the
+// label given (one sealed object at a time).
+template <class T>
+class Sealed
+{
+public:
+    template <class... Args>
+    Sealed(const char* label, Args&&... args)
+    {
+        const std::size_t page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+        size_ = (sizeof(T) + page - 1) / page * page;
+        mem_  = ::mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem_ == MAP_FAILED) {
+            std::perror("mmap");
+            std::_Exit(2);
+        }
+        obj_ = new (mem_) T(std::forward<Args>(args)...);
+
+        state().label = label;
+        state().begin = static_cast<char*>(mem_);
+        state().end   = static_cast<char*>(mem_) + size_;
+        struct sigaction sa{};
+        sa.sa_sigaction = &Sealed::on_fault;
+        sa.sa_flags     = SA_SIGINFO;
+        ::sigemptyset(&sa.sa_mask);
+        ::sigaction(SIGSEGV, &sa, &state().previous);
+    }
+    ~Sealed()
+    {
+        if (obj_)
+            obj_->~T();
+        ::munmap(mem_, size_);
+        ::sigaction(SIGSEGV, &state().previous, nullptr);
+        state() = {};
+    }
+    Sealed(const Sealed&)            = delete;
+    Sealed& operator=(const Sealed&) = delete;
+
+    T* operator->() const { return obj_; }
+    T& operator*() const { return *obj_; }
+    bool destroyed() const { return obj_ == nullptr; }
+
+    // End the object and seal its pages; nothing may touch them after this.
+    void destroy()
+    {
+        T* p = obj_;
+        obj_ = nullptr;
+        p->~T();
+        std::fflush(stdout);   // a fault ends the test without a flush
+        ::mprotect(mem_, size_, PROT_NONE);
+    }
+
+private:
+    struct Range
+    {
+        const char* label{nullptr};
+        const char* begin{nullptr};
+        const char* end{nullptr};
+        struct sigaction previous{};
+    };
+    static Range& state()
+    {
+        static Range r;
+        return r;
+    }
+
+    static void on_fault(int, siginfo_t* info, void*)
+    {
+        const auto* at = static_cast<const char*>(info->si_addr);
+        const Range& r = state();
+        if (r.begin && at >= r.begin && at < r.end) {
+            const auto put = [](const char* s) {
+                std::size_t n = 0;
+                while (s[n])
+                    ++n;
+                (void)!::write(STDOUT_FILENO, s, n);
+            };
+            put("FAIL ");
+            put(r.label ? r.label : "?");
+            put(": the object was touched after its handler destroyed it\n");
+            ::_exit(1);
+        }
+        // Not ours: the handler that was there before takes it, as it would
+        // have (the fault repeats on return).
+        ::sigaction(SIGSEGV, &r.previous, nullptr);
+    }
+
+    void*       mem_{nullptr};
+    std::size_t size_{0};
+    T*          obj_{nullptr};
+};
 
 // ─── WebSocket server half ───────────────────────────────────────────────────
 

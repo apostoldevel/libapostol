@@ -51,9 +51,8 @@ void TcpClient::connect(std::string_view host, uint16_t port)
     output_.clear();
     hostname_ = std::string(host);
 
-    do_resolve(host, port);
-    if (state_ == TcpClientState::Error)
-        return;
+    if (!do_resolve(host, port))
+        return;   // refused: on_error has run, and may have destroyed this client
 
     if (address_check_) {
         auto why = address_check_(reinterpret_cast<const sockaddr*>(&peer_addr_));
@@ -98,13 +97,16 @@ void TcpClient::close()
     cleanup();
     state_ = TcpClientState::Closed;
 
-    if (on_close_)
-        on_close_();
+    // From a copy: the handler may destroy this client or set new handlers.
+    if (on_close_) {
+        const auto on_close = on_close_;
+        on_close();
+    }
 }
 
 // ─── DNS Resolution ──────────────────────────────────────────────────────────
 
-void TcpClient::do_resolve(std::string_view host, uint16_t port)
+bool TcpClient::do_resolve(std::string_view host, uint16_t port)
 {
     std::string host_str(host);
 
@@ -119,13 +121,14 @@ void TcpClient::do_resolve(std::string_view host, uint16_t port)
     int rc = ::getaddrinfo(host_str.c_str(), port_str.c_str(), &hints, &result);
     if (rc != 0) {
         enter_error(fmt::format("getaddrinfo({}): {}", host, gai_strerror(rc)));
-        return;
+        return false;
     }
 
     // Take the first result
     std::memcpy(&peer_addr_, result->ai_addr, result->ai_addrlen);
     peer_len_ = result->ai_addrlen;
     ::freeaddrinfo(result);
+    return true;
 }
 
 // ─── Async Connect ───────────────────────────────────────────────────────────
@@ -163,6 +166,9 @@ void TcpClient::do_connect()
 
 void TcpClient::on_io(uint32_t events)
 {
+    // Every handler below may end in a callback that destroys this client.
+    const std::weak_ptr<int> alive = alive_;
+
     if (events & (EPOLLERR | EPOLLHUP)) {
         if (state_ == TcpClientState::Connecting) {
             handle_connect_result();
@@ -184,13 +190,19 @@ void TcpClient::on_io(uint32_t events)
         case TcpClientState::Connected:
             if (events & EPOLLIN)
                 handle_readable();
-            // handle_readable() callback may have closed/errored the client
+            // handle_readable() callback may have closed/errored the client,
+            // or destroyed it
+            if (alive.expired())
+                return;
             if (state_ == TcpClientState::Connected && (events & EPOLLOUT))
                 handle_writable();
             break;
         default:
             break;
     }
+
+    if (alive.expired())
+        return;
 
     // Under APOSTOL_EPOLL_ET the fd was armed with EPOLLONESHOT and the
     // kernel disabled further delivery once this event fired. Handlers
@@ -251,14 +263,17 @@ void TcpClient::on_connected()
 
     reset_idle_timer();
 
-    if (on_connect_)
-        on_connect_();
+    if (on_connect_) {
+        const auto on_connect = on_connect_;
+        on_connect();
+    }
 }
 
 void TcpClient::handle_readable()
 {
     reset_idle_timer();
 
+    const std::weak_ptr<int> alive = alive_;
     char buf[8192];
     for (;;) {
         ssize_t n;
@@ -272,8 +287,8 @@ void TcpClient::handle_readable()
         if (n > 0) {
             if (on_data_)
                 on_data_(buf, static_cast<size_t>(n));
-            // Callback may have closed/errored this client
-            if (state_ != TcpClientState::Connected)
+            // Callback may have closed/errored this client, or destroyed it
+            if (alive.expired() || state_ != TcpClientState::Connected)
                 return;
             continue;
         }
@@ -335,14 +350,13 @@ void TcpClient::drain_output()
 
 void TcpClient::enter_error(std::string_view msg)
 {
-    auto prev_state = state_;
     state_ = TcpClientState::Error;
     cleanup();
 
-    if (on_error_)
-        on_error_(msg);
-
-    (void)prev_state;
+    if (on_error_) {
+        const auto on_error = on_error_;
+        on_error(msg);
+    }
 }
 
 bool TcpClient::watch(uint32_t events)

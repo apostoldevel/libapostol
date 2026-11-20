@@ -43,6 +43,12 @@ enum class TcpClientState {
 //   client.on_error([](std::string_view e){ /* ... */ });
 //   client.connect("example.com", 80);
 //
+// A handler may destroy the client (its owner lets go of a connection that
+// failed or is done): the client touches nothing of itself once the handler
+// returns. on_connect, on_close and on_error are called from a copy, so such
+// a handler may also set new handlers or connect() again; on_data runs in
+// place — after destroying the client it must not use what it captured.
+//
 class TcpClient
 {
 public:
@@ -108,7 +114,7 @@ public:
 #endif
 
 private:
-    void do_resolve(std::string_view host, uint16_t port);
+    bool do_resolve(std::string_view host, uint16_t port);
     void do_connect();
     void on_io(uint32_t events);
     void handle_connect_result();
@@ -161,6 +167,10 @@ private:
     std::chrono::milliseconds idle_timeout_{0};
     EventLoop::TimerId connect_timer_{EventLoop::kInvalidTimer};
     EventLoop::TimerId idle_timer_{EventLoop::kInvalidTimer};
+
+    // Life token: a handler that destroyed the client expires it, and the
+    // code that called the handler returns without touching the client.
+    std::shared_ptr<int> alive_{std::make_shared<int>(0)};
 
     // TLS
 #ifdef WITH_SSL

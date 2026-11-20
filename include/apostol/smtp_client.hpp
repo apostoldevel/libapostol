@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -53,6 +54,14 @@ struct SmtpMessage
 //   msg.body = "Hello";
 //   msg.on_done = [](auto&){ fmt::print("sent\n"); };
 //   smtp.send_mail();
+//
+// A message's on_done or on_error may destroy the client (its owner lets go
+// of a delivery that is over): each is called on a message of its own (the
+// delivered one taken out of the queue, a copy of the failed one), as the last
+// thing the client does on that path, so the handler and the message it is
+// given stay valid after it destroyed the client. A failure ends the session:
+// the delivered messages leave the queue, the failed one and those after it
+// stay, and send_mail() — from on_error too — sends them again.
 //
 class SmtpClient
 {
@@ -116,6 +125,9 @@ private:
     std::vector<SmtpMessage> messages_;
     std::size_t current_msg_{0};
     std::size_t current_rcpt_{0};
+
+    // Life token: on_done that destroyed the client expires it.
+    std::shared_ptr<int> alive_{std::make_shared<int>(0)};
 };
 
 } // namespace apostol

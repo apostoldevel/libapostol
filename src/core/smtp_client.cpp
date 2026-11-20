@@ -5,6 +5,9 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
+#include <optional>
+
 namespace apostol
 {
 
@@ -156,7 +159,8 @@ void SmtpClient::process_reply()
             code = code * 10 + (line[i] - '0');
         }
 
-        auto text = (line.size() > 4) ? line.substr(4) : std::string_view{};
+        // A copy: the erase below moves what follows the line over it.
+        const std::string text((line.size() > 4) ? line.substr(4) : std::string_view{});
         reply_buf_.erase(0, crlf + 2);
 
         advance(code, text);
@@ -202,16 +206,16 @@ void SmtpClient::advance(int code, std::string_view text)
                 return;
             }
             state_ = State::TlsHandshake;
-            tcp_.start_tls();
-            // After TLS handshake completes, on_connect fires again — but actually
-            // TcpClient on start_tls goes through TlsHandshake → on_connected().
-            // We need to re-EHLO after TLS.
-            // TcpClient::start_tls() → TlsHandshake → on_connected() fires on_connect_.
-            // We override on_connect to handle this:
+            // TcpClient::start_tls() → TlsHandshake → on_connected() fires
+            // on_connect_ again once the handshake is done: EHLO is sent anew
+            // over TLS. Set before start_tls(), which may finish the handshake,
+            // or fail and report it, before it returns — nothing of this client
+            // is touched after it.
             tcp_.on_connect([this] {
                 state_ = State::SentEhloAfterTls;
                 send_command(fmt::format("EHLO {}", config_.host));
             });
+            tcp_.start_tls();
             break;
 
         case State::SentEhloAfterTls:
@@ -263,17 +267,26 @@ void SmtpClient::advance(int code, std::string_view text)
             if (code != 354) { enter_error(fmt::format("DATA: {} {}", code, text)); return; }
             state_ = State::SentContent;
             {
+                // One send: a refused one reports on_error, which may destroy
+                // this client — nothing of it is touched after.
                 auto content = build_message_data(messages_[current_msg_]);
+                content += "\r\n.\r\n";
                 tcp_.send(content);
-                tcp_.send("\r\n.\r\n");
             }
             break;
 
         case State::SentContent:
             if (code != 250) { enter_error(fmt::format("message send: {} {}", code, text)); return; }
-            // Message sent successfully
-            if (messages_[current_msg_].on_done)
-                messages_[current_msg_].on_done(messages_[current_msg_]);
+            // Message sent successfully: it leaves its place in the queue for
+            // the handler, which may destroy this client — then nothing of it
+            // is touched.
+            if (messages_[current_msg_].on_done) {
+                const std::weak_ptr<int> alive = alive_;
+                const SmtpMessage sent = std::move(messages_[current_msg_]);
+                sent.on_done(sent);
+                if (alive.expired())
+                    return;
+            }
             ++current_msg_;
             if (current_msg_ < messages_.size()) {
                 send_next_message();
@@ -320,11 +333,24 @@ void SmtpClient::enter_error(std::string_view msg)
     state_ = State::Error;
     active_ = false;
 
-    // Notify current message's error handler
-    if (current_msg_ < messages_.size() && messages_[current_msg_].on_error)
-        messages_[current_msg_].on_error(messages_[current_msg_], msg);
+    // Delivered messages leave the queue: a later send_mail() — from the
+    // handler too — sends the failed one and those after it, not them again.
+    messages_.erase(messages_.begin(),
+                    messages_.begin() + static_cast<std::ptrdiff_t>(std::min(current_msg_, messages_.size())));
+    current_msg_ = 0;
+
+    // The connection goes first (its on_close finds the client in Error and
+    // reports nothing); the handler of the failed message runs last, from a
+    // copy of the message: it may destroy this client, or send again.
+    std::optional<SmtpMessage> failed;
+    if (!messages_.empty() && messages_.front().on_error)
+        failed = messages_.front();
+    const std::string why(msg);
 
     tcp_.close();
+
+    if (failed)
+        failed->on_error(*failed, why);
 }
 
 // ─── Message serialization ───────────────────────────────────────────────────

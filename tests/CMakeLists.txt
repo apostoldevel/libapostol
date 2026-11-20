@@ -240,12 +240,21 @@ add_test(NAME http_proxy COMMAND http_proxy_test)
 set_tests_properties(http_proxy PROPERTIES TIMEOUT 30)
 
 # smtp_client_test — SmtpClient against a relay that does STARTTLS: envelope
-# addresses, data after the 220, an endless reply line, two sends in a row.
+# addresses, data after the 220, an endless reply line, two sends in a row,
+# a client destroyed by its message's handler.
 add_executable(smtp_client_test smtp_client_test.cpp)
 target_link_libraries(smtp_client_test PRIVATE apostol)
 target_compile_options(smtp_client_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME smtp_client COMMAND smtp_client_test)
 set_tests_properties(smtp_client PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+# tcp_client_test — a TcpClient destroyed by its own handler (on_connect,
+# on_data, on_close, on_error) is not touched after the handler returns.
+add_executable(tcp_client_test tcp_client_test.cpp)
+target_link_libraries(tcp_client_test PRIVATE apostol)
+target_compile_options(tcp_client_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME tcp_client COMMAND tcp_client_test)
+set_tests_properties(tcp_client PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 
 # base64_test — base64_decode(): padding optional, data after it or a third
 # '=' refused; round trip of every length to 255.
