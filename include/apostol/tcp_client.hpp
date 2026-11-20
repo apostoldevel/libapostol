@@ -9,11 +9,11 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 
 #ifdef WITH_SSL
-#include <memory>
 struct ssl_st;
 struct ssl_ctx_st;
 #endif
