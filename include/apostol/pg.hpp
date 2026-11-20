@@ -768,7 +768,7 @@ public:
 
     /// A channel whose name is made for one subscriber (it changes with each
     /// subscription) reports in the metrics under @p label, a name that
-    /// outlives it. unlisten() of the channel drops its label.
+    /// outlives it. An empty @p label, and unlisten() of the channel, drop it.
     void set_listen_label(std::string_view channel, std::string label);
 
     /// The label set_listen_label() gave @p channel; empty when none.

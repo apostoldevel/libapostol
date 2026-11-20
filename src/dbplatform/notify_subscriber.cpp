@@ -158,6 +158,9 @@ NotifySubscriber::NotifySubscriber(PgPool& pool, EventLoop& loop, Logger& log, O
 NotifySubscriber::~NotifySubscriber()
 {
     std::erase(registry(), this);
+    // Its channel, if it stays listened, is no subscriber's any more.
+    if (!listening_.empty())
+        pool_.set_listen_label(listening_, {});
     self_.reset();
     cancel_timers();
 }

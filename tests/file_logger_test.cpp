@@ -2,7 +2,7 @@
 //
 // A master with one worker, the helper and a custom process "probe". Each of
 // them writes a line every 50 ms into stream_logger() and into
-// file_logger("probe", "logs/named/probe.log") — relative to the prefix.
+// file_logger("probe", resolve_path("logs/named/probe.log")).
 //
 //   1. stream_logger() writes to the file "log.stream" names, not to the
 //      compiled default.
@@ -10,7 +10,10 @@
 //   3. Both files moved away and SIGUSR1 to the master: every role writes
 //      both files again at their paths.
 //
-// Usage: file_logger_test <dir>
+// "relative": the same with the prefix given relative to the working
+// directory — each path is taken from the prefix once, not twice.
+//
+// Usage: file_logger_test <dir> [relative]
 // Exit: 0 pass, 1 fail, 2 usage.
 
 #include "apostol/application.hpp"
@@ -43,8 +46,9 @@ using Clock = std::chrono::steady_clock;
 namespace
 {
 
-int      g_failed = 0;
+int      g_failed   = 0;
 fs::path g_dir;
+bool     g_relative = false;
 
 void check(bool ok, const std::string& what)
 {
@@ -110,7 +114,7 @@ void tick(Application& app, EventLoop& loop, const std::string& role)
 {
     loop.add_timer(50ms, [&app, role] {
         app.stream_logger().notice("tick {}", role);
-        app.file_logger("probe", "logs/named/probe.log").notice("tick {}", role);
+        app.file_logger("probe", app.resolve_path("logs/named/probe.log")).notice("tick {}", role);
     });
 }
 
@@ -147,8 +151,10 @@ pid_t start_app()
     if (pid != 0)
         return pid;
 
-    std::vector<std::string> args{"file_logger_test", "-p", g_dir.string() + "/",
-                                  "-c", conf_file().string()};
+    std::string prefix = g_dir.string() + "/";
+    if (g_relative && ::chdir(g_dir.parent_path().c_str()) == 0)
+        prefix = g_dir.filename().string() + "/";
+    std::vector<std::string> args{"file_logger_test", "-p", prefix, "-c", conf_file().string()};
     std::vector<char*> argv;
     for (auto& a : args)
         argv.push_back(a.data());
@@ -203,10 +209,11 @@ void expect_all_roles(const fs::path& p, std::chrono::milliseconds limit, const 
 
 int main(int argc, char* argv[])
 {
-    if (argc != 2) {
-        std::fprintf(stderr, "usage: file_logger_test <dir>\n");
+    if (argc < 2 || argc > 3 || (argc == 3 && std::string(argv[2]) != "relative")) {
+        std::fprintf(stderr, "usage: file_logger_test <dir> [relative]\n");
         return 2;
     }
+    g_relative = argc == 3;
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     g_dir = fs::absolute(argv[1]);
     fs::remove_all(g_dir);

@@ -319,11 +319,12 @@ public:
     const SiteConfigs& sites() const noexcept { return sites_; }
 
     /// A logger of the caller's own, kept by name: lines go to stderr and to
-    /// `file` (relative to the prefix; its directory is made; rotated as the
-    /// error log is). The first call by a name creates it; later calls by
-    /// that name return it, whatever `file` they pass. Its level follows
-    /// log.level, on a reload too. The file follows its path on every write,
-    /// so a log moved away is made again where it was. Empty `file`: stderr only.
+    /// `file`, taken as given — a configured value is resolved with
+    /// resolve_path() first. Its directory is made; it is rotated as the
+    /// error log is. The first call by a name creates it; later calls by that
+    /// name return it, whatever `file` they pass. Its level follows log.level,
+    /// on a reload too; SIGUSR1 reopens it in every role, and the file follows
+    /// its path on every write besides. Empty `file`: stderr only.
     Logger& file_logger(std::string_view name, const std::filesystem::path& file);
 
     /// Deprecated: the logger of the name "stream" at log.stream (default:

@@ -312,25 +312,33 @@ add_test(NAME yaml_writer COMMAND yaml_writer_test "${CMAKE_CURRENT_BINARY_DIR}"
 set_tests_properties(yaml_writer PROPERTIES SKIP_RETURN_CODE 77)
 
 # file_logger_test — stream_logger() and file_logger() in a master, a worker,
-# the helper and a custom process: the configured path, reopened on SIGUSR1.
+# the helper and a custom process: the configured path, reopened on SIGUSR1;
+# once more with a prefix relative to the working directory.
 add_executable(file_logger_test file_logger_test.cpp)
 target_link_libraries(file_logger_test PRIVATE apostol)
 target_compile_options(file_logger_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 add_test(NAME file_logger COMMAND file_logger_test "${CMAKE_CURRENT_BINARY_DIR}/file_logger_test.d")
 set_tests_properties(file_logger PROPERTIES TIMEOUT 60)
+add_test(NAME file_logger_relative
+         COMMAND file_logger_test "${CMAKE_CURRENT_BINARY_DIR}/file_logger_relative.d" relative)
+set_tests_properties(file_logger_relative PROPERTIES TIMEOUT 60)
 
-# notify_metrics_test — the metrics rows of a NotifySubscriber subscribed on a
-# scripted server in a child process: by the channel's code, the personal
-# channel as listen="personal".
-add_executable(notify_metrics_test notify_metrics_test.cpp)
-target_link_libraries(notify_metrics_test PRIVATE apostol)
-target_compile_options(notify_metrics_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
-add_test(NAME notify_metrics COMMAND notify_metrics_test)
-set_tests_properties(notify_metrics PROPERTIES TIMEOUT 60)
+if(WITH_POSTGRESQL AND WITH_DB_PLATFORM)
+    # notify_metrics_test — the metrics rows of a NotifySubscriber subscribed on a
+    # scripted server in a child process: by the channel's code, the personal
+    # channel as listen="personal".
+    add_executable(notify_metrics_test notify_metrics_test.cpp)
+    target_link_libraries(notify_metrics_test PRIVATE apostol)
+    target_compile_options(notify_metrics_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+    add_test(NAME notify_metrics COMMAND notify_metrics_test)
+    set_tests_properties(notify_metrics PROPERTIES TIMEOUT 60)
+endif()
 
-# db_platform_response_test — headers and parameters as JSON, the error
-# envelope and its status: db_platform::… and the forwarders of the same names.
-add_executable(db_platform_response_test db_platform_response_test.cpp)
-target_link_libraries(db_platform_response_test PRIVATE apostol)
-target_compile_options(db_platform_response_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
-add_test(NAME db_platform_response COMMAND db_platform_response_test)
+if(WITH_POSTGRESQL)
+    # db_platform_response_test — headers and parameters as JSON, the error
+    # envelope and its status: db_platform::… and the forwarders of the same names.
+    add_executable(db_platform_response_test db_platform_response_test.cpp)
+    target_link_libraries(db_platform_response_test PRIVATE apostol)
+    target_compile_options(db_platform_response_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+    add_test(NAME db_platform_response COMMAND db_platform_response_test)
+endif()

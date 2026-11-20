@@ -2,6 +2,7 @@
 
 #ifdef WITH_POSTGRESQL
 
+#include "apostol/db_platform_response.hpp"
 #include "apostol/http.hpp"
 #include "apostol/pg.hpp"
 

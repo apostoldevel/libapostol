@@ -3576,7 +3576,10 @@ std::vector<std::string> PgPool::listens() const
 
 void PgPool::set_listen_label(std::string_view channel, std::string label)
 {
-    listen_labels_.insert_or_assign(std::string(channel), std::move(label));
+    if (label.empty())
+        listen_labels_.erase(std::string(channel));
+    else
+        listen_labels_.insert_or_assign(std::string(channel), std::move(label));
 }
 
 std::string PgPool::listen_label(std::string_view channel) const

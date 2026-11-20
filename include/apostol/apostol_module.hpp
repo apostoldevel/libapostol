@@ -219,7 +219,8 @@ protected:
     // ── PostgreSQL utility delegates ────────────────────────────────────────
     //
     // pg_result_to_json, reply_pg, pg_sql_to_json, reply_sql are free
-    // functions in pg_utils.hpp — use them directly.
+    // functions in pg_utils.hpp — use them directly; the db-platform contract
+    // is db_platform::… in db_platform_response.hpp (pg_utils.hpp includes it).
 
     /// SQL-escape a string literal without PGconn* (manual E'...' escaping).
     static std::string pq_quote_literal(std::string_view val);

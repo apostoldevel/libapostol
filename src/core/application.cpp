@@ -1082,6 +1082,7 @@ void Application::master_run()
         for (auto& child : children_)
             ::kill(child.pid, SIGUSR1);
         logger_->reopen();
+        for (auto& [_, file_log] : file_loggers_) file_log->reopen();
     }));
 
     // Reap any children that died during the spawn→eventloop window
@@ -1582,6 +1583,7 @@ void Application::helper_run()
 #ifdef WITH_POSTGRESQL
         if (pg_logger_) pg_logger_->reopen();
 #endif
+        for (auto& [_, file_log] : file_loggers_) file_log->reopen();
     });
 
     bool started = false;
@@ -1739,6 +1741,7 @@ void Application::custom_process_run(CustomProcess& proc)
         logger_->notice("SIGUSR1 — process reopening logs");
         logger_->reopen();
         if (pg_logger_) pg_logger_->reopen();
+        for (auto& [_, file_log] : file_loggers_) file_log->reopen();
     });
 
     bool started = false;
@@ -2767,13 +2770,14 @@ Logger& Application::file_logger(std::string_view name, const std::filesystem::p
     log->set_level(safe_log_level(settings_.log_level));
     log->add_target(std::make_unique<StderrTarget>());
 
-    if (const auto path = settings_.resolve(file.string()); !path.empty()) {
+    if (!file.empty()) {
         try {
-            std::filesystem::create_directories(path.parent_path());
-            log->set_file_target(path.string(), settings_.log_max_size,
+            if (file.has_parent_path())
+                std::filesystem::create_directories(file.parent_path());
+            log->set_file_target(file.string(), settings_.log_max_size,
                 settings_.log_keep_rotated, settings_.log_compress);
         } catch (const std::exception& e) {
-            logger_->warn("cannot open log '{}' of '{}': {}", path.string(), name, e.what());
+            logger_->warn("cannot open log '{}' of '{}': {}", file.string(), name, e.what());
         }
     }
     return *file_loggers_.emplace(std::string(name), std::move(log)).first->second;
