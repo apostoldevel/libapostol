@@ -26,7 +26,7 @@ AppSettings::AppSettings()
     error_log    = resolve(APP_ERROR_LOG_FILE);
     access_log   = resolve(APP_ACCESS_LOG_FILE);
     stream_log   = resolve(APP_STREAM_LOG_FILE);
-    postgres_log = resolve(APP_POSTGRES_LOG_FILE);
+    // postgres_log has no default (see populate()).
     doc_root     = resolve(APP_DOC_ROOT);
     cache_prefix = resolve(APP_CACHE_PREFIX);
 }
@@ -79,7 +79,6 @@ void AppSettings::populate(const Config& cfg)
         error_log    = resolve(APP_ERROR_LOG_FILE);
         access_log   = resolve(APP_ACCESS_LOG_FILE);
         stream_log   = resolve(APP_STREAM_LOG_FILE);
-        postgres_log = resolve(APP_POSTGRES_LOG_FILE);
         doc_root     = resolve(APP_DOC_ROOT);
         cache_prefix = resolve(APP_CACHE_PREFIX);
     }
@@ -96,6 +95,10 @@ void AppSettings::populate(const Config& cfg)
         access_log = resolve(*v);
     if (auto v = cfg.get_string_opt("log.stream"))
         stream_log = resolve(*v);
+    // The PostgreSQL log keeps every statement at debug, so it has no default:
+    // a process opens it at start only when the configuration names a file;
+    // without the key, with null or "", the pool logs to stderr at log.level
+    // (Application::setup_db).
     if (auto v = cfg.get_string_opt("log.postgres"))
         postgres_log = resolve(*v);
     log_max_size = static_cast<std::uint64_t>(

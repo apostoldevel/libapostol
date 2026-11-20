@@ -48,7 +48,7 @@ private:
 
 // A log file shared by every process of the application: the master opens
 // error.log before fork() and the workers inherit the target, each process
-// opens postgres.log after it. Rotation is therefore decided from the file,
+// opens its PostgreSQL log (log.postgres, when named) after it. Rotation is therefore decided from the file,
 // not from what this process has written: under a shared flock() on
 // <path>.lock every write first follows the path to the file it names now
 // (reopening when another process has rotated it, or logrotate has moved it —

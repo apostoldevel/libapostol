@@ -62,7 +62,6 @@ target_compile_definitions(apostol PUBLIC
     APP_LOCK_FILE="logs/${APP_NAME}.lock"
     APP_ERROR_LOG_FILE="logs/error.log"
     APP_ACCESS_LOG_FILE="logs/access.log"
-    APP_POSTGRES_LOG_FILE="logs/postgres.log"
     APP_STREAM_LOG_FILE="logs/stream.log"
     APP_DOC_ROOT="www"
     APP_VERSION="${PROJECT_VERSION}"
