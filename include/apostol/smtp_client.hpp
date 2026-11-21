@@ -20,7 +20,9 @@ namespace apostol
 struct SmtpConfig
 {
     std::string host;
-    uint16_t    port{587};     // 25=plain, 587=STARTTLS, 465=implicit TLS
+    uint16_t    port{587};     // 465=implicit TLS, others=STARTTLS; the server's
+                               // certificate must lead to the system trust store
+                               // and name `host`
     std::string username;
     std::string password;
     std::string from;          // envelope sender (defaults to username if empty)

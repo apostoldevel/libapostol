@@ -89,9 +89,11 @@ void SmtpClient::start_session()
     state_ = State::Connecting;
     reply_buf_.clear();   // nothing of an earlier session is read as a reply
 
-    // Port 465 = implicit TLS; others = STARTTLS
+    // Port 465 = implicit TLS; others = STARTTLS. Both verify the server's
+    // certificate: the chain must lead to the system trust store and the
+    // certificate must name config_.host.
     if (config_.port == 465)
-        tcp_.enable_tls(false);
+        tcp_.enable_tls(true);
 
     tcp_.set_connect_timeout(std::chrono::milliseconds(10000));
 

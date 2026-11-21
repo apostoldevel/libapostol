@@ -255,6 +255,15 @@ target_compile_options(smtp_client_test PRIVATE -Wall -Wextra -Wpedantic -Wno-un
 add_test(NAME smtp_client COMMAND smtp_client_test)
 set_tests_properties(smtp_client PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 
+# smtp_implicit_tls_test — SmtpClient on port 465 verifies the relay's
+# certificate: a trusted one naming the host delivers; one for another host,
+# or one outside the trust store, is refused before any command.
+add_executable(smtp_implicit_tls_test smtp_implicit_tls_test.cpp)
+target_link_libraries(smtp_implicit_tls_test PRIVATE apostol ${CMAKE_DL_LIBS})
+target_compile_options(smtp_implicit_tls_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME smtp_implicit_tls COMMAND smtp_implicit_tls_test)
+set_tests_properties(smtp_implicit_tls PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+
 # tcp_client_test — a TcpClient destroyed by its own handler (on_connect,
 # on_data, on_close, on_error) is not touched after the handler returns.
 add_executable(tcp_client_test tcp_client_test.cpp)
