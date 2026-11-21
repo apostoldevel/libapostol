@@ -4,6 +4,7 @@
 #include "apostol/fetch_policy.hpp"
 
 #include <algorithm>
+#include <cctype>
 
 #include <fmt/format.h>
 #include <cstring>
@@ -14,6 +15,23 @@
 
 namespace apostol
 {
+
+namespace
+{
+
+// GET (also an empty method) and HEAD, in any letter case.
+bool follows_redirects(std::string_view method)
+{
+    auto is = [method](std::string_view name) {
+        return method.size() == name.size()
+            && std::equal(method.begin(), method.end(), name.begin(), [](char a, char b) {
+                   return std::toupper(static_cast<unsigned char>(a)) == b;
+               });
+    };
+    return method.empty() || is("GET") || is("HEAD");
+}
+
+} // namespace
 
 // ─── Transfer (per-request state) ───────────────────────────────────────────
 
@@ -142,10 +160,6 @@ void CurlClient::perform(std::string_view url,
     curl_easy_setopt(xfer->easy, CURLOPT_ACCEPT_ENCODING, "gzip, deflate, br");
     curl_easy_setopt(xfer->easy, CURLOPT_HTTP_CONTENT_DECODING, 1L);
 
-    // Follow HTTP redirects (S3 pre-signed URLs, CDN 301/302)
-    curl_easy_setopt(xfer->easy, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(xfer->easy, CURLOPT_MAXREDIRS, 5L);
-
     // Timeout
     if (timeout_ms_ > 0)
         curl_easy_setopt(xfer->easy, CURLOPT_TIMEOUT_MS, timeout_ms_);
@@ -210,6 +224,16 @@ void CurlClient::perform(std::string_view url,
             curl_easy_setopt(xfer->easy, CURLOPT_POSTFIELDS, xfer->post_data.c_str());
         }
     }
+
+    // Redirects are followed only for GET and HEAD that send no body
+    // (downloads: pre-signed URLs, CDN 301/302). Every other request gets the
+    // 3xx back with its Location header: libcurl would turn a POST into a
+    // body-less GET on 301/302/303 and drop the body of PUT/PATCH/DELETE, and
+    // the far end would see a request its sender never made.
+    const bool follow = follows_redirects(method) && xfer->post_data.empty();
+    curl_easy_setopt(xfer->easy, CURLOPT_FOLLOWLOCATION, follow ? 1L : 0L);
+    if (follow)
+        curl_easy_setopt(xfer->easy, CURLOPT_MAXREDIRS, 5L);
 
     // Add to multi handle — ownership transfers to curl_multi
     auto code = curl_multi_add_handle(multi_, xfer->easy);

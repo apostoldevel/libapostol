@@ -303,6 +303,14 @@ target_compile_options(fetch_limit_test PRIVATE -Wall -Wextra -Wpedantic -Wno-un
 add_test(NAME fetch_limit COMMAND fetch_limit_test)
 set_tests_properties(fetch_limit PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 
+# fetch_redirect_test — CurlClient and FetchClient follow a redirect for GET
+# only; a request with a body gets the redirect status back.
+add_executable(fetch_redirect_test fetch_redirect_test.cpp)
+target_link_libraries(fetch_redirect_test PRIVATE apostol)
+target_compile_options(fetch_redirect_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME fetch_redirect COMMAND fetch_redirect_test)
+set_tests_properties(fetch_redirect PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+
 # process_model_test — the master and a failed fork, the pid file, a daemon's
 # umask, a failed privilege switch, the crash report; one case per test.
 add_executable(process_model_test process_model_test.cpp)
