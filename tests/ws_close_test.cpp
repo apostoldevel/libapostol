@@ -14,7 +14,11 @@
 //      would have elapsed;
 //   5. close() with a server that resets the connection on the Close frame
 //      (TCP RST, a socket error rather than an end of stream): on_close(1006)
-//      once, and no second call when the close timeout would have elapsed.
+//      once, and no second call when the close timeout would have elapsed;
+//   6. with auto-reconnect on, a server that sends Close 1001 and then resets
+//      the connection (the client's echo of the Close lands on a socket the
+//      server has already released): the socket error that follows the Close
+//      leaves the scheduled reconnect in place, and the client dials again.
 //
 // Usage: ws_close_test (exit 77 — skipped — without a loopback listener)
 
@@ -151,6 +155,52 @@ CloseResult close_with(Peer peer, int wait_ms)
     return r;
 }
 
+struct ReconnectResult
+{
+    int                      connects{0};
+    std::vector<uint16_t>    closes;
+    std::vector<std::string> errors;
+    int                      accepted{0};
+    bool                     reset{false};   // the echo was queued unread when the server closed
+};
+
+// Close 1001 from the server, then a reset; the second connection is held
+// open. Watch the client for `wait_ms`.
+ReconnectResult close_then_reset(int wait_ms)
+{
+    std::atomic<bool> reset{false};
+    Server srv([&reset](Conn& c, int index) {
+        if (!ws_handshake(c))
+            return;
+        if (index == 0) {
+            c.write(std::string("\x88\x0C\x03\xE9going away", 14));   // Close, 1001
+            // Wait for the client's echo without reading it: a socket closed
+            // with unread data in its receive queue answers with RST.
+            reset = c.wait(POLLIN, 3000);
+            c.close_now();
+            return;
+        }
+        std::string b;
+        while (!c.stopping() && c.read(b, 200) != Rd::eof) {}
+    });
+
+    EventLoop       loop;
+    WsClient        client(loop);
+    ReconnectResult r;
+    client.auto_reconnect(true);
+    client.on_connect([&] { ++r.connects; });
+    client.on_close([&](uint16_t code, std::string_view) { r.closes.push_back(code); });
+    client.on_error([&](std::string_view e) { r.errors.emplace_back(e); });
+    client.connect(url_of(srv));
+    run_until(loop, [&] { return r.connects >= 2; }, wait_ms);
+    r.accepted = srv.accepted();
+    r.reset    = reset.load();
+    client.auto_reconnect(false);
+    client.close();
+    settle(loop, 200);
+    return r;
+}
+
 } // namespace
 
 int main()
@@ -189,6 +239,18 @@ int main()
         const auto r = close_with(Peer::echo_close, 1000);
         check(r.calls == 1 && r.code == 1000, "server answers Close: on_close(1000) once and no later call, got "
                                                   + std::to_string(r.calls) + " call(s), code " + std::to_string(r.code));
+    }
+
+    {
+        const auto r = close_then_reset(4000);
+        check(r.reset, "Close 1001 then reset: the client's echo reached the server before it closed (no RST otherwise)");
+        check(!r.closes.empty() && r.closes[0] == 1001,
+              "Close 1001 then reset: on_close(1001) first, got " + std::to_string(r.closes.size()) + " call(s)"
+                  + (r.closes.empty() ? std::string() : ", code " + std::to_string(r.closes[0])));
+        check(r.connects == 2 && r.accepted == 2,
+              "Close 1001 then reset: the client dialled again, connects " + std::to_string(r.connects)
+                  + ", connections " + std::to_string(r.accepted) + ", errors " + std::to_string(r.errors.size())
+                  + (r.errors.empty() ? std::string() : " ('" + r.errors[0] + "')"));
     }
 
     std::printf("ws_close_test: %s\n", g_failed == 0 ? "PASS" : "FAIL");

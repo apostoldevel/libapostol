@@ -200,6 +200,13 @@ void WsClient::do_connect()
     });
 
     tcp_.on_error([this](std::string_view err) {
+        // A reconnect is already scheduled: the error belongs to the connection
+        // that has ended (a reset after the server's Close frame, when our echo
+        // reaches a socket the server has released). Keep the timer, as the
+        // end of stream does in on_close.
+        if (state_ == WsClientState::Reconnecting)
+            return;
+
         cancel_ping_timer();
 
         if (state_ == WsClientState::Closing) {
