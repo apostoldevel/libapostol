@@ -426,14 +426,24 @@ EventLoop::TimerId EventLoop::add_timer(std::chrono::milliseconds interval, Time
     if (tfd < 0)
         throw std::system_error(errno, std::system_category(), "timerfd_create");
 
-    auto sec = std::chrono::duration_cast<std::chrono::seconds>(interval);
-    auto nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(interval - sec);
-
     itimerspec ts{};
-    ts.it_value.tv_sec = sec.count();
-    ts.it_value.tv_nsec = nsec.count();
-    if (repeat)
-        ts.it_interval = ts.it_value;
+    if (interval.count() <= 0)
+    {
+        // An all-zero it_value disarms a timerfd: it would never fire. The
+        // shortest expiry instead — already past when the loop next waits, so
+        // the callback runs on the next turn. One-shot whatever `repeat` says.
+        ts.it_value.tv_nsec = 1;
+        repeat = false;
+    }
+    else
+    {
+        auto sec = std::chrono::duration_cast<std::chrono::seconds>(interval);
+        auto nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(interval - sec);
+        ts.it_value.tv_sec = sec.count();
+        ts.it_value.tv_nsec = nsec.count();
+        if (repeat)
+            ts.it_interval = ts.it_value;
+    }
 
     if (::timerfd_settime(tfd, 0, &ts, nullptr) < 0)
     {

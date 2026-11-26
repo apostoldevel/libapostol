@@ -160,9 +160,8 @@ void HttpProxy::forward_impl(const HttpRequest& req, SendResponse send_response,
     // A failure inside tcp.connect() (a name that does not resolve, a refused
     // address, no socket) comes while forward() and connect() are still on
     // the stack: reporting it there would let the caller destroy the proxy
-    // under both. It is reported from the loop instead, a millisecond later
-    // (a zero timer never fires). The context stays unsettled until then, so
-    // no sweep takes it first; `deferred` keeps the other callbacks out.
+    // under both. It is reported from the loop instead, on a later turn. The
+    // context stays unsettled until then, so no sweep takes it first; `deferred` keeps the other callbacks out.
     auto fail = [ptr, report](Reason reason, std::string_view msg) {
         if (ptr->done || ptr->deferred) return;
         if (ptr->connecting) {
@@ -298,12 +297,18 @@ void HttpProxy::schedule_cleanup()
 {
     if (cleanup_timer_ != EventLoop::kInvalidTimer)
         return;   // one sweep pending already covers every settled context
-    cleanup_timer_ = loop_.add_timer(std::chrono::milliseconds(0),
-                                     [this, alive = std::weak_ptr<int>(alive_)] {
-        if (alive.expired()) return;   // proxy destroyed before the sweep ran
-        cleanup_timer_ = EventLoop::kInvalidTimer;
-        cleanup_done();
-    }, /*repeat=*/false);
+    // Called before the caller's handler: a timer the loop refuses (no
+    // descriptors) must not keep the handler from running. Unarmed, the
+    // context waits for the next settle to schedule the sweep.
+    try {
+        cleanup_timer_ = loop_.add_timer(std::chrono::milliseconds(0),
+                                         [this, alive = std::weak_ptr<int>(alive_)] {
+            if (alive.expired()) return;   // proxy destroyed before the sweep ran
+            cleanup_timer_ = EventLoop::kInvalidTimer;
+            cleanup_done();
+        }, /*repeat=*/false);
+    } catch (const std::exception&) {
+    }
 }
 
 void HttpProxy::cleanup_done()

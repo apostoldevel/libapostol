@@ -36,6 +36,8 @@ HttpClient::~HttpClient()
     // A refusal not yet reported must not call back into an owner that is gone.
     for (auto id : refusal_timers_)
         loop_.cancel_timer(id);
+    // The sweep of finished requests is not cancelled here: it finds the
+    // life token expired (see schedule_cleanup).
 }
 
 // ─── URL Parsing ─────────────────────────────────────────────────────────────
@@ -157,14 +159,18 @@ void HttpClient::request(std::string_view method, std::string_view url_str,
     auto serialized = serialize_request(method,
         detail::host_header(url.host, url.port, default_port(url.scheme)), url.path, body, headers);
 
+    // Every way out settles the request, closes it and schedules the sweep
+    // first, and calls the caller's handler last, taken out of the request:
+    // the handler may destroy this client, and with it the request. The sweep
+    // runs from the loop — here we are inside TcpClient's callback chain.
     ptr->parser.set_handler([ptr, this](HttpClientResponse resp) {
         if (ptr->done) return;
         ptr->done = true;
-        if (ptr->on_response)
-            ptr->on_response(std::move(resp));
-        ptr->tcp.close();
-        // Defer cleanup — we're inside TcpClient's on_data callback chain
-        loop_.add_timer(std::chrono::milliseconds(0), [this] { cleanup_done(); }, false);
+        ptr->tcp.close();   // finds the request done: reports nothing
+        schedule_cleanup();
+        auto on_response = std::move(ptr->on_response);
+        if (on_response)
+            on_response(std::move(resp));
     });
 
     ptr->tcp.on_connect([ptr, req_data = std::move(serialized)] {
@@ -180,7 +186,7 @@ void HttpClient::request(std::string_view method, std::string_view url_str,
             // this client.
             ptr->done = true;
             ptr->tcp.close();
-            loop_.add_timer(std::chrono::milliseconds(0), [this] { cleanup_done(); }, false);
+            schedule_cleanup();
             auto on_error = std::move(ptr->on_error);
             if (on_error)
                 on_error(fmt::format("response larger than {} bytes", ptr->max_received));
@@ -192,18 +198,20 @@ void HttpClient::request(std::string_view method, std::string_view url_str,
     ptr->tcp.on_error([ptr, this](std::string_view msg) {
         if (ptr->done) return;
         ptr->done = true;
-        if (ptr->on_error)
-            ptr->on_error(msg);
-        loop_.add_timer(std::chrono::milliseconds(0), [this] { cleanup_done(); }, false);
+        schedule_cleanup();
+        auto on_error = std::move(ptr->on_error);
+        if (on_error)
+            on_error(msg);
     });
 
     ptr->tcp.on_close([ptr, this] {
         if (ptr->done) return;
         // Connection closed before response completed
         ptr->done = true;
-        if (ptr->on_error)
-            ptr->on_error("connection closed before response");
-        loop_.add_timer(std::chrono::milliseconds(0), [this] { cleanup_done(); }, false);
+        schedule_cleanup();
+        auto on_error = std::move(ptr->on_error);
+        if (on_error)
+            on_error("connection closed before response");
     });
 
     ptr->tcp.connect(url.host, url.port);
@@ -212,8 +220,7 @@ void HttpClient::request(std::string_view method, std::string_view url_str,
 }
 
 // A refusal before anything is dialled: reported from the loop, never from
-// inside request() — 1 ms, not 0: a zero timerfd is disarmed and never fires.
-// The timer is cancelled with the client.
+// inside request(). The timer is cancelled with the client.
 void HttpClient::refuse(ErrorHandler on_error, std::string message)
 {
     auto id = std::make_shared<EventLoop::TimerId>(EventLoop::kInvalidTimer);
@@ -239,6 +246,28 @@ void HttpClient::post(std::string_view url, std::string_view body,
                        ResponseHandler on_response, ErrorHandler on_error)
 {
     request("POST", url, body, headers, std::move(on_response), std::move(on_error));
+}
+
+// One sweep pending at a time covers every request settled before it runs;
+// it runs on the next turn of the loop. Its callback holds a weak_ptr to the
+// life token, not this alone: a handler may destroy the client in the same
+// turn its request settles, and the destructor does not reach for the loop.
+void HttpClient::schedule_cleanup()
+{
+    if (cleanup_pending_)
+        return;
+    // Called before the caller's handler: a timer the loop refuses (no
+    // descriptors) must not keep the handler from running. Unarmed, the
+    // request waits for the next settle to schedule the sweep.
+    try {
+        loop_.add_timer(std::chrono::milliseconds(0), [this, alive = std::weak_ptr<int>(alive_)] {
+            if (alive.expired()) return;   // client destroyed before the sweep ran
+            cleanup_pending_ = false;
+            cleanup_done();
+        }, false);
+        cleanup_pending_ = true;
+    } catch (const std::exception&) {
+    }
 }
 
 void HttpClient::cleanup_done()

@@ -89,6 +89,10 @@ public:
     /// the address this proxy would add is the inner hop, not the client.
     void set_append_forwarded_for(bool on) { append_forwarded_for_ = on; }
 
+    /// Forwards held: in flight, and settled ones until the sweep on the next
+    /// turn of the loop releases them.
+    std::size_t context_count() const noexcept { return contexts_.size(); }
+
 #ifdef WITH_SSL
     /// TLS to the upstream. With verify (the default) the upstream's
     /// certificate must chain to the system trust store and name the host

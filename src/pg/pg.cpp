@@ -2631,12 +2631,8 @@ void PgPool::schedule_reconnect_timer()
 
     auto now = steady_clock::now();
     // Floor to 1ms even when next_connect_attempt_ is still (barely) ahead of
-    // now: a computed 0ms duration disarms timerfd instead of firing it ASAP
-    // (POSIX itimerspec semantics — an all-zero it_value disarms regardless
-    // of it_interval), which would leave reconnect_timer_ permanently
-    // "armed" on a timer that never fires — silently stalling every future
-    // reconnect attempt (pool and listener alike) behind schedule_reconnect_
-    // timer()'s already-armed guard.
+    // now, or already behind it: the attempt is always taken from the loop,
+    // never sooner than a millisecond after the decision to make it.
     auto delay = duration_cast<milliseconds>(next_connect_attempt_ - now);
     if (delay.count() < 1) delay = milliseconds(1);
 

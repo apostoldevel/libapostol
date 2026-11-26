@@ -30,6 +30,9 @@ public:
     // ── Message-level sending ────────────────────────────────────────────────
 
     using ResponseHandler = std::function<void(const WsMessage& response)>;
+    /// on_response is called with the answer of the same id; none within
+    /// `timeout` — an error "response timeout for <id>". A zero timeout waits
+    /// with no deadline.
     void send(const WsMessage& message, ResponseHandler on_response = {},
               std::chrono::milliseconds timeout = std::chrono::seconds(30));
 

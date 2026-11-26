@@ -375,3 +375,11 @@ if(WITH_POSTGRESQL)
     target_compile_options(db_platform_response_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
     add_test(NAME db_platform_response COMMAND db_platform_response_test)
 endif()
+
+# timer_zero_test — a zero-interval timer fires on the next loop turn;
+# HttpClient and HttpProxy release finished requests and their timerfds.
+add_executable(timer_zero_test timer_zero_test.cpp)
+target_link_libraries(timer_zero_test PRIVATE apostol)
+target_compile_options(timer_zero_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME timer_zero COMMAND timer_zero_test)
+set_tests_properties(timer_zero PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)

@@ -103,6 +103,9 @@ public:
     // ── Timers ────────────────────────────────────────────────────────────────
 
     // Add a timer. Returns a TimerId that can be used to cancel it.
+    // An interval of zero (or less) runs the callback once, on the next turn
+    // of the loop — never from inside add_timer() — and the timer is then
+    // released; `repeat` does not apply to it (a zero period has no meaning).
     TimerId add_timer(std::chrono::milliseconds interval, TimerCallback cb, bool repeat = true);
 
     // Cancel and destroy a timer.

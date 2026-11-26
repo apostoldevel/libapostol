@@ -63,6 +63,10 @@ public:
 
     void set_timeout(std::chrono::milliseconds ms) { timeout_ = ms; }
 
+    /// Requests held: in flight, and finished ones until the sweep on the
+    /// next turn of the loop releases them.
+    std::size_t pending_count() const noexcept { return pending_.size(); }
+
     /// The most bytes one response may take on the wire (status line, headers
     /// and body as sent); past it the request fails with "response larger
     /// than <n> bytes" and the connection is closed. Zero lifts the limit.
@@ -88,6 +92,7 @@ private:
     static ParsedUrl parse_url(std::string_view url);
     static std::uint16_t default_port(std::string_view scheme);
     void refuse(ErrorHandler on_error, std::string message);
+    void schedule_cleanup();
     void cleanup_done();
 
     struct PendingRequest;
@@ -97,6 +102,10 @@ private:
     std::size_t max_response_size_{kDefaultMaxResponseSize};
     std::vector<std::unique_ptr<PendingRequest>> pending_;
     std::vector<EventLoop::TimerId> refusal_timers_;  // refusals in flight: scheme, invalid URL
+    // The sweep of finished requests: one pending at a time, its callback
+    // guarded by this token (see schedule_cleanup).
+    std::shared_ptr<int> alive_{std::make_shared<int>(0)};
+    bool cleanup_pending_{false};
 
 #ifdef WITH_SSL
     bool tls_enabled_{false};

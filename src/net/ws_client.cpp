@@ -499,14 +499,17 @@ void WsClient::send(const WsMessage& message, ResponseHandler on_response,
         msg.id = generate_id();
 
     if (on_response) {
-        auto timer = loop_.add_timer(timeout, [this, id = msg.id] {
-            auto it = pending_responses_.find(id);
-            if (it != pending_responses_.end()) {
-                pending_responses_.erase(it);
-                if (on_error_)
-                    on_error_(fmt::format("response timeout for {}", id));
-            }
-        }, false);
+        // A zero timeout waits for the answer without a deadline.
+        EventLoop::TimerId timer = EventLoop::kInvalidTimer;
+        if (timeout.count() > 0)
+            timer = loop_.add_timer(timeout, [this, id = msg.id] {
+                auto it = pending_responses_.find(id);
+                if (it != pending_responses_.end()) {
+                    pending_responses_.erase(it);
+                    if (on_error_)
+                        on_error_(fmt::format("response timeout for {}", id));
+                }
+            }, false);
 
         pending_responses_[msg.id] = {std::move(on_response), timer};
     }
@@ -607,7 +610,7 @@ void WsClient::enable_tls(bool verify)
 void WsClient::start_ping_timer()
 {
     cancel_ping_timer();
-    if (ping_interval_.count() == 0) return;
+    if (ping_interval_.count() <= 0) return;
 
     ping_timer_ = loop_.add_timer(
         std::chrono::duration_cast<std::chrono::milliseconds>(ping_interval_),
