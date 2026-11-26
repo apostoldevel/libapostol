@@ -18,6 +18,8 @@ struct HttpClient::PendingRequest
     ResponseHandler     on_response;
     ErrorHandler        on_error;
     bool                done{false};
+    bool                connecting{false};   // inside tcp.connect(), called from request()
+    std::string         connect_failure;     // a failure from inside connect(), reported from the loop
     std::size_t         received{0};   // bytes of the response so far
     std::size_t         max_received{0};   // 0 — no limit
 
@@ -198,6 +200,10 @@ void HttpClient::request(std::string_view method, std::string_view url_str,
     ptr->tcp.on_error([ptr, this](std::string_view msg) {
         if (ptr->done) return;
         ptr->done = true;
+        if (ptr->connecting) {
+            ptr->connect_failure = std::string(msg);
+            return;
+        }
         schedule_cleanup();
         auto on_error = std::move(ptr->on_error);
         if (on_error)
@@ -208,19 +214,38 @@ void HttpClient::request(std::string_view method, std::string_view url_str,
         if (ptr->done) return;
         // Connection closed before response completed
         ptr->done = true;
+        if (ptr->connecting) {
+            ptr->connect_failure = "connection closed before response";
+            return;
+        }
         schedule_cleanup();
         auto on_error = std::move(ptr->on_error);
         if (on_error)
             on_error("connection closed before response");
     });
 
+    // A failure inside tcp.connect() (a name that does not resolve, a refused
+    // address, no socket) comes while request() and connect() are still on
+    // the stack: reporting it there would let the caller destroy the client
+    // under both. It is recorded instead, and request() reports it from the
+    // loop once connect() has returned, as it reports a refused URL.
+    ptr->connecting = true;
     ptr->tcp.connect(url.host, url.port);
+    ptr->connecting = false;
+
+    // Failed inside connect(): nothing is in flight, so the request is not
+    // kept — it is released on return, with connect() no longer on the stack.
+    if (ptr->done) {
+        refuse(std::move(ptr->on_error), std::move(ptr->connect_failure));
+        return;
+    }
 
     pending_.push_back(std::move(req));
 }
 
-// A refusal before anything is dialled: reported from the loop, never from
-// inside request(). The timer is cancelled with the client.
+// A refusal before anything is dialled, or a failure inside connect():
+// reported from the loop, never from inside request(). The timer is cancelled
+// with the client.
 void HttpClient::refuse(ErrorHandler on_error, std::string message)
 {
     auto id = std::make_shared<EventLoop::TimerId>(EventLoop::kInvalidTimer);

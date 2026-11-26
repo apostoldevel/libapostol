@@ -46,7 +46,9 @@ public:
     /// is refused with "unsupported URL scheme '<s>'". A URL without a host, with
     /// userinfo, an IPv6 address outside brackets, a port that is not 1..65535 in
     /// digits, or a blank or control byte is refused with "invalid URL". Both are
-    /// reported from the loop. The Host header carries the port unless it is the
+    /// reported from the loop, and so is a connection that fails at once (a name
+    /// that does not resolve, a refused address): on_error never runs inside
+    /// request(). The Host header carries the port unless it is the
     /// scheme's default, and an IPv6 address in brackets.
     void request(std::string_view method, std::string_view url,
                  std::string_view body, const Headers& headers,

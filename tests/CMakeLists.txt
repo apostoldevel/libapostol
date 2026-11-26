@@ -246,6 +246,14 @@ target_compile_options(http_proxy_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unu
 add_test(NAME http_proxy COMMAND http_proxy_test)
 set_tests_properties(http_proxy PROPERTIES TIMEOUT 30)
 
+# http_client_fail_test — a request whose connection fails at once is reported
+# from the loop; a handler that destroys the client touches nothing freed.
+add_executable(http_client_fail_test http_client_fail_test.cpp)
+target_link_libraries(http_client_fail_test PRIVATE apostol)
+target_compile_options(http_client_fail_test PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+add_test(NAME http_client_fail COMMAND http_client_fail_test)
+set_tests_properties(http_client_fail PROPERTIES TIMEOUT 30)
+
 # smtp_client_test — SmtpClient against a relay that does STARTTLS: envelope
 # addresses, data after the 220, an endless reply line, two sends in a row,
 # a client destroyed by its message's handler.
